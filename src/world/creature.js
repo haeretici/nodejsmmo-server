@@ -79,7 +79,8 @@ function createCreature(id, template, pos) {
         targetId: 0,
         path: [],
         moveReadyTick: 0,
-        attackReadyTick: 0
+        attackReadyTick: 0,
+        simSleeping: false
     };
 }
 

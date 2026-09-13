@@ -17,6 +17,8 @@
     "aiRepathFailBackoffSec": 0.25,
     "aiPathBudgetPerFrame": 0,
     "aiCreatureThinkIntervalSec": 1,
+    "aiCreatureSleep": true,
+    "aiTickRadius": 12,
     "aiOccupantStepPenalty": 4,
     "creaturePushCrush": true,
     "autoIntervalTicks": 40,

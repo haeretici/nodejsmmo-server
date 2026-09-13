@@ -49,7 +49,7 @@ const {
     decodeMoveItem,
     decodeContainerSlot
 } = require('../protocol/messages');
-const { createStaticMap, viewport, inViewport, clampSpawn } = require('./static_map');
+const { createStaticMap, viewport, viewportWindow, inViewport, clampSpawn } = require('./static_map');
 const { fromStaticMap } = require('./tilemap');
 const { computeMoveDelay, delayToTicks, isDiagonalStep } = require('./movement');
 const { PathBudget, isLogicIntervalDue, seedPathPhase } = require('./path_budget');
@@ -164,6 +164,7 @@ const {
     resolveCast,
     sayForReason
 } = require('./spells');
+const { SpatialIndex } = require('./spatial_index');
 
 const CREATURE_ID_BASE = 1000000000;
 const CORPSE_ID_BASE = 2000000000;
@@ -201,7 +202,18 @@ class World {
         this.byAccount = new Map();
         this.creatures = new Map();
         this.corpses = new Map();
+        this.corpseQueue = [];
         this.pendingSpawns = [];
+        this.playerSpatial = new SpatialIndex({ chunkSize: 32 });
+        this.creatureSpatial = new SpatialIndex({ chunkSize: 32 });
+        this.corpseSpatial = new SpatialIndex({ chunkSize: 32 });
+        this.worldPinSpatial = new SpatialIndex({ chunkSize: 32 });
+        this.spawnPinSpatial = new SpatialIndex({ chunkSize: 32 });
+        this.livingPins = new Set();
+        this.eagerPins = [];
+        this._conditionHooks = {
+            applyHpDelta: (ent, amount, element) => this._applyConditionHpDelta(ent, amount, element)
+        };
         this.spawnPins = [];
         this._spawnSkipLogged = new Set();
         this.nextCreatureId = (opts.settings && opts.settings.creatureIdBase) || CREATURE_ID_BASE;
@@ -229,6 +241,11 @@ class World {
             resolveEntity: (id) => this.getEntity(id),
             rng: this.rng,
             crush: opts.settings && opts.settings.creaturePushCrush,
+            playerSpatial: this.playerSpatial,
+            creatureSpatial: this.creatureSpatial,
+            onMove: (entity, fromX, fromY, fromZ, toX, toY, toZ) => {
+                this.onEntityMoved(entity, fromX, fromY, fromZ, toX, toY, toZ);
+            },
             budget: this.pathBudget,
             path: {
                 maxDistance: opts.settings && opts.settings.pathMaxDistance,
@@ -310,6 +327,16 @@ class World {
     getEntity(id) {
         const n = Number(id);
         return this.players.get(n) || this.creatures.get(n) || null;
+    }
+
+    onEntityMoved(entity, fromX, fromY, fromZ, toX, toY, toZ) {
+        if (!entity) return;
+        const id = entity.id != null ? entity.id : (entity.character && entity.character.id);
+        if (entity.type === 'player' || (id != null && this.players.has(id))) {
+            this.playerSpatial.update(entity);
+        } else if (entity.type === 'creature' || entity.type === 'npc' || (id != null && this.creatures.has(id))) {
+            this.creatureSpatial.update(entity);
+        }
     }
 
     sees(observer, x, y, z) {
@@ -396,6 +423,9 @@ class World {
         }
         this.spawnMode = resolveSpawnMode(this.settings, overlay);
         this.spawnPins = [];
+        if (this.spawnPinSpatial) this.spawnPinSpatial.clear();
+        if (this.livingPins) this.livingPins.clear();
+        this.eagerPins = [];
         for (let i = 0; i < rows.length; i++) {
             const pin = makePinState(rows[i], this.spawnPins.length, this.spawnMode === 'eager');
             const template = getTemplate(pin.kind, this.templates);
@@ -406,6 +436,14 @@ class World {
                 this.logSpawnSkip(pin.kind, skip);
             }
             this.spawnPins.push(pin);
+            if (pin.state !== 'skipped') {
+                if (this.spawnPinSpatial) {
+                    this.spawnPinSpatial.insert({ id: pin.index, x: pin.x, y: pin.y, z: pin.z, pin });
+                }
+                if (pin.eager) {
+                    this.eagerPins.push(pin);
+                }
+            }
         }
         if (this.spawnMode === 'eager') {
             for (let i = 0; i < this.spawnPins.length; i++) {
@@ -426,6 +464,7 @@ class World {
         this.worldPinById = new Map();
         this.worldPinByNumeric = new Map();
         this.worldPinsByTile = new Map();
+        if (this.worldPinSpatial) this.worldPinSpatial.clear();
         this.worldPinLever = { state: Object.create(null), snapshots: Object.create(null) };
         const seeded = seedWorldPinInstances(
             this.worldPinRows(),
@@ -444,6 +483,7 @@ class World {
         this.worldPinById.set(inst.pinId, inst);
         this.worldPinByNumeric.set(inst.id, inst);
         this.worldPinsByTile.set(worldPinTileKey(inst.x, inst.y, inst.z), inst);
+        if (this.worldPinSpatial) this.worldPinSpatial.insert(inst);
     }
 
     worldPinAt(x, y, z) {
@@ -468,6 +508,9 @@ class World {
                 continue;
             }
             this.spawnPins.push(pin);
+            if (this.spawnPinSpatial) {
+                this.spawnPinSpatial.insert({ id: pin.index, x: pin.x, y: pin.y, z: pin.z, pin });
+            }
             this.activatePin(pin, this._tickIndex);
         }
     }
@@ -502,6 +545,7 @@ class World {
             creature.spawnZ = alt.z;
         }
         this.creatures.set(creature.id, creature);
+        if (this.creatureSpatial) this.creatureSpatial.insert(creature);
         Cooldowns.ensureCooldowns(creature);
         if (creature.speed != null) creature.baseSpeed = Number(creature.speed);
         seedPathPhase(
@@ -527,6 +571,7 @@ class World {
         pin.state = 'living';
         pin.entityId = creature.id;
         pin.idleTicks = 0;
+        if (this.livingPins) this.livingPins.add(pin);
         creature.spawnX = pin.x;
         creature.spawnY = pin.y;
         creature.spawnZ = pin.z;
@@ -535,10 +580,12 @@ class World {
 
     despawnPin(pin) {
         if (!pin || pin.state !== 'living' || pin.eager) return;
+        if (this.livingPins) this.livingPins.delete(pin);
         const creature = this.creatures.get(pin.entityId);
         if (creature) {
             this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
             this.creatures.delete(creature.id);
+            if (this.creatureSpatial) this.creatureSpatial.remove(creature.id);
             this.clearTarget(creature.id);
             this.broadcastToViewers(creature.x, creature.y, creature.z, (p) => {
                 p.send(S2C.DISAPPEAR, encodeDisappear(creature.id));
@@ -550,15 +597,24 @@ class World {
         pin.readyTick = 0;
     }
 
+    isCreatureInCombat(cr, playerTargets) {
+        if (!cr) return false;
+        if (cr.targetId) return true;
+        if (playerTargets) return playerTargets.has(cr.id);
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(cr.x, cr.y, cr.z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p.dead && !p.downed && p.targetId === cr.id) return true;
+        }
+        return false;
+    }
+
     pinInCombat(pin) {
         if (!pin || pin.state !== 'living') return false;
         const creature = this.creatures.get(pin.entityId);
         if (!creature) return false;
-        if (creature.targetId) return true;
-        for (const p of this.players.values()) {
-            if (p.targetId === creature.id) return true;
-        }
-        return false;
+        return this.isCreatureInCombat(creature);
     }
 
     tickSpawnPins(tickIndex, opts) {
@@ -571,20 +627,26 @@ class World {
             if (p.dead || p.downed) continue;
             observers.push(p);
         }
-        for (let i = 0; i < this.spawnPins.length; i++) {
-            const pin = this.spawnPins[i];
-            if (pin.state === 'skipped') continue;
-            if (pin.state === 'living') {
+
+        if (this.livingPins && this.livingPins.size > 0) {
+            const livingList = Array.from(this.livingPins);
+            for (let i = 0; i < livingList.length; i++) {
+                const pin = livingList[i];
                 if (pin.eager) continue;
                 const creature = this.creatures.get(pin.entityId);
                 if (!creature) {
                     pin.state = 'idle';
                     pin.entityId = 0;
+                    this.livingPins.delete(pin);
                     continue;
                 }
                 let seen = false;
-                for (let o = 0; o < observers.length; o++) {
-                    const ob = observers[o];
+                const candidateObservers = this.playerSpatial
+                    ? this.playerSpatial.queryChunkCandidates(creature.x, creature.y, creature.z, 16 + margin)
+                    : observers;
+                for (let o = 0; o < candidateObservers.length; o++) {
+                    const ob = candidateObservers[o];
+                    if (ob.dead || ob.downed) continue;
                     if (inSpawnAoi(
                         this.map, ob.x, ob.y, ob.z, creature.x, creature.y, creature.z, margin
                     )) {
@@ -598,21 +660,41 @@ class World {
                 }
                 pin.idleTicks += 1;
                 if (pin.idleTicks >= idleLimit) this.despawnPin(pin);
-                continue;
             }
-            if (pin.eager) {
-                this.activatePin(pin, tickIndex, { appear });
-                continue;
-            }
-            let near = false;
-            for (let o = 0; o < observers.length; o++) {
-                const ob = observers[o];
-                if (inSpawnAoi(this.map, ob.x, ob.y, ob.z, pin.x, pin.y, pin.z, margin)) {
-                    near = true;
-                    break;
+        }
+
+        if (this.eagerPins && this.eagerPins.length) {
+            for (let i = 0; i < this.eagerPins.length; i++) {
+                const pin = this.eagerPins[i];
+                if (pin.state === 'idle' || pin.state === 'cooldown') {
+                    this.activatePin(pin, tickIndex, { appear });
                 }
             }
-            if (near) this.activatePin(pin, tickIndex, { appear });
+        }
+
+        if (observers.length > 0) {
+            const seenPins = new Set();
+            for (let o = 0; o < observers.length; o++) {
+                const ob = observers[o];
+                const win = viewportWindow(this.map, ob.x, ob.y, null, null, ob.z);
+                const minX = win.originX - margin;
+                const maxX = win.originX + win.width + margin - 1;
+                const minY = win.originY - margin;
+                const maxY = win.originY + win.height + margin - 1;
+                const candidateEntries = this.spawnPinSpatial
+                    ? this.spawnPinSpatial.queryRect(minX, minY, maxX, maxY, ob.z)
+                    : this.spawnPins;
+                for (let i = 0; i < candidateEntries.length; i++) {
+                    const entry = candidateEntries[i];
+                    const pin = entry.pin || entry;
+                    if (pin.state === 'skipped' || pin.state === 'living' || pin.eager) continue;
+                    if (seenPins.has(pin.index)) continue;
+                    seenPins.add(pin.index);
+                    if (inSpawnAoi(this.map, ob.x, ob.y, ob.z, pin.x, pin.y, pin.z, margin)) {
+                        this.activatePin(pin, tickIndex, { appear });
+                    }
+                }
+            }
         }
     }
 
@@ -647,6 +729,7 @@ class World {
         applyPlayerLoadout(session, this.itemDb());
         this.players.set(ch.id, session);
         this.byAccount.set(ch.accountId, session);
+        if (this.playerSpatial) this.playerSpatial.insert(session);
         return true;
     }
 
@@ -660,6 +743,7 @@ class World {
         }
         if (this.players.get(ch.id) === session) {
             this.players.delete(ch.id);
+            if (this.playerSpatial) this.playerSpatial.remove(ch.id);
         }
         if (this.byAccount.get(ch.accountId) === session) {
             this.byAccount.delete(ch.accountId);
@@ -685,8 +769,11 @@ class World {
     }
 
     syncAppears(session) {
-        for (const other of this.players.values()) {
-            if (other === session || other.downed) continue;
+        const candidatePlayers = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(session.x, session.y, session.z, 16)
+            : this.players.values();
+        for (const other of candidatePlayers) {
+            if (other === session || other.downed || other.dead) continue;
             if (this.sees(other, session.x, session.y, session.z)) {
                 other.send(S2C.APPEAR, encodeAppear(session));
             }
@@ -694,18 +781,27 @@ class World {
                 session.send(S2C.APPEAR, encodeAppear(other));
             }
         }
-        for (const cr of this.creatures.values()) {
+        const candidateCreatures = this.creatureSpatial
+            ? this.creatureSpatial.queryChunkCandidates(session.x, session.y, session.z, 16)
+            : this.creatures.values();
+        for (const cr of candidateCreatures) {
             if (this.sees(session, cr.x, cr.y, cr.z)) {
                 session.send(S2C.APPEAR, encodeAppear(cr));
             }
         }
-        for (const corpse of this.corpses.values()) {
+        const candidateCorpses = this.corpseSpatial
+            ? this.corpseSpatial.queryChunkCandidates(session.x, session.y, session.z, 16)
+            : this.corpses.values();
+        for (const corpse of candidateCorpses) {
             if (this.sees(session, corpse.x, corpse.y, corpse.z)) {
                 session.send(S2C.CORPSE, encodeCorpse(corpse));
             }
         }
-        for (let i = 0; i < this.worldPins.length; i++) {
-            const inst = this.worldPins[i];
+        const candidatePins = this.worldPinSpatial
+            ? this.worldPinSpatial.queryChunkCandidates(session.x, session.y, session.z, 16)
+            : this.worldPins;
+        for (let i = 0; i < candidatePins.length; i++) {
+            const inst = candidatePins[i];
             if (!inst || inst.removed) continue;
             if (this.sees(session, inst.x, inst.y, inst.z)) {
                 session.send(S2C.WORLD_PIN, encodeWorldPin(inst));
@@ -716,8 +812,11 @@ class World {
 
     broadcastAppear(entity) {
         const buf = encodeAppear(entity);
-        for (const p of this.players.values()) {
-            if (p.downed) continue;
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (p.downed || p.dead) continue;
             if (this.sees(p, entity.x, entity.y, entity.z)) {
                 p.send(S2C.APPEAR, buf);
             }
@@ -728,8 +827,11 @@ class World {
         const x = leaving.x;
         const y = leaving.y;
         const z = leaving.z;
-        for (const other of this.players.values()) {
-            if (other === leaving || other.downed) continue;
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
+            : this.players.values();
+        for (const other of candidates) {
+            if (other === leaving || other.downed || other.dead) continue;
             if (this.sees(other, x, y, z)) {
                 other.send(S2C.DISAPPEAR, encodeDisappear(id));
             }
@@ -767,31 +869,34 @@ class World {
     step(tickIndex) {
         this._tickIndex = tickIndex | 0;
         this.pathBudget.begin(this._tickIndex);
-        const list = Array.from(this.players.values());
-        for (const session of list) {
+        for (const session of this.players.values()) {
             if (session.dead) continue;
             session.movedThisTick = false;
-            const batch = session.intentQueue;
-            session.intentQueue = [];
-            for (const intent of batch) {
-                if (session.dead) break;
-                this.applyIntent(session, intent, tickIndex);
+            const queue = session.intentQueue;
+            const len = queue.length;
+            if (len > 0) {
+                for (let i = 0; i < len; i++) {
+                    if (session.dead) break;
+                    this.applyIntent(session, queue[i], tickIndex);
+                }
+                queue.length = 0;
             }
         }
-        for (const session of list) {
+        for (const session of this.players.values()) {
             if (session.dead || session.downed) continue;
             this.tickPlayerCombat(session, tickIndex);
             this.tickTalkRange(session);
         }
         this.tickSpawnPins(tickIndex);
-        for (const cr of Array.from(this.creatures.values())) {
+        this.updateCreatureSleepStates(tickIndex);
+        for (const cr of this.creatures.values()) {
             this.tickCreature(cr, tickIndex);
         }
         this.tickWorldPins(tickIndex);
         this.tickCombatStatus(tickIndex);
         this.tickCorpses(tickIndex);
         this.tickRespawns(tickIndex);
-        for (const session of list) {
+        for (const session of this.players.values()) {
             if (session.dead || !session.downed) continue;
             if (tickIndex >= session.respawnTick) {
                 this.respawnPlayer(session, tickIndex);
@@ -1125,6 +1230,7 @@ class World {
         this.worldPinByNumeric.delete(inst.id);
         const key = worldPinTileKey(inst.x, inst.y, inst.z);
         if (this.worldPinsByTile.get(key) === inst) this.worldPinsByTile.delete(key);
+        if (this.worldPinSpatial) this.worldPinSpatial.remove(inst.id);
         const gone = encodeWorldPinGone(inst.id);
         this.broadcastToViewers(inst.x, inst.y, inst.z, (p) => {
             p.send(S2C.WORLD_PIN_GONE, gone);
@@ -1144,8 +1250,11 @@ class World {
     }
 
     sendViewportToViewers(x, y, z) {
-        for (const p of this.players.values()) {
-            if (p.dead || p.downed) continue;
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p || p.dead || p.downed) continue;
             if (this.sees(p, x, y, z)) {
                 p.send(S2C.VIEWPORT, encodeViewport(this.viewportOf(p)));
             }
@@ -1287,9 +1396,86 @@ class World {
         }
     }
 
+    updateCreatureSleepStates(tickIndex) {
+        const sleepEnabled = !this.settings || this.settings.aiCreatureSleep !== false;
+        const now = this.logicNow(tickIndex);
+        const repathSec = (this.settings && this.settings.aiRepathIntervalSec != null)
+            ? Number(this.settings.aiRepathIntervalSec)
+            : 2.0;
+
+        if (!sleepEnabled) {
+            for (const cr of this.creatures.values()) {
+                if (cr.simSleeping) {
+                    cr.simSleeping = false;
+                    seedPathPhase(cr, repathSec, now);
+                }
+            }
+            return;
+        }
+
+        const radius = (this.settings && this.settings.aiTickRadius != null)
+            ? (this.settings.aiTickRadius | 0)
+            : 12;
+
+        const activePlayers = [];
+        const playerTargets = new Set();
+        for (const p of this.players.values()) {
+            if (!p.dead && !p.downed) {
+                activePlayers.push(p);
+                if (p.targetId) playerTargets.add(p.targetId);
+            }
+        }
+
+        for (const cr of this.creatures.values()) {
+            if (isNpcEntity(cr)) continue;
+            if ((cr.hp | 0) <= 0) {
+                if (cr.simSleeping) cr.simSleeping = false;
+                continue;
+            }
+
+            const inCombat = this.isCreatureInCombat(cr, playerTargets);
+            let wantSleep = false;
+
+            if (!inCombat) {
+                if (radius <= 0) {
+                    wantSleep = false;
+                } else if (activePlayers.length === 0) {
+                    wantSleep = true;
+                } else {
+                    let nearPlayer = false;
+                    const cz = cr.z | 0;
+                    const cx = cr.x | 0;
+                    const cy = cr.y | 0;
+                    const candidates = this.playerSpatial
+                        ? this.playerSpatial.queryChunkCandidates(cx, cy, cz, radius)
+                        : activePlayers;
+                    for (let i = 0; i < candidates.length; i++) {
+                        const p = candidates[i];
+                        if (p.dead || p.downed) continue;
+                        if ((p.z | 0) !== cz) continue;
+                        if (chebyshev(cx, cy, p.x | 0, p.y | 0) <= radius) {
+                            nearPlayer = true;
+                            break;
+                        }
+                    }
+                    wantSleep = !nearPlayer;
+                }
+            }
+
+            const wasSleeping = !!cr.simSleeping;
+            if (wasSleeping && !wantSleep) {
+                cr.simSleeping = false;
+                seedPathPhase(cr, repathSec, now);
+            } else if (!wasSleeping && wantSleep) {
+                cr.simSleeping = true;
+            }
+        }
+    }
+
     tickCreature(cr, tickIndex) {
         if (isNpcEntity(cr)) return;
         if ((cr.hp | 0) <= 0) return;
+        if (cr.simSleeping) return;
         let target = this.getEntity(cr.targetId);
         if (target && (target.downed || target.type !== 'player')) target = null;
         if (target) {
@@ -1328,13 +1514,17 @@ class World {
     }
 
     nearestPlayer(from, range) {
+        const r = Math.max(0, Number(range) || 0);
         let best = null;
-        let bestD = range + 1;
-        for (const p of this.players.values()) {
-            if (p.downed || p.dead) continue;
+        let bestD = r + 1;
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, r)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p || p.downed || p.dead) continue;
             if ((p.z | 0) !== (from.z | 0)) continue;
             const d = chebyshev(from.x, from.y, p.x, p.y);
-            if (d <= range && d < bestD) {
+            if (d <= r && d < bestD) {
                 best = p;
                 bestD = d;
             }
@@ -1417,8 +1607,16 @@ class World {
         this.broadcastSwing(attacker, defender, amount, flags);
         if (flags & SWING_DEATH) {
             this.kill(defender, attacker, tickIndex);
-        } else if (!hit.miss && defender.type === 'creature' && !defender.targetId) {
-            defender.targetId = attacker.id;
+        } else if (!hit.miss && defender.type === 'creature') {
+            if (!defender.targetId) defender.targetId = attacker.id;
+            if (defender.simSleeping) {
+                defender.simSleeping = false;
+                seedPathPhase(
+                    defender,
+                    (this.settings && this.settings.aiRepathIntervalSec) || 2.0,
+                    this.logicNow(tickIndex)
+                );
+            }
         }
         return true;
     }
@@ -1437,6 +1635,14 @@ class World {
         }
         if (incoming <= 0) return 0;
         this.applyHp(entity, (entity.hp | 0) - incoming);
+        if (entity.type === 'creature' && entity.simSleeping) {
+            entity.simSleeping = false;
+            seedPathPhase(
+                entity,
+                (this.settings && this.settings.aiRepathIntervalSec) || 2.0,
+                this.logicNow(tickIndex)
+            );
+        }
         this.broadcastStats(entity);
         if ((entity.hp | 0) <= 0) this.kill(entity, killer || null, tickIndex);
         return incoming;
@@ -1541,9 +1747,15 @@ class World {
     broadcastStats(entity) {
         if (!entity) return;
         const stats = encodeStats(entity);
-        for (const p of this.players.values()) {
-            if (p.downed && p !== entity) continue;
-            if (p === entity || this.sees(p, entity.x, entity.y, entity.z)) {
+        if (entity.type === 'player' && entity.send && !entity.dead) {
+            entity.send(S2C.STATS, stats);
+        }
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p || p === entity || p.downed || p.dead) continue;
+            if (this.sees(p, entity.x, entity.y, entity.z)) {
                 p.send(S2C.STATS, stats);
             }
         }
@@ -1557,8 +1769,11 @@ class World {
             flags
         });
         const stats = encodeStats(defender);
-        for (const p of this.players.values()) {
-            if (p.downed && p !== defender) continue;
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(defender.x, defender.y, defender.z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p || (p.downed && p !== defender) || p.dead) continue;
             if (p === attacker || p === defender
                 || this.sees(p, defender.x, defender.y, defender.z)
                 || this.sees(p, attacker.x, attacker.y, attacker.z)) {
@@ -1595,6 +1810,7 @@ class World {
     killCreature(creature, killer, tickIndex) {
         this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
         this.creatures.delete(creature.id);
+        if (this.creatureSpatial) this.creatureSpatial.remove(creature.id);
         this.broadcastToViewers(creature.x, creature.y, creature.z, (p) => {
             p.send(S2C.DEATH, encodeDeath(creature.id, killer && killer.id));
             p.send(S2C.DISAPPEAR, encodeDisappear(creature.id));
@@ -1603,6 +1819,8 @@ class World {
         const corpse = createCorpse(this.nextCorpseId, creature, items, tickIndex);
         this.nextCorpseId += 1;
         this.corpses.set(corpse.id, corpse);
+        this.corpseQueue.push(corpse);
+        if (this.corpseSpatial) this.corpseSpatial.insert(corpse);
         const corpseBuf = encodeCorpse(corpse);
         this.broadcastToViewers(corpse.x, corpse.y, corpse.z, (p) => {
             p.send(S2C.CORPSE, corpseBuf);
@@ -1612,6 +1830,7 @@ class World {
         }
         const pin = creature.pinIndex != null ? this.spawnPins[creature.pinIndex] : null;
         if (pin) {
+            if (this.livingPins) this.livingPins.delete(pin);
             pin.entityId = 0;
             pin.idleTicks = 0;
             const delay = respawnDelayTicks(pin, this.settings);
@@ -1625,12 +1844,12 @@ class World {
             return;
         }
         const respawn = Math.max(1, (this.settings.creatureRespawnTicks | 0) || 200);
-        this.pendingSpawns.push({
+        this.enqueuePendingSpawn({
             kind: creature.kind,
             x: creature.spawnX,
             y: creature.spawnY,
             z: creature.spawnZ,
-            at: tickIndex + respawn
+            at: (tickIndex | 0) + respawn
         });
     }
 
@@ -1652,6 +1871,7 @@ class World {
             session.y = alt.y;
             session.z = alt.z;
         }
+        if (this.playerSpatial) this.playerSpatial.update(session);
         this.applyHp(session, session.hpMax);
         session.downed = false;
         session.targetId = 0;
@@ -1668,14 +1888,23 @@ class World {
 
     tickCorpses(tickIndex) {
         const decay = Math.max(1, (this.settings.corpseDecayTicks | 0) || 600);
-        for (const corpse of Array.from(this.corpses.values())) {
-            if (tickIndex - corpse.bornTick < decay) continue;
-            this.removeCorpse(corpse);
+        while (this.corpseQueue.length > 0) {
+            const head = this.corpseQueue[0];
+            if (!this.corpses.has(head.id)) {
+                this.corpseQueue.shift();
+                continue;
+            }
+            if ((tickIndex | 0) - (head.bornTick | 0) < decay) {
+                break;
+            }
+            this.corpseQueue.shift();
+            this.removeCorpse(head);
         }
     }
 
     removeCorpse(corpse) {
         this.corpses.delete(corpse.id);
+        if (this.corpseSpatial) this.corpseSpatial.remove(corpse.id);
         const gone = encodeCorpseGone(corpse.id);
         this.broadcastToViewers(corpse.x, corpse.y, corpse.z, (p) => {
             p.send(S2C.CORPSE_GONE, gone);
@@ -1685,21 +1914,33 @@ class World {
         }
     }
 
-    tickRespawns(tickIndex) {
-        if (!this.pendingSpawns.length) return;
-        const still = [];
-        for (let i = 0; i < this.pendingSpawns.length; i++) {
-            const row = this.pendingSpawns[i];
-            if (tickIndex < row.at) {
-                still.push(row);
-                continue;
-            }
-            if (!this.spawnCreature(row.kind, row.x, row.y, row.z)) {
-                row.at = tickIndex + 20;
-                still.push(row);
+    enqueuePendingSpawn(item) {
+        let low = 0;
+        let high = this.pendingSpawns.length;
+        const target = item.at | 0;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if ((this.pendingSpawns[mid].at | 0) <= target) {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
         }
-        this.pendingSpawns = still;
+        this.pendingSpawns.splice(low, 0, item);
+    }
+
+    tickRespawns(tickIndex) {
+        while (this.pendingSpawns.length > 0) {
+            const head = this.pendingSpawns[0];
+            if ((tickIndex | 0) < (head.at | 0)) {
+                break;
+            }
+            this.pendingSpawns.shift();
+            if (!this.spawnCreature(head.kind, head.x, head.y, head.z)) {
+                head.at = (tickIndex | 0) + 20;
+                this.enqueuePendingSpawn(head);
+            }
+        }
     }
 
     clearTarget(id) {
@@ -1716,9 +1957,15 @@ class World {
     }
 
     broadcastToViewers(x, y, z, fn, include) {
-        for (const p of this.players.values()) {
-            if (p.dead) continue;
-            if (p === include || this.sees(p, x, y, z)) fn(p);
+        if (include && !include.dead) {
+            fn(include);
+        }
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
+            : this.players.values();
+        for (const p of candidates) {
+            if (!p || p.dead || p === include) continue;
+            if (this.sees(p, x, y, z)) fn(p);
         }
     }
 
@@ -1736,8 +1983,28 @@ class World {
             entity.send(S2C.VIEWPORT, encodeViewport(this.viewportOf(entity)));
         }
 
-        for (const other of this.players.values()) {
-            if (other === entity || other.downed) continue;
+        const candidatePlayers = [];
+        if (this.playerSpatial) {
+            const seen = new Set();
+            const addPlayers = (list) => {
+                for (let i = 0; i < list.length; i++) {
+                    const p = list[i];
+                    if (!p || seen.has(p.id)) continue;
+                    seen.add(p.id);
+                    candidatePlayers.push(p);
+                }
+            };
+            addPlayers(this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
+            if ((from.z | 0) !== (entity.z | 0)) {
+                addPlayers(this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+            }
+        } else {
+            for (const p of this.players.values()) candidatePlayers.push(p);
+        }
+
+        for (let i = 0; i < candidatePlayers.length; i++) {
+            const other = candidatePlayers[i];
+            if (other === entity || other.downed || other.dead) continue;
             const otherSaw = this.sees(other, from.x, from.y, from.z);
             const otherSees = this.sees(other, entity.x, entity.y, entity.z);
             if (!otherSaw && otherSees) {
@@ -1751,7 +2018,27 @@ class World {
 
         if (entity.type !== 'player' || entity.downed) return;
 
-        for (const cr of this.creatures.values()) {
+        const candidateCreatures = [];
+        if (this.creatureSpatial) {
+            const seenCr = new Set();
+            const addCr = (list) => {
+                for (let i = 0; i < list.length; i++) {
+                    const cr = list[i];
+                    if (!cr || seenCr.has(cr.id)) continue;
+                    seenCr.add(cr.id);
+                    candidateCreatures.push(cr);
+                }
+            };
+            addCr(this.creatureSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
+            if ((from.z | 0) !== (entity.z | 0)) {
+                addCr(this.creatureSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+            }
+        } else {
+            for (const cr of this.creatures.values()) candidateCreatures.push(cr);
+        }
+
+        for (let i = 0; i < candidateCreatures.length; i++) {
+            const cr = candidateCreatures[i];
             const selfSaw = inViewport(
                 this.map, from.x, from.y, cr.x, cr.y, cr.z, null, null, from.z
             );
@@ -1762,8 +2049,10 @@ class World {
                 entity.send(S2C.DISAPPEAR, encodeDisappear(cr.id));
             }
         }
-        for (const other of this.players.values()) {
-            if (other === entity || other.downed) continue;
+
+        for (let i = 0; i < candidatePlayers.length; i++) {
+            const other = candidatePlayers[i];
+            if (other === entity || other.downed || other.dead) continue;
             const selfSaw = inViewport(
                 this.map, from.x, from.y, other.x, other.y, other.z, null, null, from.z
             );
@@ -1774,7 +2063,28 @@ class World {
                 entity.send(S2C.DISAPPEAR, encodeDisappear(other.id));
             }
         }
-        for (const corpse of this.corpses.values()) {
+
+        const candidateCorpses = [];
+        if (this.corpseSpatial) {
+            const seenCp = new Set();
+            const addCp = (list) => {
+                for (let i = 0; i < list.length; i++) {
+                    const cp = list[i];
+                    if (!cp || seenCp.has(cp.id)) continue;
+                    seenCp.add(cp.id);
+                    candidateCorpses.push(cp);
+                }
+            };
+            addCp(this.corpseSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
+            if ((from.z | 0) !== (entity.z | 0)) {
+                addCp(this.corpseSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+            }
+        } else {
+            for (const cp of this.corpses.values()) candidateCorpses.push(cp);
+        }
+
+        for (let i = 0; i < candidateCorpses.length; i++) {
+            const corpse = candidateCorpses[i];
             const selfSaw = inViewport(
                 this.map, from.x, from.y, corpse.x, corpse.y, corpse.z, null, null, from.z
             );
@@ -1785,8 +2095,31 @@ class World {
                 entity.send(S2C.CORPSE_GONE, encodeCorpseGone(corpse.id));
             }
         }
-        for (let i = 0; i < this.worldPins.length; i++) {
-            const inst = this.worldPins[i];
+
+        const candidatePins = [];
+        if (this.worldPinSpatial) {
+            const seenP = new Set();
+            const addP = (list) => {
+                for (let i = 0; i < list.length; i++) {
+                    const pin = list[i];
+                    if (!pin || seenP.has(pin.id)) continue;
+                    seenP.add(pin.id);
+                    candidatePins.push(pin);
+                }
+            };
+            addP(this.worldPinSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
+            if ((from.z | 0) !== (entity.z | 0)) {
+                addP(this.worldPinSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+            }
+        } else {
+            for (let i = 0; i < this.worldPins.length; i++) {
+                const inst = this.worldPins[i];
+                if (inst && !inst.removed) candidatePins.push(inst);
+            }
+        }
+
+        for (let i = 0; i < candidatePins.length; i++) {
+            const inst = candidatePins[i];
             if (!inst || inst.removed) continue;
             const selfSaw = inViewport(
                 this.map, from.x, from.y, inst.x, inst.y, inst.z, null, null, from.z
@@ -2408,23 +2741,32 @@ class World {
         return out;
     }
 
+    _applyConditionHpDelta(ent, amount, element) {
+        if (element === 'healing') {
+            this.applyHp(ent, (ent.hp | 0) + Math.abs(amount | 0));
+            this.broadcastStats(ent);
+            return;
+        }
+        this.applyDamage(ent, amount, element, this._tickIndex, null);
+    }
+
+    tickCombatantConditions(ent, dt) {
+        if (ent.conditions && ent.conditions.length > 0) {
+            const cond = tickConditions(ent, dt, this._conditionHooks);
+            if (cond.ticks && cond.ticks.length) this.broadcastStats(ent);
+        }
+    }
+
     tickCombatStatus(tickIndex) {
         const dt = 1 / ((this.settings.logicUps | 0) || 20);
         const now = this.logicNow(tickIndex);
-        const list = this.livingCombatants();
-        for (let i = 0; i < list.length; i++) {
-            Cooldowns.tick(list[i], dt);
-            const cond = tickConditions(list[i], dt, {
-                applyHpDelta: (ent, amount, element) => {
-                    if (element === 'healing') {
-                        this.applyHp(ent, (ent.hp | 0) + Math.abs(amount | 0));
-                        this.broadcastStats(ent);
-                        return;
-                    }
-                    this.applyDamage(ent, amount, element, tickIndex, null);
-                }
-            });
-            if (cond.ticks && cond.ticks.length) this.broadcastStats(list[i]);
+        for (const p of this.players.values()) {
+            if (p.dead || p.downed || (p.hp | 0) <= 0) continue;
+            this.tickCombatantConditions(p, dt);
+        }
+        for (const cr of this.creatures.values()) {
+            if ((cr.hp | 0) <= 0 || cr.simSleeping) continue;
+            this.tickCombatantConditions(cr, dt);
         }
         const gone = purgeExpiredFields(
             this.fieldStore,
@@ -2510,7 +2852,7 @@ class World {
                 consumeItemIdFromInventory(ent.inventory, id, 1);
                 if (ent.type === 'player') this.sendInventory(ent);
             },
-            candidates: this.livingCombatants()
+            candidates: (spell && spell.chain) ? this.livingCombatants() : undefined
         });
         if (!result.ok) {
             const text = sayForReason(result.reason);

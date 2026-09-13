@@ -39,30 +39,56 @@ function ensureCooldowns(entity) {
     return entity.cooldowns;
 }
 
-function getRemaining(entity, bucket, key) {
-    const cds = entity && entity.cooldowns;
-    if (!cds || !cds[bucket]) return 0;
-    const v = cds[bucket][key];
-    return v > 0 ? v : 0;
+function resolveNow(entity, now) {
+    if (now != null && Number.isFinite(Number(now))) {
+        return Number(now);
+    }
+    if (entity && entity.world && typeof entity.world.logicNow === 'function') {
+        return entity.world.logicNow(entity.world._tickIndex);
+    }
+    return 0;
 }
 
-function canUse(entity, spec) {
+function getRemaining(entity, bucket, key, now) {
+    const cds = entity && entity.cooldowns;
+    if (!cds || !cds[bucket]) return 0;
+    const readyAt = cds[bucket][key];
+    if (readyAt == null || readyAt <= 0) return 0;
+    const current = resolveNow(entity, now);
+    const rem = readyAt - current;
+    return rem > 0 ? rem : 0;
+}
+
+function isReady(entity, bucket, key, now) {
+    const cds = entity && entity.cooldowns;
+    if (!cds || !cds[bucket]) return true;
+    const readyAt = cds[bucket][key];
+    if (readyAt == null || readyAt <= 0) return true;
+    const current = resolveNow(entity, now);
+    return current >= readyAt;
+}
+
+function canUse(entity, spec, now) {
     if (!spec || typeof spec !== 'object') return true;
     ensureCooldowns(entity);
+    const current = resolveNow(entity, now);
     for (let i = 0; i < BUCKETS.length; i++) {
         const bucket = BUCKETS[i];
         const keys = spec[bucket];
         if (!keys || typeof keys !== 'object') continue;
+        const bucketCds = entity.cooldowns[bucket];
         for (const key of Object.keys(keys)) {
-            if (getRemaining(entity, bucket, key) > 0) return false;
+            const readyAt = bucketCds && bucketCds[key];
+            if (readyAt != null && readyAt > current) return false;
         }
     }
     return true;
 }
 
-function apply(entity, spec) {
+function apply(entity, spec, now) {
     if (!spec || typeof spec !== 'object') return;
     const cds = ensureCooldowns(entity);
+    const current = resolveNow(entity, now);
     for (let i = 0; i < BUCKETS.length; i++) {
         const bucket = BUCKETS[i];
         const keys = spec[bucket];
@@ -70,29 +96,21 @@ function apply(entity, spec) {
         if (!cds[bucket]) cds[bucket] = {};
         for (const key of Object.keys(keys)) {
             const dur = Number(keys[key]) || 0;
-            if (dur > 0) cds[bucket][key] = dur;
+            if (dur > 0) {
+                cds[bucket][key] = current + dur;
+            }
         }
     }
 }
 
 function tick(entity, dt) {
-    if (!entity || !entity.cooldowns) return;
-    const step = Math.max(0, Number(dt) || 0);
-    if (step === 0) return;
-    const cds = entity.cooldowns;
-    for (let i = 0; i < BUCKETS.length; i++) {
-        const bucket = BUCKETS[i];
-        const map = cds[bucket];
-        if (!map) continue;
-        for (const key of Object.keys(map)) {
-            if (map[key] > 0) map[key] = Math.max(0, map[key] - step);
-        }
-    }
+    // No-op with timestamp-based cooldown deadlines.
 }
 
-function tryUse(entity, spec) {
-    if (!canUse(entity, spec)) return false;
-    apply(entity, spec);
+function tryUse(entity, spec, now) {
+    const current = resolveNow(entity, now);
+    if (!canUse(entity, spec, current)) return false;
+    apply(entity, spec, current);
     return true;
 }
 
@@ -101,6 +119,7 @@ module.exports = {
     createCooldownState,
     ensureCooldowns,
     getRemaining,
+    isReady,
     canUse,
     apply,
     tick,

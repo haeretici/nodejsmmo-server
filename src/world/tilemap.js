@@ -262,6 +262,9 @@ class TileMap {
         this.crushOn = opts.crush == null ? true : !!opts.crush;
         this.onCrush = opts.onCrush || null;
         this.onPushed = opts.onPushed || null;
+        this.onMove = opts.onMove || null;
+        this.playerSpatial = opts.playerSpatial || null;
+        this.creatureSpatial = opts.creatureSpatial || null;
         this.budget = opts.budget || null;
         this.pathOpts = opts.path && typeof opts.path === 'object' ? opts.path : {};
     }
@@ -798,6 +801,14 @@ class TileMap {
             entity.y = y | 0;
             entity.z = z | 0;
         }
+        if (this.onMove) {
+            this.onMove(entity, fromX, fromY, fromZ, x, y, z);
+        }
+        if (this.playerSpatial && (entity.type === 'player' || this.playerSpatial.has(id))) {
+            this.playerSpatial.update(entity);
+        } else if (this.creatureSpatial && (entity.type === 'creature' || entity.type === 'npc' || this.creatureSpatial.has(id))) {
+            this.creatureSpatial.update(entity);
+        }
         const reason = opts && opts.reason != null ? String(opts.reason) : '';
         if (!isStairReason(reason)) this.tryAutoStairHop(entity);
         return true;
@@ -1114,6 +1125,9 @@ function fromStaticMap(map, opts) {
         crush: opts && opts.crush,
         onCrush: opts && opts.onCrush,
         onPushed: opts && opts.onPushed,
+        onMove: opts && opts.onMove,
+        playerSpatial: opts && opts.playerSpatial,
+        creatureSpatial: opts && opts.creatureSpatial,
         budget: opts && opts.budget,
         path: opts && opts.path
     });

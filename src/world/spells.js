@@ -222,8 +222,9 @@ function canCast(attacker, spell, ctx) {
         && tileMap.blocksCast(attacker.x, attacker.y, attacker.z)) {
         return { ok: false, reason: 'no_cast' };
     }
+    const now = c.now != null ? Number(c.now) : (c.tickIndex != null ? Number(c.tickIndex) / 20 : null);
     Cooldowns.ensureCooldowns(attacker);
-    if (!c.skipCooldown && !Cooldowns.canUse(attacker, spell.cooldowns)) {
+    if (!c.skipCooldown && !Cooldowns.canUse(attacker, spell.cooldowns, now)) {
         return { ok: false, reason: 'cooldown' };
     }
     if (!c.skipMana && !hasMana(attacker, spell.mana || 0)) {
@@ -431,11 +432,12 @@ function resolveCast(opts) {
         center = casterPos;
     }
 
+    const now = o.now != null ? Number(o.now) : (o.tickIndex != null ? Number(o.tickIndex) / 20 : 0);
     const delaySec = spell.delaySec != null ? Number(spell.delaySec) : 0;
     if (delaySec > 0 && !o.detonate) {
         const manaCost = spell.mana != null ? spell.mana : 0;
         if (!o.skipMana) spendMana(attacker, manaCost);
-        if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns);
+        if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, now);
         if (isRuneSpell(spell) && o.runeConsumption && typeof o.consumeRune === 'function') {
             o.consumeRune(attacker, spell);
         }
@@ -459,12 +461,11 @@ function resolveCast(opts) {
 
     const manaCost = spell.mana != null ? spell.mana : 0;
     if (!o.skipMana) spendMana(attacker, manaCost);
-    if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns);
+    if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, now);
     if (isRuneSpell(spell) && o.runeConsumption && typeof o.consumeRune === 'function') {
         o.consumeRune(attacker, spell);
     }
 
-    const now = o.now != null ? Number(o.now) : 0;
     const hits = [];
     const fields = [];
     const purged = [];
