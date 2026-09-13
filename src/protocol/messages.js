@@ -1,7 +1,7 @@
 'use strict';
 
 const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND } = require('./opcodes');
-const { Writer, Reader, clampU16 } = require('./frame');
+const { FastWriter, Writer, Reader, clampU16 } = require('./frame');
 
 function wrap(fn, payload) {
     try {
@@ -12,7 +12,7 @@ function wrap(fn, payload) {
 }
 
 function encodeHello({ ups, tickIndex, enterTimeoutMs, protocolVersion }) {
-    return new Writer()
+    return new FastWriter()
         .u16(protocolVersion == null ? PROTOCOL_VERSION : protocolVersion)
         .u8(ups)
         .u32(tickIndex >>> 0)
@@ -33,7 +33,7 @@ function decodeHello(payload) {
 }
 
 function encodeKick(reason) {
-    return new Writer().u8(reason).toBuffer();
+    return new FastWriter().u8(reason).toBuffer();
 }
 
 function decodeKick(payload) {
@@ -41,7 +41,7 @@ function decodeKick(payload) {
 }
 
 function encodeReject(refSeq, reason) {
-    return new Writer().u32(refSeq).u8(reason).toBuffer();
+    return new FastWriter().u32(refSeq).u8(reason).toBuffer();
 }
 
 function decodeReject(payload) {
@@ -52,7 +52,7 @@ function decodeReject(payload) {
 }
 
 function encodePong(clientMs, serverMs, tickIndex) {
-    return new Writer()
+    return new FastWriter()
         .u32(clientMs >>> 0)
         .u32(serverMs >>> 0)
         .u32(tickIndex >>> 0)
@@ -94,7 +94,7 @@ function decodeUseStair(payload) {
 }
 
 function encodeUseTile(x, y, z) {
-    return new Writer()
+    return new FastWriter()
         .i16(x)
         .i16(y)
         .i8(z)
@@ -112,7 +112,7 @@ function decodeUseTile(payload) {
 }
 
 function encodeUseItemWith({ x, y, z, itemId }) {
-    return new Writer()
+    return new FastWriter()
         .i16(x)
         .i16(y)
         .i8(z)
@@ -142,7 +142,7 @@ function worldPinFlags(inst) {
 }
 
 function encodeWorldPin(inst) {
-    return new Writer()
+    return new FastWriter()
         .u32((inst && inst.id) >>> 0)
         .i16(inst && inst.x)
         .i16(inst && inst.y)
@@ -169,7 +169,7 @@ function decodeWorldPin(payload) {
 }
 
 function encodeWorldPinGone(id) {
-    return new Writer().u32(id >>> 0).toBuffer();
+    return new FastWriter().u32(id >>> 0).toBuffer();
 }
 
 function decodeWorldPinGone(payload) {
@@ -196,7 +196,7 @@ function readViewport(r) {
 }
 
 function encodeEnterWorld({ character, x, y, z, viewport }) {
-    const w = new Writer();
+    const w = new FastWriter();
     w.u32(character.id);
     w.str(character.name);
     w.str(character.vocation);
@@ -267,7 +267,7 @@ function appearFlags(entity) {
 
 function encodeAppear(entity) {
     const v = appearView(entity);
-    return new Writer()
+    return new FastWriter()
         .u32(v.id)
         .str(v.name)
         .i16(v.x)
@@ -298,7 +298,7 @@ function decodeAppear(payload) {
 }
 
 function encodeDisappear(id) {
-    return new Writer().u32(id).toBuffer();
+    return new FastWriter().u32(id).toBuffer();
 }
 
 function decodeDisappear(payload) {
@@ -306,7 +306,7 @@ function decodeDisappear(payload) {
 }
 
 function encodeViewport(vp) {
-    const w = new Writer();
+    const w = new FastWriter();
     writeViewport(w, vp);
     return w.toBuffer();
 }
@@ -316,7 +316,7 @@ function decodeViewport(payload) {
 }
 
 function encodeMove({ id, x, y, z, dir }) {
-    return new Writer()
+    return new FastWriter()
         .u32(id)
         .i16(x)
         .i16(y)
@@ -393,7 +393,7 @@ function encodeStats(entity) {
     const mp = entity && entity.mp != null ? entity.mp : (ch && ch.mp) || 0;
     const mpMax = entity && entity.mpMax != null ? entity.mpMax : (ch && ch.mpMax) || 0;
     const v = appearView(entity);
-    return new Writer()
+    return new FastWriter()
         .u32(v.id)
         .u16(clampU16(v.hp))
         .u16(clampU16(v.hpMax))
@@ -416,7 +416,7 @@ function decodeStats(payload) {
 }
 
 function encodeSwing({ sourceId, targetId, amount, flags }) {
-    return new Writer()
+    return new FastWriter()
         .u32(sourceId >>> 0)
         .u32(targetId >>> 0)
         .u16(clampU16(amount))
@@ -437,7 +437,7 @@ function decodeSwing(payload) {
 }
 
 function encodeDeath(id, killerId) {
-    return new Writer()
+    return new FastWriter()
         .u32(id >>> 0)
         .u32((killerId || 0) >>> 0)
         .toBuffer();
@@ -451,7 +451,7 @@ function decodeDeath(payload) {
 }
 
 function encodeCorpse(corpse) {
-    return new Writer()
+    return new FastWriter()
         .u32(corpse.id >>> 0)
         .i16(corpse.x)
         .i16(corpse.y)
@@ -474,7 +474,7 @@ function decodeCorpse(payload) {
 }
 
 function encodeCorpseGone(id) {
-    return new Writer().u32(id >>> 0).toBuffer();
+    return new FastWriter().u32(id >>> 0).toBuffer();
 }
 
 function decodeCorpseGone(payload) {
@@ -483,7 +483,7 @@ function decodeCorpseGone(payload) {
 
 function encodeContainer(corpse) {
     const items = (corpse && corpse.items) || [];
-    const w = new Writer();
+    const w = new FastWriter();
     w.u32((corpse && corpse.id) >>> 0);
     w.u8(Math.min(255, items.length));
     const n = Math.min(255, items.length);
@@ -508,7 +508,7 @@ function decodeContainer(payload) {
 }
 
 function encodeItemGain(id, count) {
-    return new Writer()
+    return new FastWriter()
         .str(id)
         .u16(clampU16(count))
         .toBuffer();
@@ -522,7 +522,7 @@ function decodeItemGain(payload) {
 }
 
 function encodeExp(total, gained, level) {
-    const w = new Writer()
+    const w = new FastWriter()
         .u32(total >>> 0)
         .u32(gained >>> 0);
     if (level != null) w.u16(clampU16(level));
@@ -579,7 +579,7 @@ function asBagView(input) {
 
 function encodeInventory(input) {
     const view = asBagView(input);
-    const w = new Writer();
+    const w = new FastWriter();
     w.str(view.containerId || '');
     w.u8(Math.min(255, view.capacity | 0));
     const slots = view.slots || [];
@@ -614,7 +614,7 @@ function decodeInventory(payload) {
 }
 
 function encodeEquipment({ cap, capMax, slots }) {
-    const w = new Writer();
+    const w = new FastWriter();
     w.u16(clampU16(cap));
     w.u16(clampU16(capMax));
     const list = slots || [];
@@ -651,7 +651,7 @@ function decodeBag(payload) {
 }
 
 function encodeContainerSlot(containerId, index) {
-    return new Writer()
+    return new FastWriter()
         .str(containerId || '')
         .u8(index | 0)
         .toBuffer();
@@ -667,7 +667,7 @@ function decodeContainerSlot(payload) {
 }
 
 function encodeEquip(containerId, index, slot) {
-    const w = new Writer()
+    const w = new FastWriter()
         .str(containerId || '')
         .u8(index | 0);
     w.str(slot || '');
@@ -685,7 +685,7 @@ function decodeEquip(payload) {
 }
 
 function encodeUnequip(slot) {
-    return new Writer().str(slot || '').toBuffer();
+    return new FastWriter().str(slot || '').toBuffer();
 }
 
 function decodeUnequip(payload) {
@@ -709,7 +709,7 @@ function writeItemLoc(w, loc) {
 }
 
 function encodeMoveItem(from, to, count) {
-    const w = new Writer();
+    const w = new FastWriter();
     writeItemLoc(w, from);
     writeItemLoc(w, to);
     w.u16(clampU16(count || 0));
@@ -735,11 +735,11 @@ function decodeMoveItem(payload) {
 }
 
 function encodeSay(text) {
-    return new Writer().str(text == null ? '' : text).toBuffer();
+    return new FastWriter().str(text == null ? '' : text).toBuffer();
 }
 
 function encodeSkills(skills) {
-    const w = new Writer();
+    const w = new FastWriter();
     const src = skills && typeof skills === 'object' ? skills : {};
     for (let i = 0; i < SKILL_ORDER.length; i++) {
         const n = Math.floor(Number(src[SKILL_ORDER[i]]));
@@ -807,7 +807,7 @@ function decodeShopDeal(payload) {
 function encodeDialog({ npcId, nodeId, text, replies }) {
     const list = replies || [];
     const n = Math.min(255, list.length);
-    const w = new Writer();
+    const w = new FastWriter();
     w.u32(npcId >>> 0);
     w.str(nodeId || '');
     w.str(text == null ? '' : text);
@@ -834,7 +834,7 @@ function decodeDialog(payload) {
 }
 
 function encodeDialogClose(npcId) {
-    return new Writer().u32(npcId >>> 0).toBuffer();
+    return new FastWriter().u32(npcId >>> 0).toBuffer();
 }
 
 function decodeDialogClose(payload) {
@@ -844,7 +844,7 @@ function decodeDialogClose(payload) {
 function encodeShop({ npcId, currency, items }) {
     const list = items || [];
     const n = Math.min(255, list.length);
-    const w = new Writer();
+    const w = new FastWriter();
     w.u32(npcId >>> 0);
     w.str(currency || 'gold_coin');
     w.u8(n);
@@ -871,7 +871,7 @@ function decodeShop(payload) {
 }
 
 function encodeCast({ spellId, targetId, x, y, z }) {
-    return new Writer()
+    return new FastWriter()
         .str(spellId || '')
         .u32((targetId || 0) >>> 0)
         .i16(x || 0)
@@ -899,7 +899,7 @@ function decodeCast(payload) {
 }
 
 function encodeCastFx({ sourceId, spellId, targetId, x, y, z, flags }) {
-    return new Writer()
+    return new FastWriter()
         .u32((sourceId || 0) >>> 0)
         .str(spellId || '')
         .u32((targetId || 0) >>> 0)
@@ -929,7 +929,7 @@ function encodeField(field) {
     let flags = 0;
     if (field && field.isObstacle) flags |= 1;
     if (field && field.source === 'player') flags |= 2;
-    return new Writer()
+    return new FastWriter()
         .i16(field && field.x)
         .i16(field && field.y)
         .i8(field && field.z)
@@ -952,7 +952,7 @@ function decodeField(payload) {
 }
 
 function encodeFieldGone(x, y, z) {
-    return new Writer().i16(x).i16(y).i8(z).toBuffer();
+    return new FastWriter().i16(x).i16(y).i8(z).toBuffer();
 }
 
 function decodeFieldGone(payload) {

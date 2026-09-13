@@ -198,6 +198,14 @@ function itemIsShield(item) {
     return false;
 }
 
+function itemIsMagicWeapon(item) {
+    if (!item || typeof item !== 'object') return false;
+    if (item.weaponType === 'magic') return true;
+    const cat = item.category != null ? String(item.category).toLowerCase() : '';
+    if (cat === 'wand' || cat === 'rod') return true;
+    return false;
+}
+
 function itemIsTwoHanded(item) {
     if (!item) return false;
     return item.twoHanded === true || item.twoHanded === 'true' || item.twoHanded === 1;
@@ -375,6 +383,7 @@ function preferredEquipSlot(item) {
     if (cat === 'ring') return 'ring';
     if (cat === 'shield' || cat === 'spellbook' || cat === 'quiver') return 'leftHand';
     if (cat === 'container' || cat === 'backpack' || cat === 'bag') return 'backpack';
+    if (cat === 'wand' || cat === 'rod') return 'rightHand';
     if (itemIsShield(item)) return 'leftHand';
     if (item.atk != null || item.weaponType) return 'rightHand';
     return null;
@@ -451,13 +460,14 @@ function skillValue(skills, key) {
     const bag = skills || {};
     if (key === 'magic') return Number(bag.magic) || 0;
     if (key === 'distance') return bag.distance != null ? Number(bag.distance) || 0 : 10;
-    if (key === 'fist') return bag.fist != null ? Number(bag.fist) || 0 : 10;
+    if (key === 'fist') return bag.fist != null ? Number(bag.fist) || 0 : (bag.melee != null ? Number(bag.melee) || 0 : 10);
     if (key === 'sword' || key === 'axe' || key === 'club') {
         if (bag[key] != null) return Number(bag[key]) || 0;
+        if (bag.melee != null) return Number(bag.melee) || 0;
         return 10;
     }
     if (key === 'shielding') return bag.shielding != null ? Number(bag.shielding) || 0 : 10;
-    return bag[key] != null ? Number(bag[key]) || 0 : 10;
+    return bag[key] != null ? Number(bag[key]) || 0 : (bag.melee != null ? Number(bag.melee) || 0 : 10);
 }
 
 module.exports = {
@@ -486,6 +496,7 @@ module.exports = {
     itemAmmoKind,
     weaponRequiredAmmoKind,
     itemIsBowOrCrossbowWeapon,
+    itemIsMagicWeapon,
     mapTokenToWeaponSkill,
     resolveWeaponSkillFromItem,
     itemIsContainer,

@@ -18,6 +18,7 @@ const {
     itemIsShield,
     itemIsTwoHanded,
     itemIsBowOrCrossbowWeapon,
+    itemIsMagicWeapon,
     itemAmmoKind,
     weaponRequiredAmmoKind,
     canEquipInSlot,
@@ -947,6 +948,31 @@ function applyPlayerLoadout(session, itemDb) {
     session.atk = atk;
     session.weaponSkill = unarmed ? 'fist' : (resolveWeaponSkillFromItem(right) || 'fist');
     session.weaponTier = unarmed ? 0 : Math.max(0, Math.floor(Number(right && right.tier) || 0));
+
+    const isMagic = !!(
+        right && (
+            itemIsMagicWeapon(right) ||
+            right.weaponType === 'magic' ||
+            right.category === 'wand' ||
+            right.category === 'rod'
+        )
+    );
+    if (isMagic) {
+        session.weaponType = 'magic';
+        session.weaponMin = Number(right.min) || 0;
+        session.weaponMax = Number(right.max) || 0;
+        session.weaponElement = String(right.element || 'energy').toLowerCase();
+        session.weaponRange = Math.max(1, Math.min(7, Number(right.range) || 4));
+        session.weaponManaGain = Math.max(0, Math.floor(Number(right.manaGain) || 0));
+    } else {
+        session.weaponType = unarmed ? 'fist' : (right.weaponType || 'melee');
+        session.weaponMin = 0;
+        session.weaponMax = 0;
+        session.weaponElement = null;
+        session.weaponRange = 1;
+        session.weaponManaGain = 0;
+    }
+
     session._gearSkillBonus = Object.create(null);
     let armor = 0;
     let extraCrit = 0;
@@ -1224,5 +1250,6 @@ module.exports = {
     equipmentView,
     playerCap,
     ownsContainer,
+    itemIsMagicWeapon,
     CAP_CLASS_BAND
 };

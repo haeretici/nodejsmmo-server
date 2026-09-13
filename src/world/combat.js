@@ -166,8 +166,11 @@ function playerSkill(attacker) {
     const skills = attacker && attacker.skills;
     let n = 10;
     if (skills) {
-        if (skills[key] != null) n = Number(skills[key]) || 0;
-        else if (key === 'fist' && skills.fist != null) n = Number(skills.fist) || 0;
+        if (skills[key] != null) {
+            n = Number(skills[key]) || 0;
+        } else if (skills.melee != null && (key === 'sword' || key === 'axe' || key === 'club' || key === 'fist')) {
+            n = Number(skills.melee) || 0;
+        }
     }
     const bonus = attacker && attacker._gearSkillBonus && attacker._gearSkillBonus[key];
     if (bonus) n += Number(bonus) || 0;
@@ -334,6 +337,83 @@ function resolveMelee(attacker, defender, rng, opts) {
         shieldBlock,
         armorReduction,
         blockChargeSpent: canBlock
+    };
+}
+
+/**
+ * Authoritative wand/rod auto-attack.
+ * Fixed uniform roll in [min, max], elemental damage.
+ * Multiplied on crit: uniform in [min, max] * (1 + critDamage/100).
+ * Subject to defender mitigation% and resists[element]%.
+ * Bypasses shield block (0) and armor reduction (0).
+ * Returns { miss, hit, raw, final, critical, fatal: false, shieldBlock: 0, armorReduction: 0, blockChargeSpent: false, element, manaGain }
+ */
+function resolveWandAuto(attacker, defender, rng, opts) {
+    const o = opts || {};
+    const hitChance = attacker && attacker.hitChance != null ? Number(attacker.hitChance) : 100;
+    const element = String(
+        (o && o.element) ||
+        (attacker && attacker.weaponElement) ||
+        'energy'
+    ).toLowerCase();
+
+    if (o.hit === false || (o.hit !== true && !rollHit(hitChance, rng))) {
+        return {
+            miss: true,
+            hit: false,
+            raw: 0,
+            final: 0,
+            critical: false,
+            fatal: false,
+            shieldBlock: 0,
+            armorReduction: 0,
+            blockChargeSpent: false,
+            element,
+            manaGain: 0
+        };
+    }
+
+    const isCritical = o.critical === true || o.critical === false
+        ? !!o.critical
+        : rollCritical(critChanceFor(attacker), rng);
+
+    const min = o.min != null
+        ? Number(o.min)
+        : (attacker && attacker.weaponMin != null ? Number(attacker.weaponMin) : 0);
+    const max = o.max != null
+        ? Number(o.max)
+        : (attacker && attacker.weaponMax != null ? Number(attacker.weaponMax) : 0);
+
+    const raw = rollRaw(min, max, isCritical, critDamageFor(attacker), rng, CRIT_BAND_MULTIPLY);
+
+    const mit = Math.max(0, Math.min(100, Number(defender && defender.mitigation) || 0));
+    let remaining = raw * (1 - mit / 100);
+
+    const resists = defender && defender.resists;
+    const resist = resists && resists[element] != null ? Number(resists[element]) : 0;
+    remaining = remaining * (1 - Math.max(0, Math.min(100, resist)) / 100);
+    remaining = Math.max(0, remaining);
+
+    const final = Math.max(0, Math.floor(remaining));
+
+    const weaponManaGain = o.manaGain != null
+        ? Math.max(0, Math.floor(Number(o.manaGain) || 0))
+        : (attacker && attacker.weaponManaGain != null ? Math.max(0, Math.floor(Number(attacker.weaponManaGain) || 0)) : 0);
+
+    const manaGain = final > 0 ? weaponManaGain : 0;
+
+    return {
+        miss: false,
+        hit: true,
+        raw,
+        final,
+        critical: isCritical,
+        fatal: false,
+        shieldBlock: 0,
+        armorReduction: 0,
+        blockChargeSpent: false,
+        element,
+        manaGain
     };
 }
 
@@ -646,6 +726,7 @@ module.exports = {
     playerCombatFromClass,
     playerSkill,
     resolveMelee,
+    resolveWandAuto,
     meleeRangeOk,
     getMagicSpellParameters,
     getMeleeSpellParameters,

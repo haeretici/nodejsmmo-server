@@ -71,6 +71,17 @@ function main() {
     assert.strictEqual(hit.critical, false);
     assert.strictEqual(hit.fatal, false);
 
+    const swordsmanGenericMelee = {
+        type: 'player',
+        level: 1,
+        atk: 42,
+        weaponSkill: 'sword',
+        skills: { melee: 50 },
+        weaponTier: 0
+    };
+    const genericHit = resolveMelee(swordsmanGenericMelee, dummy, () => 0.5);
+    assert.strictEqual(genericHit.raw, swordHit.raw);
+
     const rat = {
         type: 'creature',
         attacks: [{ min: 0, max: 26, chance: 100 }]

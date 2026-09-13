@@ -870,8 +870,14 @@ function isTileWalkBlocked(tileMap, x, y, z) {
  */
 function isTileSightBlocked(tileMap, x, y, z) {
     if (!tileMap) return false;
+    if (typeof tileMap === 'function') {
+        return !!tileMap(x, y, z);
+    }
     if (typeof tileMap.blocksSight === 'function') {
         return !!tileMap.blocksSight(x, y, z);
+    }
+    if (typeof tileMap.isSolid === 'function') {
+        return !!tileMap.isSolid(x, y, z);
     }
     // Legacy mock maps: only getFriction / isWalkable — couple sight to walk
     return isTileWalkBlocked(tileMap, x, y, z);
@@ -903,27 +909,37 @@ function isTileBlocked(tileMap, x, y, z) {
  * @returns {boolean}
  */
 function hasLineOfSight(x1, y1, z1, x2, y2, z2, tileMap) {
-    if (String(z1) !== String(z2)) return false;
-    const dx0 = Math.abs(x2 - x1);
-    const dy0 = Math.abs(y2 - y1);
+    let ax = x1, ay = y1, az = z1, bx = x2, by = y2, bz = z2, tm = tileMap;
+    if (arguments.length === 5) {
+        ax = arguments[0];
+        ay = arguments[1];
+        az = 0;
+        bx = arguments[2];
+        by = arguments[3];
+        bz = 0;
+        tm = arguments[4];
+    }
+    if (String(az) !== String(bz)) return false;
+    const dx0 = Math.abs(bx - ax);
+    const dy0 = Math.abs(by - ay);
     if (dx0 <= 1 && dy0 <= 1) return true;
-    if (!tileMap) return true;
+    if (!tm) return true;
 
     let dx = dx0;
     let dy = dy0;
-    const sx = x1 < x2 ? 1 : -1;
-    const sy = y1 < y2 ? 1 : -1;
+    const sx = ax < bx ? 1 : -1;
+    const sy = ay < by ? 1 : -1;
     let err = dx - dy;
-    let x = x1;
-    let y = y1;
+    let x = ax;
+    let y = ay;
 
     while (true) {
         // Skip origin: standing tile must not self-block the ray.
-        if (!(x === x1 && y === y1)) {
-            if (x === x2 && y === y2) break;
-            if (isTileSightBlocked(tileMap, x, y, z1)) return false;
+        if (!(x === ax && y === ay)) {
+            if (x === bx && y === by) break;
+            if (isTileSightBlocked(tm, x, y, az)) return false;
         }
-        if (x === x2 && y === y2) break;
+        if (x === bx && y === by) break;
         const e2 = 2 * err;
         if (e2 > -dy) {
             err -= dy;

@@ -27,6 +27,7 @@
     "creatureRespawnTicks": 200,
     "spawnActivateMargin": 8,
     "spawnDespawnIdleTicks": 40,
+    "spawnMaxLiving": 3000,
     "unarmedAtk": 7,
     "meleeAutoFactor": 0.102,
     "creatureIdBase": 1000000000,

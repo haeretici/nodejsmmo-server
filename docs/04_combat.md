@@ -52,13 +52,14 @@ Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins loa
 
 Auto-attack is **not** an intent: each tick, if target is Chebyshev ≤ 1 and `attackReadyTick` elapsed, the server swings.
 
-## Damage (physical melee only)
+## Damage (melee & wand auto)
 
 Order: miss → **crit** → raw → **fatal** → mit% → resist% → shield block → armor → floor 0.
 
 | Attacker | Raw |
 | :--- | :--- |
-| Player | `melee_auto`: non-crit gaussian μ=0.5 σ=0.25 on `[levelBonus, ceil(0.102×atk×skill + levelBonus)]`. Unarmed atk **7** / fist. Equipped: catalog `atk` + weapon skill. Crit = `auto_st` uniform `[max(min, floor(0.65×max)), max]`, then `×(1+critDamage/100)` |
+| Player (Melee) | `melee_auto`: non-crit gaussian μ=0.5 σ=0.25 on `[levelBonus, ceil(0.102×atk×skill + levelBonus)]`. Unarmed atk **7** / fist. Equipped: catalog `atk` + weapon skill. Crit = `auto_st` uniform `[max(min, floor(0.65×max)), max]`, then `×(1+critDamage/100)` |
+| Player (Magic) | `wand_auto`: fixed uniform `[min, max]` elemental damage; range from item (fallback 4), requires LOS; bypasses shield block and armor; mitigated by `mitigation%` and `resists[element]%`. Restores `manaGain` MP on hit. No weapon skill tries. |
 | Creature | kit `attacks[]` melee row uniform `[min, max]`. Crit = `multiply` (same roll × extra). Never fatal |
 
 | Proc | Rule |

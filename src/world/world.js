@@ -55,6 +55,7 @@ const { computeMoveDelay, delayToTicks, isDiagonalStep } = require('./movement')
 const { PathBudget, isLogicIntervalDue, seedPathPhase } = require('./path_budget');
 const {
     resolveMelee,
+    resolveWandAuto,
     meleeRangeOk,
     chebyshev,
     classRow,
@@ -64,6 +65,7 @@ const {
     SWING_CRIT,
     SWING_FATAL
 } = require('./combat');
+const { hasLineOfSight } = require('./shapes');
 const { rollLoot } = require('./loot');
 const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, asHealRange, asManaRange, designerSlotToEngine } = require('./items');
 const {
@@ -92,15 +94,21 @@ const {
 } = require('./inventory');
 const { TEMPLATES, getTemplate } = require('./templates');
 const { runtimeMap, resolveMapId } = require('../content/load_pack');
-const { dirFromDelta, createCreature, createCorpse } = require('./creature');
+const { dirFromDelta, createCreature, createCorpse, Creature, CreaturePool } = require('./creature');
 const {
+    DEFAULT_ACTIVATE_MARGIN,
+    DEFAULT_DESPAWN_IDLE_TICKS,
+    DEFAULT_MAX_LIVING,
+    spawnMaxLiving,
     resolveSpawnMode,
     spawnActivateMargin,
     spawnDespawnIdleTicks,
     pinSkipReason,
     respawnDelayTicks,
     inSpawnAoi,
-    makePinState
+    makePinState,
+    minChebyshevToObservers,
+    livingPinKeepPriority
 } = require('./spawn_pins');
 const { snapshotSession } = require('./snapshot');
 const {
@@ -201,6 +209,11 @@ class World {
         this.players = new Map();
         this.byAccount = new Map();
         this.creatures = new Map();
+        this.activeCreatures = new Set();
+        const poolCap = (opts.settings && opts.settings.creaturePoolCapacity != null)
+            ? opts.settings.creaturePoolCapacity
+            : 4096;
+        this.creaturePool = new CreaturePool(poolCap);
         this.corpses = new Map();
         this.corpseQueue = [];
         this.pendingSpawns = [];
@@ -308,7 +321,9 @@ class World {
         return Object.assign({}, this.tick.snapshot(), {
             players: this.players.size,
             creatures: this.creatures.size,
-            corpses: this.corpses.size
+            activeCreatures: this.activeCreatures ? this.activeCreatures.size : 0,
+            corpses: this.corpses.size,
+            creaturePool: this.creaturePool ? this.creaturePool.size : 0
         });
     }
 
@@ -528,13 +543,16 @@ class World {
         if (pinSkipReason(template)) return null;
         const id = this.nextCreatureId;
         this.nextCreatureId += 1;
-        const creature = createCreature(id, template, { x: x | 0, y: y | 0, z: z | 0 });
+        const creature = this.creaturePool
+            ? this.creaturePool.obtain(id, template, { x: x | 0, y: y | 0, z: z | 0 })
+            : createCreature(id, template, { x: x | 0, y: y | 0, z: z | 0 });
         if (opts && opts.pinIndex != null) creature.pinIndex = opts.pinIndex | 0;
         if (!this.tileMap.enterTile(creature.x, creature.y, creature.z, creature)) {
             const alt = this.tileMap.findNearestEnterable(
                 creature.x, creature.y, creature.z, creature
             );
             if (!alt || !this.tileMap.enterTile(alt.x, alt.y, alt.z, creature)) {
+                if (this.creaturePool) this.creaturePool.release(creature);
                 return null;
             }
             creature.x = alt.x;
@@ -546,6 +564,9 @@ class World {
         }
         this.creatures.set(creature.id, creature);
         if (this.creatureSpatial) this.creatureSpatial.insert(creature);
+        if (!creature.simSleeping && (creature.hp | 0) > 0 && !isNpcEntity(creature)) {
+            this.activeCreatures.add(creature);
+        }
         Cooldowns.ensureCooldowns(creature);
         if (creature.speed != null) creature.baseSpeed = Number(creature.speed);
         seedPathPhase(
@@ -560,6 +581,12 @@ class World {
     activatePin(pin, tickIndex, opts) {
         if (!pin || pin.state === 'skipped' || pin.state === 'living') return null;
         if ((tickIndex | 0) < (pin.readyTick | 0)) return null;
+        const maxLiving = spawnMaxLiving(this.settings);
+        if (maxLiving > 0 && !pin.eager && this.livingPins && this.livingPins.size >= maxLiving) {
+            const victim = this.pickBudgetVictim(null, pin);
+            if (!victim) return null;
+            this.despawnPin(victim);
+        }
         const creature = this.spawnCreature(pin.kind, pin.x, pin.y, pin.z, {
             pinIndex: pin.index,
             appear: opts && opts.appear
@@ -585,11 +612,13 @@ class World {
         if (creature) {
             this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
             this.creatures.delete(creature.id);
+            this.activeCreatures.delete(creature);
             if (this.creatureSpatial) this.creatureSpatial.remove(creature.id);
             this.clearTarget(creature.id);
             this.broadcastToViewers(creature.x, creature.y, creature.z, (p) => {
                 p.send(S2C.DISAPPEAR, encodeDisappear(creature.id));
             });
+            if (this.creaturePool) this.creaturePool.release(creature);
         }
         pin.state = 'idle';
         pin.entityId = 0;
@@ -610,11 +639,43 @@ class World {
         return false;
     }
 
-    pinInCombat(pin) {
+    pinInCombat(pin, playerTargets) {
         if (!pin || pin.state !== 'living') return false;
         const creature = this.creatures.get(pin.entityId);
         if (!creature) return false;
-        return this.isCreatureInCombat(creature);
+        return this.isCreatureInCombat(creature, playerTargets);
+    }
+
+    pickBudgetVictim(observers, incomingPin, playerTargets) {
+        if (!this.livingPins || this.livingPins.size === 0) return null;
+        const activeObservers = observers || Array.from(this.players.values()).filter((p) => !p.dead && !p.downed);
+        let bestPin = null;
+        let bestPri = Infinity;
+        let incomingPri = Infinity;
+
+        if (incomingPin) {
+            const template = getTemplate(incomingPin.kind, this.templates);
+            incomingPri = livingPinKeepPriority(incomingPin, null, activeObservers, template);
+        }
+
+        for (const pin of this.livingPins) {
+            if (pin.eager) continue;
+            const creature = this.creatures.get(pin.entityId);
+            if (!creature) {
+                return pin;
+            }
+            if (this.pinInCombat(pin, playerTargets)) continue;
+            const template = getTemplate(pin.kind, this.templates);
+            const pri = livingPinKeepPriority(pin, creature, activeObservers, template);
+            if (pri >= 1e11) continue;
+            if (incomingPin && pri >= incomingPri) continue;
+
+            if (pri < bestPri || (pri === bestPri && bestPin && pin.index < bestPin.index)) {
+                bestPri = pri;
+                bestPin = pin;
+            }
+        }
+        return bestPin;
     }
 
     tickSpawnPins(tickIndex, opts) {
@@ -622,10 +683,13 @@ class World {
         const appear = !opts || opts.appear !== false;
         const margin = spawnActivateMargin(this.settings);
         const idleLimit = spawnDespawnIdleTicks(this.settings);
+        const maxLiving = spawnMaxLiving(this.settings);
         const observers = [];
+        const playerTargets = new Set();
         for (const p of this.players.values()) {
             if (p.dead || p.downed) continue;
             observers.push(p);
+            if (p.targetId) playerTargets.add(p.targetId);
         }
 
         if (this.livingPins && this.livingPins.size > 0) {
@@ -654,12 +718,20 @@ class World {
                         break;
                     }
                 }
-                if (seen || this.pinInCombat(pin)) {
+                if (seen || this.pinInCombat(pin, playerTargets)) {
                     pin.idleTicks = 0;
                     continue;
                 }
                 pin.idleTicks += 1;
                 if (pin.idleTicks >= idleLimit) this.despawnPin(pin);
+            }
+        }
+
+        if (maxLiving > 0 && this.livingPins && this.livingPins.size > maxLiving) {
+            while (this.livingPins.size > maxLiving) {
+                const victim = this.pickBudgetVictim(observers, null, playerTargets);
+                if (!victim) break;
+                this.despawnPin(victim);
             }
         }
 
@@ -674,6 +746,7 @@ class World {
 
         if (observers.length > 0) {
             const seenPins = new Set();
+            const candidates = [];
             for (let o = 0; o < observers.length; o++) {
                 const ob = observers[o];
                 const win = viewportWindow(this.map, ob.x, ob.y, null, null, ob.z);
@@ -691,8 +764,27 @@ class World {
                     if (seenPins.has(pin.index)) continue;
                     seenPins.add(pin.index);
                     if (inSpawnAoi(this.map, ob.x, ob.y, ob.z, pin.x, pin.y, pin.z, margin)) {
-                        this.activatePin(pin, tickIndex, { appear });
+                        candidates.push(pin);
                     }
+                }
+            }
+            if (candidates.length > 0) {
+                if (maxLiving > 0 && candidates.length > 1) {
+                    candidates.sort((a, b) => {
+                        const da = minChebyshevToObservers(a.x, a.y, a.z, observers);
+                        const db = minChebyshevToObservers(b.x, b.y, b.z, observers);
+                        if (da !== db) return da - db;
+                        return a.index - b.index;
+                    });
+                }
+                for (let i = 0; i < candidates.length; i++) {
+                    const pin = candidates[i];
+                    if (maxLiving > 0 && this.livingPins && this.livingPins.size >= maxLiving) {
+                        const victim = this.pickBudgetVictim(observers, pin, playerTargets);
+                        if (!victim) continue;
+                        this.despawnPin(victim);
+                    }
+                    this.activatePin(pin, tickIndex, { appear });
                 }
             }
         }
@@ -889,7 +981,7 @@ class World {
         }
         this.tickSpawnPins(tickIndex);
         this.updateCreatureSleepStates(tickIndex);
-        for (const cr of this.creatures.values()) {
+        for (const cr of this.activeCreatures) {
             this.tickCreature(cr, tickIndex);
         }
         this.tickWorldPins(tickIndex);
@@ -1377,6 +1469,18 @@ class World {
         if (session.openCorpseId === id) session.openCorpseId = 0;
     }
 
+    playerCanAttackTarget(attacker, target) {
+        if (!attacker || !target) return false;
+        if ((attacker.z | 0) !== (target.z | 0)) return false;
+        if (attacker.weaponType === 'magic') {
+            const range = attacker.weaponRange != null ? attacker.weaponRange : 4;
+            const dist = chebyshev(attacker.x, attacker.y, target.x, target.y);
+            if (dist > range) return false;
+            return hasLineOfSight(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, this.tileMap || this.map);
+        }
+        return meleeRangeOk(attacker, target);
+    }
+
     tickPlayerCombat(session, tickIndex) {
         const target = this.getEntity(session.targetId);
         if (!target || target.downed) {
@@ -1386,12 +1490,13 @@ class World {
             }
             return;
         }
-        if (session.autoChase && !session.movedThisTick && !meleeRangeOk(session, target)) {
+        const canAttack = this.playerCanAttackTarget(session, target);
+        if (session.autoChase && !session.movedThisTick && !canAttack) {
             this.tryStepToward(session, target.x, target.y, tickIndex, {
                 maxDistance: this.pathCap(session)
             });
         }
-        if (meleeRangeOk(session, target)) {
+        if (this.playerCanAttackTarget(session, target)) {
             this.trySwing(session, target, tickIndex);
         }
     }
@@ -1403,19 +1508,17 @@ class World {
             ? Number(this.settings.aiRepathIntervalSec)
             : 2.0;
 
-        if (!sleepEnabled) {
-            for (const cr of this.creatures.values()) {
-                if (cr.simSleeping) {
-                    cr.simSleeping = false;
-                    seedPathPhase(cr, repathSec, now);
-                }
-            }
-            return;
-        }
-
         const radius = (this.settings && this.settings.aiTickRadius != null)
             ? (this.settings.aiTickRadius | 0)
             : 12;
+
+        if (!sleepEnabled || radius <= 0) {
+            for (const cr of this.creatures.values()) {
+                if (isNpcEntity(cr)) continue;
+                this.wakeCreature(cr, tickIndex);
+            }
+            return;
+        }
 
         const activePlayers = [];
         const playerTargets = new Set();
@@ -1426,50 +1529,74 @@ class World {
             }
         }
 
+        // Observer-Centric AOI Frame:
+        // Query outward only from active players into creatureSpatial (O(N_players))
+        // instead of querying playerSpatial from every creature in the world (O(N_creatures)).
+        const awakeCandidates = new Set();
+        if (activePlayers.length > 0) {
+            for (let i = 0; i < activePlayers.length; i++) {
+                const p = activePlayers[i];
+                const px = p.x | 0;
+                const py = p.y | 0;
+                const pz = p.z | 0;
+                const candidates = this.creatureSpatial
+                    ? this.creatureSpatial.queryChunkCandidates(px, py, pz, radius)
+                    : this.creatures.values();
+                for (const cr of candidates) {
+                    if (!cr || (cr.hp | 0) <= 0 || isNpcEntity(cr)) continue;
+                    if ((cr.z | 0) !== pz) continue;
+                    if (chebyshev(cr.x | 0, cr.y | 0, px, py) <= radius) {
+                        awakeCandidates.add(cr.id);
+                    }
+                }
+            }
+        }
+
+        // Add creatures currently targeted by any active player
+        for (const targetId of playerTargets) {
+            awakeCandidates.add(targetId);
+        }
+
+        // Update sleep states only for entities that changed status
         for (const cr of this.creatures.values()) {
             if (isNpcEntity(cr)) continue;
             if ((cr.hp | 0) <= 0) {
                 if (cr.simSleeping) cr.simSleeping = false;
+                this.activeCreatures.delete(cr);
                 continue;
             }
 
-            const inCombat = this.isCreatureInCombat(cr, playerTargets);
-            let wantSleep = false;
-
-            if (!inCombat) {
-                if (radius <= 0) {
-                    wantSleep = false;
-                } else if (activePlayers.length === 0) {
-                    wantSleep = true;
-                } else {
-                    let nearPlayer = false;
-                    const cz = cr.z | 0;
-                    const cx = cr.x | 0;
-                    const cy = cr.y | 0;
-                    const candidates = this.playerSpatial
-                        ? this.playerSpatial.queryChunkCandidates(cx, cy, cz, radius)
-                        : activePlayers;
-                    for (let i = 0; i < candidates.length; i++) {
-                        const p = candidates[i];
-                        if (p.dead || p.downed) continue;
-                        if ((p.z | 0) !== cz) continue;
-                        if (chebyshev(cx, cy, p.x | 0, p.y | 0) <= radius) {
-                            nearPlayer = true;
-                            break;
-                        }
-                    }
-                    wantSleep = !nearPlayer;
-                }
-            }
+            const inCombat = !!(cr.targetId || playerTargets.has(cr.id));
+            const wantSleep = !inCombat && !awakeCandidates.has(cr.id);
 
             const wasSleeping = !!cr.simSleeping;
             if (wasSleeping && !wantSleep) {
-                cr.simSleeping = false;
-                seedPathPhase(cr, repathSec, now);
+                this.wakeCreature(cr, tickIndex);
             } else if (!wasSleeping && wantSleep) {
-                cr.simSleeping = true;
+                this.sleepCreature(cr);
+            } else if (!wasSleeping && !wantSleep) {
+                this.activeCreatures.add(cr);
             }
         }
+    }
+
+    wakeCreature(cr, tickIndex) {
+        if (!cr || (cr.hp | 0) <= 0 || isNpcEntity(cr)) return;
+        if (cr.simSleeping) {
+            cr.simSleeping = false;
+            seedPathPhase(
+                cr,
+                (this.settings && this.settings.aiRepathIntervalSec) || 2.0,
+                this.logicNow(tickIndex != null ? tickIndex : this._tickIndex)
+            );
+        }
+        this.activeCreatures.add(cr);
+    }
+
+    sleepCreature(cr) {
+        if (!cr || isNpcEntity(cr)) return;
+        cr.simSleeping = true;
+        this.activeCreatures.delete(cr);
     }
 
     tickCreature(cr, tickIndex) {
@@ -1569,9 +1696,22 @@ class World {
 
     trySwing(attacker, defender, tickIndex) {
         if (tickIndex < attacker.attackReadyTick) return false;
-        if (!meleeRangeOk(attacker, defender)) return false;
+        if (!attacker || !defender) return false;
+        if ((attacker.z | 0) !== (defender.z | 0)) return false;
+
+        const isMagic = attacker && attacker.weaponType === 'magic';
+        if (isMagic) {
+            const range = attacker.weaponRange != null ? attacker.weaponRange : 4;
+            if (chebyshev(attacker.x, attacker.y, defender.x, defender.y) > range) return false;
+            if (!hasLineOfSight(attacker.x, attacker.y, attacker.z, defender.x, defender.y, defender.z, this.tileMap || this.map)) {
+                return false;
+            }
+        } else {
+            if (!meleeRangeOk(attacker, defender)) return false;
+        }
+
         attacker.attackReadyTick = tickIndex + this.autoInterval();
-        if (attacker.type === 'player') {
+        if (attacker.type === 'player' && !isMagic) {
             const itemDb = this.itemDb();
             if (equippedWeaponAmmoKind(attacker.inventory, itemDb)) {
                 if (!peekAmmoForShot(attacker.inventory, itemDb)) {
@@ -1589,9 +1729,16 @@ class World {
                 }
             }
         }
-        const meleeOpts = { factor: this.settings.meleeAutoFactor };
-        if (attacker.atk == null) meleeOpts.unarmedAtk = this.settings.unarmedAtk;
-        const hit = resolveMelee(attacker, defender, this.rng, meleeOpts);
+
+        let hit;
+        if (isMagic) {
+            hit = resolveWandAuto(attacker, defender, this.rng);
+        } else {
+            const meleeOpts = { factor: this.settings.meleeAutoFactor };
+            if (attacker.atk == null) meleeOpts.unarmedAtk = this.settings.unarmedAtk;
+            hit = resolveMelee(attacker, defender, this.rng, meleeOpts);
+        }
+
         let amount = 0;
         let flags = 0;
         if (hit.miss) {
@@ -1603,20 +1750,22 @@ class World {
             if (hit.fatal) flags |= SWING_FATAL;
             if ((defender.hp | 0) <= 0) flags |= SWING_DEATH;
         }
-        this.applyAttackProgression(attacker, defender, hit);
+
+        if (isMagic) {
+            if (hit.manaGain > 0) {
+                this.applyMp(attacker, (attacker.mp | 0) + hit.manaGain);
+                this.broadcastStats(attacker);
+            }
+        } else {
+            this.applyAttackProgression(attacker, defender, hit);
+        }
+
         this.broadcastSwing(attacker, defender, amount, flags);
         if (flags & SWING_DEATH) {
             this.kill(defender, attacker, tickIndex);
         } else if (!hit.miss && defender.type === 'creature') {
             if (!defender.targetId) defender.targetId = attacker.id;
-            if (defender.simSleeping) {
-                defender.simSleeping = false;
-                seedPathPhase(
-                    defender,
-                    (this.settings && this.settings.aiRepathIntervalSec) || 2.0,
-                    this.logicNow(tickIndex)
-                );
-            }
+            this.wakeCreature(defender, tickIndex);
         }
         return true;
     }
@@ -1625,6 +1774,13 @@ class World {
         const next = Math.max(0, Math.min(entity.hpMax | 0, hp | 0));
         entity.hp = next;
         if (entity.character) entity.character.hp = next;
+    }
+
+    applyMp(entity, mp) {
+        if (!entity) return;
+        const next = Math.max(0, Math.min(entity.mpMax | 0, mp | 0));
+        entity.mp = next;
+        if (entity.character) entity.character.mp = next;
     }
 
     applyDamage(entity, amount, element, tickIndex, killer) {
@@ -1636,12 +1792,7 @@ class World {
         if (incoming <= 0) return 0;
         this.applyHp(entity, (entity.hp | 0) - incoming);
         if (entity.type === 'creature' && entity.simSleeping) {
-            entity.simSleeping = false;
-            seedPathPhase(
-                entity,
-                (this.settings && this.settings.aiRepathIntervalSec) || 2.0,
-                this.logicNow(tickIndex)
-            );
+            this.wakeCreature(entity, tickIndex);
         }
         this.broadcastStats(entity);
         if ((entity.hp | 0) <= 0) this.kill(entity, killer || null, tickIndex);
@@ -1810,6 +1961,7 @@ class World {
     killCreature(creature, killer, tickIndex) {
         this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
         this.creatures.delete(creature.id);
+        this.activeCreatures.delete(creature);
         if (this.creatureSpatial) this.creatureSpatial.remove(creature.id);
         this.broadcastToViewers(creature.x, creature.y, creature.z, (p) => {
             p.send(S2C.DEATH, encodeDeath(creature.id, killer && killer.id));
@@ -1841,6 +1993,7 @@ class World {
                 pin.state = 'cooldown';
                 pin.readyTick = tickIndex + delay;
             }
+            if (this.creaturePool) this.creaturePool.release(creature);
             return;
         }
         const respawn = Math.max(1, (this.settings.creatureRespawnTicks | 0) || 200);
@@ -1851,6 +2004,7 @@ class World {
             z: creature.spawnZ,
             at: (tickIndex | 0) + respawn
         });
+        if (this.creaturePool) this.creaturePool.release(creature);
     }
 
     respawnPlayer(session, tickIndex) {
@@ -1951,7 +2105,7 @@ class World {
                 p.autoChase = false;
             }
         }
-        for (const cr of this.creatures.values()) {
+        for (const cr of this.activeCreatures) {
             if (cr.targetId === n) cr.targetId = 0;
         }
     }
@@ -2735,8 +2889,8 @@ class World {
         for (const p of this.players.values()) {
             if (!p.dead && !p.downed && (p.hp | 0) > 0) out.push(p);
         }
-        for (const cr of this.creatures.values()) {
-            if ((cr.hp | 0) > 0) out.push(cr);
+        for (const cr of this.activeCreatures) {
+            if ((cr.hp | 0) > 0 && !cr.simSleeping) out.push(cr);
         }
         return out;
     }
@@ -2764,7 +2918,7 @@ class World {
             if (p.dead || p.downed || (p.hp | 0) <= 0) continue;
             this.tickCombatantConditions(p, dt);
         }
-        for (const cr of this.creatures.values()) {
+        for (const cr of this.activeCreatures) {
             if ((cr.hp | 0) <= 0 || cr.simSleeping) continue;
             this.tickCombatantConditions(cr, dt);
         }
