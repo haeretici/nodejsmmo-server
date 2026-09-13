@@ -1,6 +1,6 @@
 'use strict';
 
-const { HEADER_SIZE } = require('./opcodes');
+const { HEADER_SIZE, S2C } = require('./opcodes');
 
 const DEFAULT_SLAB_SIZE = 8192; // 8 KB reusable scratch buffer slab
 
@@ -268,14 +268,189 @@ function encodeFrame(opcode, seq, payload) {
     return buf;
 }
 
+function measureFramePayload(opcode, buf, off = 0) {
+    const rem = buf.length - off;
+    if (rem < 0) return -1;
+    let o = off;
+    const need = (n) => (o + n <= buf.length);
+    const readStr = () => {
+        if (!need(1)) return null;
+        const len = buf[o++];
+        if (!need(len)) return null;
+        o += len;
+        return true;
+    };
+
+    switch (opcode) {
+        case S2C.HELLO: return rem >= 9 ? 9 : -1;
+        case S2C.KICK: return rem >= 1 ? 1 : -1;
+        case S2C.REJECT: return rem >= 5 ? 5 : -1;
+        case S2C.PONG: return rem >= 12 ? 12 : -1;
+        case S2C.DISAPPEAR:
+        case S2C.CORPSE_GONE:
+        case S2C.WORLD_PIN_GONE:
+        case S2C.DIALOG_CLOSE:
+            return rem >= 4 ? 4 : -1;
+        case S2C.DEATH: return rem >= 8 ? 8 : -1;
+        case S2C.MOVE: return rem >= 10 ? 10 : -1;
+        case S2C.SWING: return rem >= 11 ? 11 : -1;
+        case S2C.STATS: return rem >= 12 ? 12 : -1;
+        case S2C.SKILLS: return rem >= 16 ? 16 : -1;
+        case S2C.FIELD_GONE: return rem >= 5 ? 5 : -1;
+        case S2C.SAY: {
+            if (readStr() == null) return -1;
+            return o - off;
+        }
+        case S2C.ITEM_GAIN: {
+            if (readStr() == null) return -1;
+            if (!need(2)) return -1;
+            return (o + 2) - off;
+        }
+        case S2C.VIEWPORT: {
+            if (!need(7)) return -1;
+            const w = buf[off + 5];
+            const h = buf[off + 6];
+            const total = 7 + w * h * 2;
+            return rem >= total ? total : -1;
+        }
+        case S2C.APPEAR: {
+            if (!need(4)) return -1; o += 4;
+            if (readStr() == null) return -1;
+            if (!need(10)) return -1; o += 10;
+            if (readStr() == null) return -1;
+            return o - off;
+        }
+        case S2C.CORPSE: {
+            if (!need(9)) return -1; o += 9;
+            if (readStr() == null) return -1;
+            return o - off;
+        }
+        case S2C.CONTAINER: {
+            if (!need(5)) return -1; o += 4;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (readStr() == null) return -1;
+                if (!need(2)) return -1; o += 2;
+            }
+            return o - off;
+        }
+        case S2C.BAG:
+        case S2C.INVENTORY: {
+            if (readStr() == null) return -1;
+            if (!need(2)) return -1; o += 1;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (!need(1)) return -1; o += 1;
+                if (readStr() == null) return -1;
+                if (!need(3)) return -1; o += 3;
+            }
+            return o - off;
+        }
+        case S2C.EQUIPMENT: {
+            if (!need(5)) return -1; o += 4;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (readStr() == null) return -1;
+                if (readStr() == null) return -1;
+                if (!need(2)) return -1; o += 2;
+            }
+            return o - off;
+        }
+        case S2C.WORLD_PIN: {
+            if (!need(9)) return -1; o += 9;
+            if (readStr() == null) return -1;
+            if (readStr() == null) return -1;
+            if (!need(1)) return -1; o += 1;
+            return o - off;
+        }
+        case S2C.CAST: {
+            if (!need(4)) return -1; o += 4;
+            if (readStr() == null) return -1;
+            if (!need(9)) return -1; o += 9;
+            if (need(1)) o += 1;
+            return o - off;
+        }
+        case S2C.DIALOG: {
+            if (!need(4)) return -1; o += 4;
+            if (readStr() == null) return -1;
+            if (readStr() == null) return -1;
+            if (!need(1)) return -1;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (readStr() == null) return -1;
+            }
+            return o - off;
+        }
+        case S2C.SHOP: {
+            if (!need(4)) return -1; o += 4;
+            if (readStr() == null) return -1;
+            if (!need(1)) return -1;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (readStr() == null) return -1;
+                if (!need(4)) return -1; o += 4;
+            }
+            return o - off;
+        }
+        case S2C.FIELD: {
+            if (!need(5)) return -1; o += 5;
+            if (readStr() == null) return -1;
+            if (need(1)) o += 1;
+            return o - off;
+        }
+        case S2C.EXP: {
+            return rem >= 10 ? 10 : (rem >= 8 ? 8 : -1);
+        }
+        case S2C.ENTER_WORLD: {
+            if (!need(4)) return -1; o += 4;
+            if (readStr() == null) return -1;
+            if (readStr() == null) return -1;
+            if (!need(2 + 4 + 8 + 5 + 2 + 7)) return -1;
+            const w = buf[o + 26];
+            const h = buf[o + 27];
+            o += 28;
+            if (!need(w * h * 2)) return -1;
+            o += w * h * 2;
+            return o - off;
+        }
+        default:
+            return rem;
+    }
+}
+
+function decodeFrames(buf) {
+    if (!buf || buf.length < HEADER_SIZE) return [];
+    const raw = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    const frames = [];
+    let offset = 0;
+    while (offset + HEADER_SIZE <= raw.length) {
+        const opcode = raw.readUInt16LE(offset);
+        const seq = raw.readUInt32LE(offset + 2);
+        const payloadOffset = offset + HEADER_SIZE;
+        const payloadLen = measureFramePayload(opcode, raw, payloadOffset);
+        if (payloadLen < 0) {
+            frames.push({
+                opcode,
+                seq,
+                payload: Buffer.from(raw.subarray(payloadOffset))
+            });
+            break;
+        }
+        frames.push({
+            opcode,
+            seq,
+            payload: Buffer.from(raw.subarray(payloadOffset, payloadOffset + payloadLen))
+        });
+        offset = payloadOffset + payloadLen;
+        if (payloadLen === 0 && offset >= raw.length) break;
+    }
+    return frames;
+}
+
 function decodeFrame(buf) {
     if (!buf || buf.length < HEADER_SIZE) return null;
-    const raw = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    return {
-        opcode: raw.readUInt16LE(0),
-        seq: raw.readUInt32LE(2),
-        payload: Buffer.from(raw.subarray(HEADER_SIZE))
-    };
+    const frames = decodeFrames(buf);
+    return frames.length > 0 ? frames[0] : null;
 }
 
 function clampU16(v) {
@@ -291,5 +466,7 @@ module.exports = {
     Reader,
     encodeFrame,
     decodeFrame,
+    decodeFrames,
+    measureFramePayload,
     clampU16
 };

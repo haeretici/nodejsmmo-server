@@ -68,7 +68,9 @@
         "wsEnterTimeoutMs": 10000,
         "malformedClosesPerMin": 10,
         "malformedIgnoreSec": 60,
-        "playTokenBindIp": false
+        "playTokenBindIp": false,
+        "outboundBatching": true,
+        "coalescePayloads": false
     },
     "security": {
         "argon2": {

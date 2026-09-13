@@ -25,7 +25,9 @@ const ENV_MAP = [
     ['GAME_PERSIST_CONCURRENCY', ['persistConcurrency'], toInt],
     ['GAME_CONTENT_PATH', ['contentPath'], String],
     ['GAME_MAP_ID', ['mapId'], String],
-    ['GAME_SPAWN_MAX_LIVING', ['spawnMaxLiving'], toInt]
+    ['GAME_SPAWN_MAX_LIVING', ['spawnMaxLiving'], toInt],
+    ['GAME_OUTBOUND_BATCHING', ['limits', 'outboundBatching'], toBool],
+    ['GAME_COALESCE_PAYLOADS', ['limits', 'coalescePayloads'], toBool]
 ];
 
 function toInt(v) {

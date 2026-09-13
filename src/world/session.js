@@ -85,10 +85,18 @@ class GameSession {
         this.talkNodeId = '';
         this.shopOpen = false;
         this.enterTimer = null;
-        const limits = opts.settings.limits;
+        const limits = opts.settings && opts.settings.limits;
+        this.outboundQueue = [];
+        this.batching = false;
+        this.batchingEnabled = limits && limits.outboundBatching !== undefined
+            ? Boolean(limits.outboundBatching)
+            : true;
+        this.coalescePayloads = Boolean(limits && limits.coalescePayloads);
+        this.flushedFramesCount = 0;
+        this.flushedBatchesCount = 0;
         this.gate = new PacketGate({
-            rate: limits.maxPacketsPerSecond | 0,
-            burst: limits.packetBurst | 0,
+            rate: (limits && limits.maxPacketsPerSecond) | 0,
+            burst: (limits && limits.packetBurst) | 0,
             now: this.now
         });
     }
@@ -164,11 +172,92 @@ class GameSession {
         const seq = this.nextServerSeq;
         this.nextServerSeq += 1;
         const buf = encodeFrame(opcode, seq, payload);
+        const inBatch = this.batchingEnabled && (this.batching || (this.world && this.world._batchingOutbound));
+        if (inBatch && opcode !== S2C.KICK) {
+            this.outboundQueue.push(buf);
+            if (this.limiter && this.limiter.metrics && this.limiter.metrics.outboundFramesBatched != null) {
+                this.limiter.metrics.outboundFramesBatched += 1;
+            }
+            if (this.world && typeof this.world.markOutboundDirty === 'function') {
+                this.world.markOutboundDirty(this);
+            }
+            return;
+        }
         try {
             sock.send(buf, { binary: true });
         } catch {
             // drop; close handler will leave
         }
+    }
+
+    flushOutbound(opts = {}) {
+        if (this.dead) {
+            this.outboundQueue.length = 0;
+            return 0;
+        }
+        const len = this.outboundQueue.length;
+        if (len === 0) return 0;
+        const sock = this.socket;
+        if (!sock || sock.readyState !== 1) {
+            this.outboundQueue.length = 0;
+            return 0;
+        }
+
+        const shouldCoalesce = opts.coalesce != null
+            ? Boolean(opts.coalesce)
+            : this.coalescePayloads;
+
+        const rawSocket = sock._socket;
+        const canCork = rawSocket && typeof rawSocket.cork === 'function' && typeof rawSocket.uncork === 'function';
+
+        this.flushedBatchesCount += 1;
+        this.flushedFramesCount += len;
+        if (this.limiter && this.limiter.metrics) {
+            if (this.limiter.metrics.outboundBatchesFlushed != null) this.limiter.metrics.outboundBatchesFlushed += 1;
+            if (this.limiter.metrics.outboundFramesFlushed != null) this.limiter.metrics.outboundFramesFlushed += len;
+        }
+
+        if (shouldCoalesce && len > 1) {
+            let totalBytes = 0;
+            for (let i = 0; i < len; i++) {
+                totalBytes += this.outboundQueue[i].length;
+            }
+            const coalesced = Buffer.allocUnsafe(totalBytes);
+            let offset = 0;
+            for (let i = 0; i < len; i++) {
+                const f = this.outboundQueue[i];
+                f.copy(coalesced, offset);
+                offset += f.length;
+            }
+            this.outboundQueue.length = 0;
+            try {
+                sock.send(coalesced, { binary: true });
+            } catch {
+                // drop; close handler will leave
+            }
+            return len;
+        }
+
+        if (canCork) {
+            rawSocket.cork();
+        }
+        try {
+            for (let i = 0; i < len; i++) {
+                sock.send(this.outboundQueue[i], { binary: true });
+            }
+        } catch {
+            // drop; close handler will leave
+        } finally {
+            if (canCork) {
+                rawSocket.uncork();
+            }
+            this.outboundQueue.length = 0;
+        }
+        return len;
+    }
+
+    clearOutbound() {
+        this.outboundQueue.length = 0;
     }
 
     reject(refSeq, reason) {
@@ -177,6 +266,7 @@ class GameSession {
 
     kick(reason) {
         if (this.dead) return;
+        this.clearOutbound();
         try {
             this.send(S2C.KICK, encodeKick(reason));
         } catch {

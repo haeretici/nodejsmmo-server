@@ -51,7 +51,10 @@ class RateLimiter {
             wsRejected: 0,
             malformed: 0,
             enterOk: 0,
-            enterFail: 0
+            enterFail: 0,
+            outboundFramesBatched: 0,
+            outboundBatchesFlushed: 0,
+            outboundFramesFlushed: 0
         };
     }
 

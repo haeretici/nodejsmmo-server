@@ -221,7 +221,10 @@ class World {
         this.creatureSpatial = new SpatialIndex({ chunkSize: 32 });
         this.corpseSpatial = new SpatialIndex({ chunkSize: 32 });
         this.worldPinSpatial = new SpatialIndex({ chunkSize: 32 });
-        this.spawnPinSpatial = new SpatialIndex({ chunkSize: 32 });
+        const spawnPinChunkSize = (opts.settings && opts.settings.spawnPinChunkSize != null)
+            ? opts.settings.spawnPinChunkSize | 0
+            : 64;
+        this.spawnPinSpatial = new SpatialIndex({ chunkSize: spawnPinChunkSize });
         this.livingPins = new Set();
         this.eagerPins = [];
         this._conditionHooks = {
@@ -293,6 +296,8 @@ class World {
         this.spellBook = indexSpellBook(this.pack && this.pack.spells);
         this.fieldStore = createFieldStore(this.tileMap);
         this.delayedCasts = [];
+        this._batchingOutbound = false;
+        this._dirtyOutboundSessions = new Set();
         this.seedSpawns();
         this.seedWorldPins();
         seedMapFieldsFromTileMap(this.fieldStore, this.tileMap, { createdAt: 0 });
@@ -843,7 +848,35 @@ class World {
         this.clearTarget(ch.id);
         this.closeTalk(session, false);
         this.broadcastDisappear(ch.id, session);
+        if (this._dirtyOutboundSessions) {
+            this._dirtyOutboundSessions.delete(session);
+        }
+        if (typeof session.clearOutbound === 'function') {
+            session.clearOutbound();
+        }
         this.enqueuePersist(session, LOGOUT_PERSIST);
+    }
+
+    markOutboundDirty(session) {
+        if (session && !session.dead && this._dirtyOutboundSessions) {
+            this._dirtyOutboundSessions.add(session);
+        }
+    }
+
+    flushOutbound(opts) {
+        if (!this._dirtyOutboundSessions || this._dirtyOutboundSessions.size === 0) {
+            return 0;
+        }
+        let total = 0;
+        for (const session of this._dirtyOutboundSessions) {
+            if (!session.dead) {
+                total += session.flushOutbound(opts);
+            } else if (typeof session.clearOutbound === 'function') {
+                session.clearOutbound();
+            }
+        }
+        this._dirtyOutboundSessions.clear();
+        return total;
     }
 
     sendEnterWorld(session) {
@@ -961,38 +994,44 @@ class World {
     step(tickIndex) {
         this._tickIndex = tickIndex | 0;
         this.pathBudget.begin(this._tickIndex);
-        for (const session of this.players.values()) {
-            if (session.dead) continue;
-            session.movedThisTick = false;
-            const queue = session.intentQueue;
-            const len = queue.length;
-            if (len > 0) {
-                for (let i = 0; i < len; i++) {
-                    if (session.dead) break;
-                    this.applyIntent(session, queue[i], tickIndex);
+        this._batchingOutbound = true;
+        try {
+            for (const session of this.players.values()) {
+                if (session.dead) continue;
+                session.movedThisTick = false;
+                const queue = session.intentQueue;
+                const len = queue.length;
+                if (len > 0) {
+                    for (let i = 0; i < len; i++) {
+                        if (session.dead) break;
+                        this.applyIntent(session, queue[i], tickIndex);
+                    }
+                    queue.length = 0;
                 }
-                queue.length = 0;
             }
-        }
-        for (const session of this.players.values()) {
-            if (session.dead || session.downed) continue;
-            this.tickPlayerCombat(session, tickIndex);
-            this.tickTalkRange(session);
-        }
-        this.tickSpawnPins(tickIndex);
-        this.updateCreatureSleepStates(tickIndex);
-        for (const cr of this.activeCreatures) {
-            this.tickCreature(cr, tickIndex);
-        }
-        this.tickWorldPins(tickIndex);
-        this.tickCombatStatus(tickIndex);
-        this.tickCorpses(tickIndex);
-        this.tickRespawns(tickIndex);
-        for (const session of this.players.values()) {
-            if (session.dead || !session.downed) continue;
-            if (tickIndex >= session.respawnTick) {
-                this.respawnPlayer(session, tickIndex);
+            for (const session of this.players.values()) {
+                if (session.dead || session.downed) continue;
+                this.tickPlayerCombat(session, tickIndex);
+                this.tickTalkRange(session);
             }
+            this.tickSpawnPins(tickIndex);
+            this.updateCreatureSleepStates(tickIndex);
+            for (const cr of this.activeCreatures) {
+                this.tickCreature(cr, tickIndex);
+            }
+            this.tickWorldPins(tickIndex);
+            this.tickCombatStatus(tickIndex);
+            this.tickCorpses(tickIndex);
+            this.tickRespawns(tickIndex);
+            for (const session of this.players.values()) {
+                if (session.dead || !session.downed) continue;
+                if (tickIndex >= session.respawnTick) {
+                    this.respawnPlayer(session, tickIndex);
+                }
+            }
+        } finally {
+            this.flushOutbound();
+            this._batchingOutbound = false;
         }
     }
 

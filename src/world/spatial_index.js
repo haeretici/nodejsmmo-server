@@ -8,11 +8,45 @@
 'use strict';
 
 /**
+ * Normalize entity id to numeric primitive if valid integer, else string.
  * @param {*} id
- * @returns {string}
+ * @returns {number|string}
  */
 function idKey(id) {
+    if (typeof id === 'number') return id;
+    const n = Number(id);
+    if (Number.isFinite(n) && String(n) === String(id)) return n;
     return String(id);
+}
+
+/**
+ * Bit-pack chunk coordinates into an unsigned 32-bit integer:
+ * - z: 4 bits (floors 0..15, bits 24..27)
+ * - cx: 12 bits (chunks 0..4095, bits 12..23)
+ * - cy: 12 bits (chunks 0..4095, bits 0..11)
+ *
+ * @param {number} cx chunk x
+ * @param {number} cy chunk y
+ * @param {number} [z] floor z (0..15)
+ * @returns {number} 32-bit unsigned integer key
+ */
+function numericChunkKey(cx, cy, z) {
+    const zx = z !== undefined && z !== null ? (z | 0) : 0;
+    return (((zx & 0xf) << 24) | (((cx | 0) & 0xfff) << 12) | ((cy | 0) & 0xfff)) >>> 0;
+}
+
+/**
+ * Decode a 32-bit numeric chunk key back to { cx, cy, z }.
+ * @param {number} key
+ * @returns {{ cx: number, cy: number, z: number }}
+ */
+function decodeNumericChunkKey(key) {
+    const k = Number(key) >>> 0;
+    return {
+        z: (k >>> 24) & 0xf,
+        cx: (k >>> 12) & 0xfff,
+        cy: k & 0xfff
+    };
 }
 
 /**
@@ -75,9 +109,9 @@ class SpatialIndex {
     constructor(opts) {
         const o = opts || {};
         this.chunkSize = Math.max(1, o.chunkSize != null ? o.chunkSize | 0 : 32);
-        /** @type {Map<string, Map<string, object>>} chunkKey -> idKey -> entity */
+        /** @type {Map<number, Map<number|string, object>>} numericChunkKey -> idKey -> entity */
         this._chunks = new Map();
-        /** @type {Map<string, { entity: object, key: string, x: number, y: number, z: number }>} */
+        /** @type {Map<number|string, { entity: object, key: number, x: number, y: number, z: number }>} */
         this._byId = new Map();
     }
 
@@ -87,9 +121,37 @@ class SpatialIndex {
     }
 
     /**
+     * Bit-packed 32-bit integer chunk key for tile coordinates (x, y, z).
      * @param {number} x
      * @param {number} y
-     * @param {*} z
+     * @param {*} [z]
+     * @returns {number}
+     */
+    numericKey(x, y, z) {
+        const cs = this.chunkSize;
+        const cx = Math.floor(Number(x) / cs);
+        const cy = Math.floor(Number(y) / cs);
+        const zx = z !== undefined && z !== null ? (z | 0) : 0;
+        return numericChunkKey(cx, cy, zx);
+    }
+
+    /**
+     * Bit-packed 32-bit integer chunk key from chunk coordinates (cx, cy, z).
+     * @param {number} cx
+     * @param {number} cy
+     * @param {*} [z]
+     * @returns {number}
+     */
+    numericChunkKey(cx, cy, z) {
+        return numericChunkKey(cx, cy, z);
+    }
+
+    /**
+     * Human-readable string chunk key `${z}:${cx}:${cy}`.
+     * Retained for logging / inspection compatibility.
+     * @param {number} x
+     * @param {number} y
+     * @param {*} [z]
      * @returns {string}
      */
     chunkKey(x, y, z) {
@@ -119,7 +181,7 @@ class SpatialIndex {
         if (this._byId.has(ik)) {
             this.remove(eid);
         }
-        const key = this.chunkKey(pos.x, pos.y, pos.z);
+        const key = this.numericKey(pos.x, pos.y, pos.z);
         let bucket = this._chunks.get(key);
         if (!bucket) {
             bucket = new Map();
@@ -175,7 +237,7 @@ class SpatialIndex {
         const rec = this._byId.get(ik);
         if (!rec) return this.insert(entity);
 
-        const nextKey = this.chunkKey(pos.x, pos.y, pos.z);
+        const nextKey = this.numericKey(pos.x, pos.y, pos.z);
         if (rec.key === nextKey) {
             rec.x = pos.x;
             rec.y = pos.y;
@@ -243,9 +305,10 @@ class SpatialIndex {
      * @param {number} y
      * @param {*} z
      * @param {number} radius
-     * @returns {object[]} sorted by id
+     * @param {{ sort?: boolean }|boolean} [opts] optional sort setting (defaults to false)
+     * @returns {object[]} candidates (unsorted by default, pass { sort: true } if needed)
      */
-    queryChunkCandidates(x, y, z, radius) {
+    queryChunkCandidates(x, y, z, radius, opts) {
         const r = Math.max(0, Number(radius) || 0);
         const cs = this.chunkSize;
         const zx = z !== undefined && z !== null ? (z | 0) : 0;
@@ -257,14 +320,17 @@ class SpatialIndex {
         const out = [];
         for (let cx = minCx; cx <= maxCx; cx++) {
             for (let cy = minCy; cy <= maxCy; cy++) {
-                const bucket = this._chunks.get(`${zx}:${cx}:${cy}`);
+                const bucket = this._chunks.get(numericChunkKey(cx, cy, zx));
                 if (!bucket) continue;
                 for (const entity of bucket.values()) {
                     out.push(entity);
                 }
             }
         }
-        out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        const sort = typeof opts === 'boolean' ? opts : (opts && opts.sort === true);
+        if (sort) {
+            out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        }
         return out;
     }
 
@@ -275,9 +341,10 @@ class SpatialIndex {
      * @param {number} maxX
      * @param {number} maxY
      * @param {*} z
-     * @returns {object[]}
+     * @param {{ sort?: boolean }|boolean} [opts] optional sort setting (defaults to false)
+     * @returns {object[]} candidates (unsorted by default, pass { sort: true } if needed)
      */
-    queryRect(minX, minY, maxX, maxY, z) {
+    queryRect(minX, minY, maxX, maxY, z, opts) {
         const cs = this.chunkSize;
         const zx = z !== undefined && z !== null ? (z | 0) : 0;
         const minCx = Math.floor(Number(minX) / cs);
@@ -288,14 +355,17 @@ class SpatialIndex {
         const out = [];
         for (let cx = minCx; cx <= maxCx; cx++) {
             for (let cy = minCy; cy <= maxCy; cy++) {
-                const bucket = this._chunks.get(`${zx}:${cx}:${cy}`);
+                const bucket = this._chunks.get(numericChunkKey(cx, cy, zx));
                 if (!bucket) continue;
                 for (const entity of bucket.values()) {
                     out.push(entity);
                 }
             }
         }
-        out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        const sort = typeof opts === 'boolean' ? opts : (opts && opts.sort === true);
+        if (sort) {
+            out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        }
         return out;
     }
 
@@ -303,13 +373,14 @@ class SpatialIndex {
      * Union of chunk candidates near any observer (same-z squares).
      * @param {{ tile?: {x,y,z}, x?: number, y?: number, z?: * }[]} observers
      * @param {number} radius
-     * @returns {object[]}
+     * @param {{ sort?: boolean }|boolean} [opts] optional sort setting (defaults to false)
+     * @returns {object[]} candidates (unsorted by default, pass { sort: true } if needed)
      */
-    queryNearObservers(observers, radius) {
+    queryNearObservers(observers, radius, opts) {
         if (!observers || !observers.length) return [];
         const r = Math.max(0, Number(radius) || 0);
         const cs = this.chunkSize;
-        /** @type {Map<string, object>} */
+        /** @type {Map<*, object>} */
         const seen = new Map();
 
         for (let i = 0; i < observers.length; i++) {
@@ -324,7 +395,7 @@ class SpatialIndex {
             const maxCy = Math.floor((pos.y + r) / cs);
             for (let cx = minCx; cx <= maxCx; cx++) {
                 for (let cy = minCy; cy <= maxCy; cy++) {
-                    const bucket = this._chunks.get(`${zx}:${cx}:${cy}`);
+                    const bucket = this._chunks.get(numericChunkKey(cx, cy, zx));
                     if (!bucket) continue;
                     for (const [ik, entity] of bucket) {
                         if (!seen.has(ik)) seen.set(ik, entity);
@@ -334,7 +405,10 @@ class SpatialIndex {
         }
 
         const out = Array.from(seen.values());
-        out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        const sort = typeof opts === 'boolean' ? opts : (opts && opts.sort === true);
+        if (sort) {
+            out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        }
         return out;
     }
 
@@ -347,7 +421,8 @@ class SpatialIndex {
      * @param {{
      *   livingOnly?: boolean,
      *   filter?: (e: object) => boolean,
-     *   includeOrigin?: boolean
+     *   includeOrigin?: boolean,
+     *   sort?: boolean
      * }} [opts]
      * @returns {object[]}
      */
@@ -357,7 +432,7 @@ class SpatialIndex {
         const ox = Number(x);
         const oy = Number(y);
         const zx = z !== undefined && z !== null ? (z | 0) : 0;
-        const candidates = this.queryChunkCandidates(ox, oy, zx, r);
+        const candidates = this.queryChunkCandidates(ox, oy, zx, r, o);
         /** @type {object[]} */
         const out = [];
         for (let i = 0; i < candidates.length; i++) {
@@ -380,6 +455,9 @@ class SpatialIndex {
             if (d === 0 && o.includeOrigin === false) continue;
             out.push(e);
         }
+        if (o.sort === true) {
+            out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        }
         return out;
     }
 
@@ -387,7 +465,7 @@ class SpatialIndex {
      * Exact Chebyshev around an entity.
      * @param {object} origin
      * @param {number} radius
-     * @param {{ livingOnly?: boolean, filter?: (e: object) => boolean, includeOrigin?: boolean }} [opts]
+     * @param {{ livingOnly?: boolean, filter?: (e: object) => boolean, includeOrigin?: boolean, sort?: boolean }} [opts]
      * @returns {object[]}
      */
     queryAround(origin, radius, opts) {
@@ -400,14 +478,14 @@ class SpatialIndex {
      * Living entities within exact Chebyshev of any observer (same floor).
      * @param {{ tile?: {x,y,z}, x?: number, y?: number, z?: * }[]} observers
      * @param {number} radius
-     * @param {{ livingOnly?: boolean, filter?: (e: object) => boolean }} [opts]
+     * @param {{ livingOnly?: boolean, filter?: (e: object) => boolean, sort?: boolean }} [opts]
      * @returns {object[]}
      */
     queryNearObserversExact(observers, radius, opts) {
         if (!observers || !observers.length) return [];
         const o = opts || {};
         const r = Math.max(0, Number(radius) || 0);
-        const candidates = this.queryNearObservers(observers, r);
+        const candidates = this.queryNearObservers(observers, r, o);
         /** @type {object[]} */
         const out = [];
         for (let i = 0; i < candidates.length; i++) {
@@ -439,6 +517,9 @@ class SpatialIndex {
             }
             if (near) out.push(e);
         }
+        if (o.sort === true) {
+            out.sort((a, b) => compareIds(entityId(a), entityId(b)));
+        }
         return out;
     }
 
@@ -456,6 +537,8 @@ class SpatialIndex {
 
 module.exports = {
     SpatialIndex,
+    numericChunkKey,
+    decodeNumericChunkKey,
     entityPos,
     entityId,
     compareIds,
