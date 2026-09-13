@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>engine-server debug</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #12141a; color: #e8e6df; }
+  main { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+  form, #log, #loot, #bag, #dialog, #shop { background: #1c2028; padding: 12px; border-radius: 8px; }
+  label { display: block; margin: 6px 0; }
+  input, select, button { font: inherit; }
+  input, select { width: 220px; background: #0e1014; color: inherit; border: 1px solid #3a4050; padding: 4px 6px; }
+  button { margin: 4px 4px 0 0; padding: 6px 10px; cursor: pointer; }
+  canvas { image-rendering: pixelated; background: #0a0c10; border: 1px solid #3a4050; }
+  #log { width: 360px; height: 352px; overflow: auto; white-space: pre-wrap; font: 12px/1.35 ui-monospace, monospace; }
+  #loot, #bag, #dialog, #shop { width: 220px; min-height: 80px; }
+  .ok { color: #8fd18f; } .err { color: #e08080; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <form id="f">
+      <label>email <input id="email" type="email" value="dev@localhost" autocomplete="username"></label>
+      <label>password <input id="password" type="password" value="correct-horse" autocomplete="current-password"></label>
+      <label>name <input id="name" value="Ash" maxlength="20"></label>
+      <label>vocation
+        <select id="vocation">
+          <option>scout</option><option>guardian</option><option>mystic</option>
+          <option>adept</option><option>warden</option><option>adventurer</option>
+        </select>
+      </label>
+      <button type="button" id="reg">Register</button>
+      <button type="button" id="login">Login</button>
+      <button type="button" id="play">Play</button>
+      <button type="button" id="out">Logout WS</button>
+      <p id="status">P5 firstlight. Arrows walk the plaza (z=6). Stairs hop z=6↔z=7. U uses a ladder. Water/walls block.</p>
+    </form>
+    <canvas id="c" width="480" height="352"></canvas>
+    <div id="loot"><strong>loot</strong><div id="loot-body">click a corpse</div></div>
+    <div id="bag"><strong>bag</strong><div id="bag-body">empty</div></div>
+    <div id="dialog"><strong>talk</strong><div id="dialog-body">click the Guide</div></div>
+    <div id="shop"><strong>shop</strong><div id="shop-body">open Trade</div></div>
+  </div>
+  <div id="log"></div>
+</main>
+<script>
+const C2S = {
+  ENTER: 1, PING: 2, LOGOUT: 3, MOVE_STEP: 10,
+  SET_TARGET: 11, SET_AUTO_CHASE: 12, USE_STAIR: 13, USE: 14, USE_ITEM_WITH: 15,
+  OPEN_CORPSE: 20, LOOT_TAKE: 21, LOOT_CLOSE: 22,
+  TALK: 30, TALK_REPLY: 31, TALK_CLOSE: 32, SHOP_BUY: 33, SHOP_SELL: 34
+};
+const S2C = {
+  HELLO: 100, ENTER_WORLD: 101, KICK: 102, REJECT: 103, PONG: 104,
+  VIEWPORT: 110, APPEAR: 111, DISAPPEAR: 112, MOVE: 113,
+  STATS: 114, SWING: 115, DEATH: 116, CORPSE: 117, CORPSE_GONE: 118,
+  CONTAINER: 119, ITEM_GAIN: 120, EXP: 121,
+  INVENTORY: 122, SAY: 123, WORLD_PIN: 125, WORLD_PIN_GONE: 126,
+  DIALOG: 130, DIALOG_CLOSE: 131, SHOP: 132
+};
+const APPEAR_NPC = 1;
+const TILE = { 0: '#111', 1: '#3a7d3a', 2: '#c2a36b', 3: '#5a5a5a', 4: '#2a5a8a', 5: '#d4b84a' };
+function tileColor(t) {
+  if (TILE[t]) return TILE[t];
+  if ((t | 0) === 255) return '#2a2a38';
+  const u = Math.max(0, Math.min(254, t | 0));
+  const k = 1 - (u / 254);
+  const r = Math.round(40 + k * 140);
+  const g = Math.round(50 + k * 120);
+  return 'rgb(' + r + ',' + g + ',55)';
+}
+const TS = 32;
+const CREATURE_MIN = 1000000000;
+const logEl = document.getElementById('log');
+const emailEl = document.getElementById('email');
+const passwordEl = document.getElementById('password');
+const nameEl = document.getElementById('name');
+const vocationEl = document.getElementById('vocation');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let ws, clientSeq = 1, viewport = null, self = null, others = new Map(), corpses = new Map(), worldPins = new Map();
+let openCorpse = 0, bag = [], talkNpc = 0, shopNpc = 0;
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    credentials: 'same-origin',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const json = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((json && json.error) || r.status);
+  return json;
+}
+
+document.getElementById('reg').onclick = () =>
+  api('POST', '/v1/register', { email: emailEl.value, password: passwordEl.value })
+    .then((a) => log('registered ' + a.email, 'ok'))
+    .catch((e) => log('register ' + e.message, 'err'));
+
+document.getElementById('login').onclick = () =>
+  api('POST', '/v1/login', { email: emailEl.value, password: passwordEl.value })
+    .then((a) => log('login ' + a.email, 'ok'))
+    .catch((e) => log('login ' + e.message, 'err'));
+
+document.getElementById('play').onclick = async () => {
+  try {
+    let list = await api('GET', '/v1/characters');
+    if (!list.characters.length) {
+      await api('POST', '/v1/characters', { name: nameEl.value, vocation: vocationEl.value });
+      list = await api('GET', '/v1/characters');
+    }
+    const ch = list.characters[0];
+    const play = await api('POST', '/v1/play', { characterId: ch.id });
+    log('token for ' + ch.name, 'ok');
+    connect(play.token);
+  } catch (e) {
+    log('play ' + e.message, 'err');
+  }
+};
+
+document.getElementById('out').onclick = () => {
+  if (ws && ws.readyState === 1) send(C2S.LOGOUT);
+};
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function encodeFrame(opcode, seq, payload) {
+  const p = payload || new Uint8Array(0);
+  const out = new Uint8Array(6 + p.length);
+  const v = new DataView(out.buffer);
+  v.setUint16(0, opcode, true);
+  v.setUint32(2, seq >>> 0, true);
+  out.set(p, 6);
+  return out;
+}
+
+function u32buf(n) {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n >>> 0, true);
+  return b;
+}
+
+function encodeTileUse(x, y, z) {
+  const p = new Uint8Array(5);
+  const v = new DataView(p.buffer);
+  v.setInt16(0, x | 0, true);
+  v.setInt16(2, y | 0, true);
+  v.setInt8(4, z | 0);
+  return p;
+}
+
+function encodeUseItemWith(x, y, z, itemId) {
+  const idb = new TextEncoder().encode(itemId);
+  const p = new Uint8Array(5 + 1 + idb.length);
+  const v = new DataView(p.buffer);
+  v.setInt16(0, x | 0, true);
+  v.setInt16(2, y | 0, true);
+  v.setInt8(4, z | 0);
+  p[5] = idb.length;
+  p.set(idb, 6);
+  return p;
+}
+
+function send(opcode, payload) {
+  if (!ws || ws.readyState !== 1) return;
+  const seq = clientSeq;
+  clientSeq += 1;
+  ws.send(encodeFrame(opcode, seq, payload));
+}
+
+class Reader {
+  constructor(buf) { this.b = buf; this.v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength); this.o = 0; }
+  u8() { return this.v.getUint8(this.o++); }
+  i8() { const x = this.v.getInt8(this.o); this.o += 1; return x; }
+  u16() { const x = this.v.getUint16(this.o, true); this.o += 2; return x; }
+  i16() { const x = this.v.getInt16(this.o, true); this.o += 2; return x; }
+  u32() { const x = this.v.getUint32(this.o, true); this.o += 4; return x; }
+  str() {
+    const n = this.u8();
+    const s = new TextDecoder().decode(this.b.subarray(this.o, this.o + n));
+    this.o += n;
+    return s;
+  }
+}
+
+function connect(tokenHex) {
+  if (ws) try { ws.close(); } catch (e) { /* ignore */ }
+  clientSeq = 1;
+  others.clear();
+  corpses.clear();
+  worldPins.clear();
+  bag = [];
+  talkNpc = 0;
+  shopNpc = 0;
+  bag = [];
+  openCorpse = 0;
+  self = null;
+  viewport = null;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/v1/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (ev) => onFrame(new Uint8Array(ev.data), tokenHex);
+  ws.onclose = (ev) => log('ws close ' + ev.code, ev.code === 1000 || ev.code === 4016 ? 'ok' : 'err');
+  ws.onerror = () => log('ws error', 'err');
+}
+
+function onFrame(bytes, tokenHex) {
+  const r = new Reader(bytes);
+  const opcode = r.u16();
+  const seq = r.u32();
+  if (opcode === S2C.HELLO) {
+    log('HELLO v' + r.u16() + ' ups=' + r.u8() + ' tick=' + r.u32());
+    send(C2S.ENTER, hexToBytes(tokenHex));
+    return;
+  }
+  if (opcode === S2C.ENTER_WORLD) {
+    self = {
+      id: r.u32(), name: r.str(), vocation: r.str(), level: r.u16(),
+      experience: r.u32(), hp: r.u16(), hpMax: r.u16(), mp: r.u16(), mpMax: r.u16(),
+      x: r.i16(), y: r.i16(), z: r.i8(), townId: r.u16()
+    };
+    const originX = r.i16(), originY = r.i16(), z = r.i8(), w = r.u8(), h = r.u8();
+    const tiles = [];
+    for (let i = 0; i < w * h; i++) tiles.push(r.u16());
+    viewport = { originX, originY, z, width: w, height: h, tiles };
+    log('ENTER_WORLD ' + self.name + ' @' + self.x + ',' + self.y + ',' + self.z, 'ok');
+    setStatus();
+    draw();
+    return;
+  }
+  if (opcode === S2C.VIEWPORT) {
+    const originX = r.i16(), originY = r.i16(), z = r.i8(), w = r.u8(), h = r.u8();
+    const tiles = [];
+    for (let i = 0; i < w * h; i++) tiles.push(r.u16());
+    viewport = { originX, originY, z, width: w, height: h, tiles };
+    setStatus();
+    draw();
+    return;
+  }
+  if (opcode === S2C.MOVE) {
+    const id = r.u32(), x = r.i16(), y = r.i16(), z = r.i8(), dir = r.u8();
+    if (self && id === self.id) {
+      self.x = x; self.y = y; self.z = z; self.dir = dir;
+      setStatus();
+    } else {
+      const p = others.get(id);
+      if (p) { p.x = x; p.y = y; p.z = z; }
+    }
+    draw();
+    return;
+  }
+  if (opcode === S2C.PONG) {
+    const echo = r.u32(), srv = r.u32(), tick = r.u32();
+    log('PONG rtt~' + Math.max(0, Date.now() - echo) + 'ms tick=' + tick);
+    return;
+  }
+  if (opcode === S2C.REJECT) {
+    log('REJECT seq=' + r.u32() + ' reason=' + r.u8(), 'err');
+    return;
+  }
+  if (opcode === S2C.KICK) {
+    log('KICK reason=' + r.u8(), 'err');
+    return;
+  }
+  if (opcode === S2C.APPEAR) {
+    const p = { id: r.u32(), name: r.str(), x: r.i16(), y: r.i16(), z: r.i8(), hp: r.u16(), hpMax: r.u16(), flags: r.u8() };
+    others.set(p.id, p);
+    log('APPEAR ' + p.name + (p.flags & APPEAR_NPC ? ' (npc)' : ''));
+    draw();
+    return;
+  }
+  if (opcode === S2C.DISAPPEAR) {
+    const id = r.u32();
+    others.delete(id);
+    log('DISAPPEAR ' + id);
+    draw();
+    return;
+  }
+  if (opcode === S2C.STATS) {
+    const id = r.u32(), hp = r.u16(), hpMax = r.u16(), mp = r.u16(), mpMax = r.u16();
+    if (self && id === self.id) {
+      self.hp = hp; self.hpMax = hpMax; self.mp = mp; self.mpMax = mpMax;
+      setStatus();
+    } else {
+      const p = others.get(id);
+      if (p) { p.hp = hp; p.hpMax = hpMax; }
+    }
+    draw();
+    return;
+  }
+  if (opcode === S2C.SWING) {
+    const src = r.u32(), dst = r.u32(), amount = r.u16(), flags = r.u8();
+    log('SWING ' + src + '→' + dst + ' ' + amount + (flags & 1 ? ' miss' : '') + (flags & 4 ? ' crit' : '') + (flags & 8 ? ' fatal' : '') + (flags & 2 ? ' death' : ''));
+    return;
+  }
+  if (opcode === S2C.DEATH) {
+    const id = r.u32(), killer = r.u32();
+    log('DEATH ' + id + ' by ' + killer, id === (self && self.id) ? 'err' : 'ok');
+    others.delete(id);
+    draw();
+    return;
+  }
+  if (opcode === S2C.CORPSE) {
+    const c = { id: r.u32(), x: r.i16(), y: r.i16(), z: r.i8(), name: r.str() };
+    corpses.set(c.id, c);
+    log('CORPSE ' + c.name);
+    draw();
+    return;
+  }
+  if (opcode === S2C.WORLD_PIN) {
+    const pin = { id: r.u32(), x: r.i16(), y: r.i16(), z: r.i8(), kind: r.str(), catalogId: r.str() };
+    if (r.o < r.b.length) pin.flags = r.u8();
+    worldPins.set(pin.id, pin);
+    log('PIN ' + pin.kind + ' ' + pin.catalogId);
+    draw();
+    return;
+  }
+  if (opcode === S2C.WORLD_PIN_GONE) {
+    const id = r.u32();
+    worldPins.delete(id);
+    draw();
+    return;
+  }
+  if (opcode === S2C.CORPSE_GONE) {
+    const id = r.u32();
+    corpses.delete(id);
+    if (openCorpse === id) {
+      openCorpse = 0;
+      document.getElementById('loot-body').textContent = 'click a corpse';
+    }
+    draw();
+    return;
+  }
+  if (opcode === S2C.CONTAINER) {
+    const id = r.u32(), n = r.u8();
+    const items = [];
+    for (let i = 0; i < n; i++) items.push({ id: r.str(), count: r.u16() });
+    openCorpse = id;
+    renderLoot(items);
+    return;
+  }
+  if (opcode === S2C.ITEM_GAIN) {
+    const id = r.str(), count = r.u16();
+    log('gain ' + count + '× ' + id, 'ok');
+    return;
+  }
+  if (opcode === S2C.EXP) {
+    const total = r.u32(), gained = r.u32();
+    if (self) self.experience = total;
+    if (r.o + 2 <= r.b.length) {
+      const level = r.u16();
+      if (self) self.level = level;
+    }
+    log('exp +' + gained + ' (' + total + ')', 'ok');
+    setStatus();
+    return;
+  }
+  if (opcode === S2C.INVENTORY) {
+    const n = r.u8();
+    bag = [];
+    for (let i = 0; i < n; i++) bag.push({ id: r.str(), count: r.u16() });
+    renderBag();
+    return;
+  }
+  if (opcode === S2C.SAY) {
+    log(r.str(), 'err');
+    return;
+  }
+  if (opcode === S2C.DIALOG) {
+    talkNpc = r.u32();
+    const nodeId = r.str();
+    const text = r.str();
+    const n = r.u8();
+    const replies = [];
+    for (let i = 0; i < n; i++) replies.push(r.str());
+    renderDialog(nodeId, text, replies);
+    return;
+  }
+  if (opcode === S2C.DIALOG_CLOSE) {
+    r.u32();
+    talkNpc = 0;
+    document.getElementById('dialog-body').textContent = 'click the Guide';
+    return;
+  }
+  if (opcode === S2C.SHOP) {
+    shopNpc = r.u32();
+    const currency = r.str();
+    const n = r.u8();
+    const items = [];
+    for (let i = 0; i < n; i++) items.push({ itemId: r.str(), buy: r.u16(), sell: r.u16() });
+    renderShop(currency, items);
+    return;
+  }
+  log('opcode ' + opcode + ' seq=' + seq);
+}
+
+function renderBag() {
+  const el = document.getElementById('bag-body');
+  el.textContent = '';
+  if (!bag.length) {
+    el.textContent = 'empty';
+    return;
+  }
+  bag.forEach((it) => {
+    const d = document.createElement('div');
+    d.textContent = it.count + '× ' + it.id;
+    el.appendChild(d);
+  });
+}
+
+function encodeStrPayload(npcId, count, itemId) {
+  const idb = new TextEncoder().encode(itemId);
+  const p = new Uint8Array(4 + 2 + 1 + idb.length);
+  const v = new DataView(p.buffer);
+  v.setUint32(0, npcId >>> 0, true);
+  v.setUint16(4, count, true);
+  p[6] = idb.length;
+  p.set(idb, 7);
+  return p;
+}
+
+function renderDialog(nodeId, text, replies) {
+  const el = document.getElementById('dialog-body');
+  el.textContent = '';
+  const t = document.createElement('div');
+  t.textContent = text;
+  el.appendChild(t);
+  replies.forEach((label, index) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => {
+      const p = new Uint8Array(5);
+      new DataView(p.buffer).setUint32(0, talkNpc >>> 0, true);
+      p[4] = index;
+      send(C2S.TALK_REPLY, p);
+    };
+    el.appendChild(b);
+  });
+  const close = document.createElement('button');
+  close.textContent = 'Close';
+  close.onclick = () => send(C2S.TALK_CLOSE, u32buf(talkNpc));
+  el.appendChild(close);
+}
+
+function renderShop(currency, items) {
+  const el = document.getElementById('shop-body');
+  el.textContent = '';
+  const cap = document.createElement('div');
+  cap.textContent = 'pay with ' + currency;
+  el.appendChild(cap);
+  items.forEach((it) => {
+    if (it.buy > 0) {
+      const b = document.createElement('button');
+      b.textContent = 'Buy ' + it.itemId + ' (' + it.buy + ')';
+      b.onclick = () => send(C2S.SHOP_BUY, encodeStrPayload(shopNpc, 1, it.itemId));
+      el.appendChild(b);
+    }
+    if (it.sell > 0) {
+      const b = document.createElement('button');
+      b.textContent = 'Sell ' + it.itemId + ' (' + it.sell + ')';
+      b.onclick = () => send(C2S.SHOP_SELL, encodeStrPayload(shopNpc, 1, it.itemId));
+      el.appendChild(b);
+    }
+  });
+}
+
+function renderLoot(items) {
+  const el = document.getElementById('loot-body');
+  el.textContent = '';
+  if (!items.length) {
+    el.textContent = 'empty';
+    return;
+  }
+  items.forEach((it, slot) => {
+    const b = document.createElement('button');
+    b.textContent = it.count + '× ' + it.id;
+    b.onclick = () => {
+      const p = new Uint8Array(5);
+      new DataView(p.buffer).setUint32(0, openCorpse >>> 0, true);
+      p[4] = slot;
+      send(C2S.LOOT_TAKE, p);
+    };
+    el.appendChild(b);
+  });
+}
+
+function setStatus() {
+  if (!self) return;
+  let tile = '';
+  if (viewport) {
+    const lx = self.x - viewport.originX;
+    const ly = self.y - viewport.originY;
+    if (lx >= 0 && ly >= 0 && lx < viewport.width && ly < viewport.height) {
+      tile = ' tile ' + viewport.tiles[ly * viewport.width + lx];
+    }
+  }
+  const floor = viewport ? viewport.z : self.z;
+  document.getElementById('status').textContent =
+    self.name + ' L' + self.level + ' ' + self.hp + '/' + self.hpMax + 'hp @' +
+    self.x + ',' + self.y + ',' + self.z +
+    ' floor ' + floor + tile +
+    ' exp ' + (self.experience || 0);
+}
+
+function draw() {
+  ctx.fillStyle = '#0a0c10';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!viewport) return;
+  for (let y = 0; y < viewport.height; y++) {
+    for (let x = 0; x < viewport.width; x++) {
+      const t = viewport.tiles[y * viewport.width + x];
+      ctx.fillStyle = tileColor(t);
+      ctx.fillRect(x * TS, y * TS, TS - 1, TS - 1);
+    }
+  }
+  function mark(px, py, color, label) {
+    const sx = (px - viewport.originX) * TS + TS / 2;
+    const sy = (py - viewport.originY) * TS + TS / 2;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, sx + 10, sy + 4);
+  }
+  for (const pin of worldPins.values()) {
+    const sx = (pin.x - viewport.originX) * TS + 6;
+    const sy = (pin.y - viewport.originY) * TS + 6;
+    ctx.fillStyle = '#8fde5d';
+    ctx.fillRect(sx, sy, TS - 12, TS - 12);
+  }
+  for (const c of corpses.values()) {
+    const sx = (c.x - viewport.originX) * TS + 4;
+    const sy = (c.y - viewport.originY) * TS + 4;
+    ctx.fillStyle = '#6b4423';
+    ctx.fillRect(sx, sy, TS - 8, TS - 8);
+  }
+  if (self) mark(self.x, self.y, '#fff', self.name);
+  for (const p of others.values()) {
+    let color = '#7ab8ff';
+    if (p.flags & APPEAR_NPC) color = '#d4b84a';
+    else if (p.id >= CREATURE_MIN) color = '#e08080';
+    const label = p.hpMax ? (p.name + ' ' + p.hp) : p.name;
+    mark(p.x, p.y, color, label);
+  }
+}
+
+canvas.addEventListener('click', (ev) => {
+  if (!self || !viewport) return;
+  const rect = canvas.getBoundingClientRect();
+  const tx = viewport.originX + Math.floor((ev.clientX - rect.left) / TS);
+  const ty = viewport.originY + Math.floor((ev.clientY - rect.top) / TS);
+  for (const pin of worldPins.values()) {
+    if (pin.x === tx && pin.y === ty) {
+      send(C2S.USE, encodeTileUse(tx, ty, self.z));
+      log('use ' + pin.kind);
+      return;
+    }
+  }
+  for (const c of corpses.values()) {
+    if (c.x === tx && c.y === ty) {
+      send(C2S.OPEN_CORPSE, u32buf(c.id));
+      return;
+    }
+  }
+  for (const p of others.values()) {
+    if (p.x === tx && p.y === ty) {
+      if (p.flags & APPEAR_NPC) {
+        send(C2S.TALK, u32buf(p.id));
+        log('talk ' + p.name);
+        return;
+      }
+      send(C2S.SET_TARGET, u32buf(p.id));
+      send(C2S.SET_AUTO_CHASE, Uint8Array.of(1));
+      log('target ' + p.name);
+      return;
+    }
+  }
+  send(C2S.SET_TARGET, u32buf(0));
+});
+
+const KEY_WALK_REPEAT_MS = 200;
+const KEY_WALK_DIR = {
+  ArrowUp: 0, w: 0, W: 0,
+  ArrowRight: 1, d: 1, D: 1,
+  ArrowDown: 2, s: 2, S: 2,
+  ArrowLeft: 3, a: 3, A: 3
+};
+let keyWalkHeld = [];
+let keyWalkLastEmit = 0;
+
+function keyWalkCurrent() {
+  return keyWalkHeld.length ? keyWalkHeld[0].dir : null;
+}
+
+function tryKeyWalk() {
+  if (!self) return;
+  const dir = keyWalkCurrent();
+  if (dir == null) return;
+  const now = Date.now();
+  const firstPress = keyWalkLastEmit === 0;
+  const heldFor = now - keyWalkHeld[0].first;
+  if (!firstPress && heldFor < KEY_WALK_REPEAT_MS) return;
+  if (!firstPress && now - keyWalkLastEmit < KEY_WALK_REPEAT_MS) return;
+  keyWalkLastEmit = now;
+  send(C2S.MOVE_STEP, Uint8Array.of(dir));
+}
+
+setInterval(() => {
+  if (ws && ws.readyState === 1 && self) {
+    const p = new Uint8Array(4);
+    new DataView(p.buffer).setUint32(0, Date.now() >>> 0, true);
+    send(C2S.PING, p);
+  }
+}, 2000);
+
+setInterval(tryKeyWalk, 30);
+
+window.addEventListener('keydown', (ev) => {
+  if (!self) return;
+  if (ev.key === 'u' || ev.key === 'U') {
+    ev.preventDefault();
+    send(C2S.USE_STAIR, new Uint8Array(0));
+    return;
+  }
+  if (ev.key === 'e' || ev.key === 'E') {
+    ev.preventDefault();
+    send(C2S.USE, encodeTileUse(self.x, self.y, self.z));
+    return;
+  }
+  if (ev.key === 'g' || ev.key === 'G') {
+    ev.preventDefault();
+    send(C2S.USE_ITEM_WITH, encodeUseItemWith(self.x, self.y, self.z, 'shovel'));
+    return;
+  }
+  if (ev.key === 'r' || ev.key === 'R') {
+    ev.preventDefault();
+    send(C2S.USE_ITEM_WITH, encodeUseItemWith(self.x, self.y, self.z, 'rope'));
+    return;
+  }
+  const dir = KEY_WALK_DIR[ev.key];
+  if (dir == null) return;
+  ev.preventDefault();
+  if (keyWalkHeld.some((h) => h.key === ev.key)) return;
+  keyWalkHeld = keyWalkHeld.filter((h) => h.dir !== dir);
+  keyWalkHeld.unshift({ key: ev.key, dir, first: Date.now() });
+  tryKeyWalk();
+});
+
+window.addEventListener('keyup', (ev) => {
+  if (KEY_WALK_DIR[ev.key] == null) return;
+  keyWalkHeld = keyWalkHeld.filter((h) => h.key !== ev.key);
+  if (!keyWalkHeld.length) keyWalkLastEmit = 0;
+});
+
+window.addEventListener('blur', () => {
+  keyWalkHeld = [];
+  keyWalkLastEmit = 0;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+    "bind": "127.0.0.1",
+    "httpPort": 8081,
+    "logLevel": "debug",
+    "mysql": {
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "game",
+        "database": "game"
+    }
+}
