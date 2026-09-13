@@ -53,6 +53,7 @@ const { createStaticMap, viewport, viewportWindow, inViewport, clampSpawn } = re
 const { fromStaticMap } = require('./tilemap');
 const { computeMoveDelay, delayToTicks, isDiagonalStep } = require('./movement');
 const { PathBudget, isLogicIntervalDue, seedPathPhase } = require('./path_budget');
+const { MonsterComputeService } = require('./monster_compute');
 const {
     resolveMelee,
     resolveWandAuto,
@@ -252,6 +253,14 @@ class World {
         this.pathBudget = new PathBudget(
             opts.settings && opts.settings.aiPathBudgetPerFrame
         );
+        this.computeService = new MonsterComputeService({
+            workers: opts.settings && opts.settings.computeWorkers,
+            capacity: opts.settings && opts.settings.computeQueueCapacity,
+            visibleReserve: opts.settings && opts.settings.computeVisibleReserve,
+            applyDelayTicks: opts.settings && opts.settings.computeApplyDelayTicks,
+            creatureIdBase: (opts.settings && opts.settings.creatureIdBase) || 1000000000,
+            log: this.log
+        });
         this.tileMap = fromStaticMap(this.map, {
             maxStack: opts.settings && opts.settings.playerTileMaxStack,
             resolveEntity: (id) => this.getEntity(id),
@@ -263,6 +272,7 @@ class World {
                 this.onEntityMoved(entity, fromX, fromY, fromZ, toX, toY, toZ);
             },
             budget: this.pathBudget,
+            computeService: this.computeService,
             path: {
                 maxDistance: opts.settings && opts.settings.pathMaxDistance,
                 maxIterations: opts.settings && opts.settings.pathMaxIterations,
@@ -285,6 +295,7 @@ class World {
                 this.broadcastMove(target, from, dir);
             }
         });
+        this.computeService.tileMap = this.tileMap;
         this.tick = new WorldTick({
             ups: (opts.settings && opts.settings.logicUps) || 20,
             now: this.now,
@@ -304,12 +315,18 @@ class World {
     }
 
     start() {
+        if (this.computeService) {
+            this.computeService.start();
+        }
         this.tick.start();
         this._scheduleGlobalSave();
         this._scheduleIntervalSave();
     }
 
     stop() {
+        if (this.computeService) {
+            this.computeService.stop();
+        }
         this.tick.stop();
         this._stopPersistClock();
         for (const session of Array.from(this.players.values())) {
@@ -328,7 +345,8 @@ class World {
             creatures: this.creatures.size,
             activeCreatures: this.activeCreatures ? this.activeCreatures.size : 0,
             corpses: this.corpses.size,
-            creaturePool: this.creaturePool ? this.creaturePool.size : 0
+            creaturePool: this.creaturePool ? this.creaturePool.size : 0,
+            compute: this.computeService ? this.computeService.stats() : null
         });
     }
 
@@ -615,6 +633,10 @@ class World {
         if (this.livingPins) this.livingPins.delete(pin);
         const creature = this.creatures.get(pin.entityId);
         if (creature) {
+            if (this.computeService) {
+                this.computeService.cancelEntityJobs(creature.id);
+            }
+            creature._computeToken = null;
             this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
             this.creatures.delete(creature.id);
             this.activeCreatures.delete(creature);
@@ -991,11 +1013,49 @@ class World {
         return true;
     }
 
+    drainComputeCompletions(tickIndex) {
+        if (!this.computeService) return;
+        const completions = this.computeService.drainCompletions();
+        if (!completions || completions.length === 0) return;
+
+        const now = this.logicNow(tickIndex);
+        const failBackoff = this.tileMap && this.tileMap.pathOpts && this.tileMap.pathOpts.failBackoffSec != null
+            ? Number(this.tileMap.pathOpts.failBackoffSec)
+            : 0.25;
+
+        for (let i = 0; i < completions.length; i++) {
+            const comp = completions[i];
+            const cr = this.creatures.get(comp.entityId);
+            if (!cr || cr.dead || (cr.hp | 0) <= 0) {
+                this.computeService.recordStale();
+                continue;
+            }
+            if (cr._computeToken !== comp.token) {
+                this.computeService.recordStale();
+                continue;
+            }
+            if (comp.goal && (cr._repathGoalX !== comp.goal.x || cr._repathGoalY !== comp.goal.y)) {
+                this.computeService.recordStale();
+                continue;
+            }
+
+            if (comp.status === 'found' && Array.isArray(comp.path) && comp.path.length > 0) {
+                cr.path = comp.path.slice(1);
+                cr._repathFailBackoffUntil = null;
+            } else {
+                if (Number.isFinite(failBackoff) && failBackoff > 0) {
+                    cr._repathFailBackoffUntil = now + failBackoff;
+                }
+            }
+        }
+    }
+
     step(tickIndex) {
         this._tickIndex = tickIndex | 0;
         this.pathBudget.begin(this._tickIndex);
         this._batchingOutbound = true;
         try {
+            this.drainComputeCompletions(tickIndex);
             for (const session of this.players.values()) {
                 if (session.dead) continue;
                 session.movedThisTick = false;
@@ -1698,6 +1758,14 @@ class World {
         return best;
     }
 
+    computePriorityFor(entity) {
+        if (!entity) return 'background';
+        if (entity.type === 'player') return 'visible';
+        if (entity.targetId && entity.targetId > 0) return 'visible';
+        if (!entity.simSleeping) return 'visible';
+        return 'background';
+    }
+
     tryStepToward(entity, tx, ty, tickIndex, opts) {
         if (tickIndex < entity.moveReadyTick) return false;
         const from = { x: entity.x | 0, y: entity.y | 0, z: entity.z | 0 };
@@ -1706,6 +1774,7 @@ class World {
             return false;
         }
         const cap = this.pathCap(entity, opts);
+        const priority = this.computePriorityFor(entity);
         this.tileMap.followPath(
             entity,
             tx | 0,
@@ -1713,7 +1782,12 @@ class World {
             entity.z | 0,
             cap,
             0,
-            { now: this.logicNow(tickIndex), budget: this.pathBudget }
+            {
+                now: this.logicNow(tickIndex),
+                budget: this.pathBudget,
+                computeService: this.computeService,
+                priority
+            }
         );
         if ((entity.x | 0) === from.x && (entity.y | 0) === from.y) {
             return false;
@@ -1998,6 +2072,10 @@ class World {
     }
 
     killCreature(creature, killer, tickIndex) {
+        if (this.computeService) {
+            this.computeService.cancelEntityJobs(creature.id);
+        }
+        creature._computeToken = null;
         this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
         this.creatures.delete(creature.id);
         this.activeCreatures.delete(creature);

@@ -27,8 +27,17 @@ const ENV_MAP = [
     ['GAME_MAP_ID', ['mapId'], String],
     ['GAME_SPAWN_MAX_LIVING', ['spawnMaxLiving'], toInt],
     ['GAME_OUTBOUND_BATCHING', ['limits', 'outboundBatching'], toBool],
-    ['GAME_COALESCE_PAYLOADS', ['limits', 'coalescePayloads'], toBool]
+    ['GAME_COALESCE_PAYLOADS', ['limits', 'coalescePayloads'], toBool],
+    ['GAME_COMPUTE_WORKERS', ['computeWorkers'], toWorkerSetting],
+    ['GAME_COMPUTE_QUEUE_CAPACITY', ['computeQueueCapacity'], toInt],
+    ['GAME_COMPUTE_APPLY_DELAY_TICKS', ['computeApplyDelayTicks'], toInt]
 ];
+
+function toWorkerSetting(v) {
+    const s = String(v).trim().toLowerCase();
+    if (s === 'auto') return 'auto';
+    return toInt(s);
+}
 
 function toInt(v) {
     const n = Number.parseInt(String(v), 10);

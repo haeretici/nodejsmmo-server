@@ -266,6 +266,7 @@ class TileMap {
         this.playerSpatial = opts.playerSpatial || null;
         this.creatureSpatial = opts.creatureSpatial || null;
         this.budget = opts.budget || null;
+        this.computeService = opts.computeService || null;
         this.pathOpts = opts.path && typeof opts.path === 'object' ? opts.path : {};
     }
 
@@ -900,28 +901,60 @@ class TileMap {
                 const occupantPenalty = knobs.occupantStepPenalty != null
                     ? Number(knobs.occupantStepPenalty)
                     : 4;
-                const path = this.search(
-                    { x: entity.x | 0, y: entity.y | 0, z: entity.z | 0 },
-                    { x: tx, y: ty, z: tz },
-                    {
-                        allowDiagonal: knobs.allowDiagonal !== false,
-                        maxDistance: cap,
-                        mover: entity,
-                        useStackPolicy: true,
-                        occupantStepPenalty: occupantPenalty,
-                        avoidFieldMask: 0,
-                        fieldPenalty: 0
+                const computeService = (extras && extras.computeService) || this.computeService;
+                if (computeService && computeService.enabled && !critical) {
+                    const priority = (extras && extras.priority) || 'visible';
+                    const token = computeService.submitPath({
+                        entityId: entity.id | 0,
+                        priority,
+                        z: tz,
+                        start: { x: entity.x | 0, y: entity.y | 0 },
+                        goal: { x: tx, y: ty },
+                        flags: {
+                            allowDiagonal: knobs.allowDiagonal !== false,
+                            useStackPolicy: true,
+                            canPushCreatures: !!(entity.canPushCreatures || (entity.flags && entity.flags.canPushCreatures)),
+                            occupantStepPenalty: occupantPenalty,
+                            avoidFieldMask: 0,
+                            fieldPenalty: 0
+                        },
+                        caps: {
+                            maxDistance: cap,
+                            maxIterations: knobs.maxIterations != null ? knobs.maxIterations : DEFAULT_MAX_ITERATIONS
+                        },
+                        tileMap: this
+                    });
+                    if (token) {
+                        entity._computeToken = typeof token === 'object' ? token.token : token;
+                        if (typeof token === 'object' && token.inline && token.path && token.path.length > 0) {
+                            entity.path = token.path.slice(1);
+                            entity._repathFailBackoffUntil = null;
+                        }
                     }
-                );
-                if (path && path.length > 0) {
-                    entity.path = path.slice(1);
-                    entity._repathFailBackoffUntil = null;
                 } else {
-                    entity.path = [];
-                    if (critical && Number.isFinite(failBackoff) && failBackoff > 0) {
-                        entity._repathFailBackoffUntil = now + failBackoff;
-                        if (budget && typeof budget.noteFailBackoff === 'function') {
-                            budget.noteFailBackoff();
+                    const path = this.search(
+                        { x: entity.x | 0, y: entity.y | 0, z: entity.z | 0 },
+                        { x: tx, y: ty, z: tz },
+                        {
+                            allowDiagonal: knobs.allowDiagonal !== false,
+                            maxDistance: cap,
+                            mover: entity,
+                            useStackPolicy: true,
+                            occupantStepPenalty: occupantPenalty,
+                            avoidFieldMask: 0,
+                            fieldPenalty: 0
+                        }
+                    );
+                    if (path && path.length > 0) {
+                        entity.path = path.slice(1);
+                        entity._repathFailBackoffUntil = null;
+                    } else {
+                        entity.path = [];
+                        if (critical && Number.isFinite(failBackoff) && failBackoff > 0) {
+                            entity._repathFailBackoffUntil = now + failBackoff;
+                            if (budget && typeof budget.noteFailBackoff === 'function') {
+                                budget.noteFailBackoff();
+                            }
                         }
                     }
                 }
@@ -1129,6 +1162,7 @@ function fromStaticMap(map, opts) {
         playerSpatial: opts && opts.playerSpatial,
         creatureSpatial: opts && opts.creatureSpatial,
         budget: opts && opts.budget,
+        computeService: opts && opts.computeService,
         path: opts && opts.path
     });
     for (let z = zMin; z <= zMax; z++) {
