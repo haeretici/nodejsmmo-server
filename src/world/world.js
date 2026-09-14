@@ -127,6 +127,7 @@ const {
     isNpcEntity,
     talkRangeOk,
     normalizeDialog,
+    resolveDialog,
     resolveNode,
     listReplies,
     applyStoragePatch,
@@ -202,7 +203,14 @@ class World {
         this.onRequestShutdown = opts.onRequestShutdown || null;
         this.pack = opts.pack || null;
         this._itemDb = itemDbFromPack(this.pack);
-        this.templates = opts.templates || (this.pack && this.pack.templates) || TEMPLATES;
+        this.dialogs = opts.dialogs || (this.pack && this.pack.dialogs) || Object.create(null);
+        this.templates = Object.assign(Object.create(null), opts.templates || (this.pack && this.pack.templates) || TEMPLATES);
+        for (const id of Object.keys(this.templates)) {
+            const tmpl = this.templates[id];
+            if (tmpl && !tmpl.dialog && tmpl.dialogId && this.dialogs[tmpl.dialogId]) {
+                this.templates[id] = Object.assign({}, tmpl, { dialog: this.dialogs[tmpl.dialogId] });
+            }
+        }
         this.map = opts.map || (this.pack
             ? runtimeMap(this.pack, resolveMapId(this.settings, this.pack))
             : createStaticMap());
@@ -467,7 +475,7 @@ class World {
         for (let i = 0; i < rows.length; i++) {
             const pin = makePinState(rows[i], this.spawnPins.length, this.spawnMode === 'eager');
             const template = getTemplate(pin.kind, this.templates);
-            const skip = pinSkipReason(template);
+            const skip = pinSkipReason(template, this.dialogs);
             if (skip) {
                 pin.state = 'skipped';
                 pin.skipReason = skip;
@@ -563,7 +571,7 @@ class World {
     spawnCreature(kind, x, y, z, opts) {
         const template = getTemplate(kind, this.templates);
         if (!template) return null;
-        if (pinSkipReason(template)) return null;
+        if (pinSkipReason(template, this.dialogs)) return null;
         const id = this.nextCreatureId;
         this.nextCreatureId += 1;
         const creature = this.creaturePool
@@ -1665,7 +1673,8 @@ class World {
                 continue;
             }
 
-            const inCombat = !!(cr.targetId || playerTargets.has(cr.id));
+            const hasActiveConditions = !!(cr.conditions && cr.conditions.length > 0);
+            const inCombat = !!(cr.targetId || playerTargets.has(cr.id) || hasActiveConditions);
             const wantSleep = !inCombat && !awakeCandidates.has(cr.id);
 
             const wasSleeping = !!cr.simSleeping;
@@ -2627,7 +2636,7 @@ class World {
     }
 
     sendDialog(session, npc, nodeId) {
-        const dialog = normalizeDialog(npc.dialog);
+        const dialog = normalizeDialog(npc.dialog) || resolveDialog(npc, this.dialogs);
         if (!dialog) {
             this.say(session, 'Nothing to say.');
             return false;
@@ -2651,7 +2660,8 @@ class World {
     }
 
     sendShop(session, npc) {
-        const shop = resolveShop(npc);
+        const shop = resolveShop(npc)
+            || (this.dialogs && npc.dialogId && resolveShop(this.dialogs[npc.dialogId]));
         if (!shop) {
             this.say(session, 'I do not trade with you.');
             return false;
@@ -2706,7 +2716,7 @@ class World {
             session.reject(intent.seq, REASON.OUT_OF_RANGE);
             return;
         }
-        const dialog = normalizeDialog(npc.dialog);
+        const dialog = normalizeDialog(npc.dialog) || resolveDialog(npc, this.dialogs);
         const resolved = dialog ? resolveNode(dialog, session.talkNodeId) : null;
         if (!resolved) {
             session.reject(intent.seq, REASON.NO_TARGET);
@@ -2718,6 +2728,10 @@ class World {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
+        if (reply.give && !this.canGiveItem(session, reply.give.itemId, reply.give.count)) {
+            this.say(session, 'You cannot carry that.');
+            return;
+        }
         if (reply.take) {
             if (!takeItem(session.inventory, reply.take.itemId, reply.take.count)) {
                 this.say(session, 'You do not have that.');
@@ -2726,10 +2740,7 @@ class World {
             this.sendInventory(session);
         }
         if (reply.give) {
-            if (!this.tryGiveItem(session, reply.give.itemId, reply.give.count)) {
-                this.say(session, 'You cannot carry that.');
-                return;
-            }
+            this.tryGiveItem(session, reply.give.itemId, reply.give.count);
             session.send(S2C.ITEM_GAIN, encodeItemGain(reply.give.itemId, reply.give.count));
             this.sendInventory(session);
         }
@@ -2776,7 +2787,8 @@ class World {
             session.reject(intent.seq, REASON.OUT_OF_RANGE);
             return;
         }
-        const shop = resolveShop(npc);
+        const shop = resolveShop(npc)
+            || (this.dialogs && npc.dialogId && resolveShop(this.dialogs[npc.dialogId]));
         if (!shop) {
             this.say(session, 'I do not trade with you.');
             return;
@@ -2994,6 +3006,14 @@ class World {
         });
     }
 
+    broadcastCastFx(fx, includeSelf) {
+        if (!fx) return;
+        const buf = encodeCastFx(fx);
+        this.broadcastToViewers(fx.x, fx.y, fx.z, (p) => {
+            p.send(S2C.CAST, buf);
+        }, includeSelf);
+    }
+
     applyFieldHit(entity, result, tickIndex) {
         if (!entity || !result) return;
         if (result.damage > 0) {
@@ -3165,16 +3185,14 @@ class World {
             attacker.send(S2C.STATS, encodeStats(attacker));
         }
         const fxTarget = o.target || attacker;
-        this.broadcastToViewers(attacker.x, attacker.y, attacker.z, (p) => {
-            p.send(S2C.CAST, encodeCastFx({
-                sourceId: attacker.id,
-                spellId: spell.id,
-                targetId: fxTarget && fxTarget.id || 0,
-                x: (result.center && result.center.x) || attacker.x,
-                y: (result.center && result.center.y) || attacker.y,
-                z: (result.center && result.center.z) || attacker.z,
-                flags: 0
-            }));
+        this.broadcastCastFx({
+            sourceId: attacker.id,
+            spellId: spell.id,
+            targetId: fxTarget && fxTarget.id || 0,
+            x: (result.center && result.center.x) || attacker.x,
+            y: (result.center && result.center.y) || attacker.y,
+            z: (result.center && result.center.z) || attacker.z,
+            flags: 0
         }, attacker);
         for (let i = 0; i < result.fields.length; i++) this.broadcastField(result.fields[i]);
         for (let i = 0; i < result.purged.length; i++) {

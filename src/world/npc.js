@@ -304,6 +304,28 @@ function clampDealCount(raw) {
     return n > MAX_DEAL_COUNT ? MAX_DEAL_COUNT : n;
 }
 
+function resolveDialog(source, dialogDb) {
+    if (!source) return null;
+    if (typeof source === 'string') {
+        const id = source.trim();
+        const raw = dialogDb && dialogDb[id];
+        return raw ? normalizeDialog(raw) : null;
+    }
+    if (typeof source !== 'object' || Array.isArray(source)) return null;
+    if (source.dialog != null) {
+        return normalizeDialog(source.dialog);
+    }
+    const dialogId = source.dialogId != null ? String(source.dialogId).trim() : '';
+    if (dialogId) {
+        const raw = dialogDb && dialogDb[dialogId];
+        if (raw) return normalizeDialog(raw);
+    }
+    if (isDialogTree(source)) {
+        return normalizeDialog(source);
+    }
+    return null;
+}
+
 module.exports = {
     DEFAULT_TALK_RANGE,
     DEFAULT_CURRENCY,
@@ -316,7 +338,9 @@ module.exports = {
     applyStoragePatch,
     evalWhen,
     replyMatchesWhen,
+    isDialogTree,
     normalizeDialog,
+    resolveDialog,
     resolveNode,
     listReplies,
     normalizeShop,

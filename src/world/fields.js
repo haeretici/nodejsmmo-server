@@ -561,14 +561,31 @@ function listFieldsInRect(store, originX, originY, z, w, h) {
     if (!store || !store.byKey) return out;
     const x0 = originX | 0;
     const y0 = originY | 0;
-    const x1 = x0 + (w | 0);
-    const y1 = y0 + (h | 0);
+    const width = w | 0;
+    const height = h | 0;
+    const zInt = z | 0;
+    const tileCount = width * height;
+    if (tileCount > 0 && tileCount <= 512) {
+        for (let dy = 0; dy < height; dy++) {
+            const curY = y0 + dy;
+            for (let dx = 0; dx < width; dx++) {
+                const curX = x0 + dx;
+                const slot = store.byKey[tileKey(curX, curY, zInt)];
+                if (slot && slot.field) {
+                    out.push(slot.field);
+                }
+            }
+        }
+        return out;
+    }
+    const x1 = x0 + width;
+    const y1 = y0 + height;
     const keys = Object.keys(store.byKey);
     for (let i = 0; i < keys.length; i++) {
         const slot = store.byKey[keys[i]];
         const f = slot && slot.field;
         if (!f) continue;
-        if ((f.z | 0) !== (z | 0)) continue;
+        if ((f.z | 0) !== zInt) continue;
         if (f.x < x0 || f.y < y0 || f.x >= x1 || f.y >= y1) continue;
         out.push(f);
     }

@@ -106,7 +106,8 @@ class Creature {
         this.attacks = (template && template.attacks) || [];
         this.loot = (template && template.loot) || [];
         this.dialog = (template && template.dialog) || null;
-        this.shop = (template && template.shop) || null;
+        this.dialogId = (template && template.dialogId) || null;
+        this.shop = (template && template.shop) || (this.dialog && this.dialog.shop) || null;
         this.aggroRange = flags.aggroRange == null ? 7 : flags.aggroRange | 0;
         this.loseTargetDistance = flags.loseTargetDistance == null ? 12 : flags.loseTargetDistance | 0;
         this.targetId = 0;
@@ -166,6 +167,7 @@ class Creature {
         this.attacks = null;
         this.loot = null;
         this.dialog = null;
+        this.dialogId = null;
         this.shop = null;
         this.aggroRange = 7;
         this.loseTargetDistance = 12;

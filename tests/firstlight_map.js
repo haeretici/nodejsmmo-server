@@ -163,7 +163,8 @@ async function main() {
     assert.ok(world.creatures.size < 50);
     const living = Array.from(world.creatures.values()).map((c) => c.kind);
     assert.ok(living.includes('mountain_troll') || living.includes('deer'));
-    assert.ok(!living.includes('outfitter_calder'));
+    assert.ok(living.includes('outfitter_calder'));
+    assert.ok(living.includes('quartermaster_hale'));
     const sock = session.socket;
     const ew = decodeEnterWorld(lastOf(sock, S2C.ENTER_WORLD).payload);
     assert.strictEqual(ew.x, 80);

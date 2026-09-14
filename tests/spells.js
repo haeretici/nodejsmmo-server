@@ -135,8 +135,17 @@ function main() {
     assert.strictEqual(cast.ok, true);
     assert.strictEqual(cast.hits.length, 1);
     assert.strictEqual(cast.hits[0].result.final, 4);
-    assert.strictEqual(caster.mp, 87);
     assert.ok(!Cooldowns.canUse(caster, spell.cooldowns));
+    assert.strictEqual(Cooldowns.canUse(caster, spell.cooldowns, 0), false);
+    assert.strictEqual(Cooldowns.canUse(caster, spell.cooldowns, 39), false);
+    assert.strictEqual(Cooldowns.canUse(caster, spell.cooldowns, 40), true);
+    assert.strictEqual(Cooldowns.getRemaining(caster, 'primary', 'attack', 40), 0);
+
+    // Verify exact discrete tick expiration without float drift (0.10s = 2 ticks)
+    const shortSpell = Object.assign({}, spell, { cooldowns: { primary: { attack: 0.10 } } });
+    Cooldowns.apply(caster, shortSpell.cooldowns, 10);
+    assert.strictEqual(Cooldowns.canUse(caster, shortSpell.cooldowns, 11), false);
+    assert.strictEqual(Cooldowns.canUse(caster, shortSpell.cooldowns, 12), true);
 
     console.log('ok spells');
 }

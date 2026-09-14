@@ -15,11 +15,13 @@ const {
     decodeSwing,
     decodeReject,
     decodeSay,
-    decodeField
+    decodeField,
+    decodeFieldGone
 } = require('../src/protocol/messages');
 const { TILE_FLAG_NO_CAST } = require('../src/world/tilemap');
 const { addItemToInventory, countItem } = require('../src/world/inventory');
-const { getFieldOnTile } = require('../src/world/fields');
+const { getFieldOnTile, deployFieldToTile } = require('../src/world/fields');
+const { applyCondition, FIELD_BURNING } = require('../src/world/conditions');
 const { loadPack, resolveContentPath } = require('../src/content/load_pack');
 const { SERVER_ROOT } = require('../src/config/load_settings');
 const { createStaticMap } = require('../src/world/static_map');
@@ -52,7 +54,7 @@ function mysticPack() {
                 mpPerLevel: 10,
                 critChance: 5,
                 critDamage: 10,
-                spells: ['snap_jab', 'blaze_field_rune'],
+                spells: ['snap_jab', 'blaze_field_rune', 'quick_strike'],
                 skillRates: { melee: 1.4, fist: 1.1, magic: 1.25 }
             }]
         },
@@ -73,6 +75,22 @@ function mysticPack() {
                     level: 1,
                     damageAmplitude: 0.1726,
                     cooldowns: { primary: { attack: 2 } }
+                },
+                {
+                    id: 'quick_strike',
+                    kind: 'strike',
+                    element: 'physical',
+                    powerCurve: 'melee_strike',
+                    basePower: 8,
+                    range: 1,
+                    mana: 1,
+                    hitChance: 100,
+                    isMelee: true,
+                    requiresTarget: true,
+                    vocations: ['mystic'],
+                    level: 1,
+                    damageAmplitude: 0.1,
+                    cooldowns: { primary: { attack: 0.10 } }
                 },
                 {
                     id: 'blaze_field_rune',
@@ -273,6 +291,104 @@ function main() {
     }
     assert.strictEqual(seeded, cells);
     live.stop();
+
+    // 1. Discrete integer tick cooldown determinism: 0.10s = 2 ticks at 20 UPS
+    const w4 = makeWorld({
+        autoIntervalTicks: 40,
+        spawns: [{ kind: 'dummy', x: 12, y: 11, z: 0 }]
+    });
+    const quickCaster = makeSession(w4, ash(4));
+    const quickDummy = Array.from(w4.creatures.values())[0];
+    assert.ok(quickDummy);
+    // At tick 10: cast quick_strike -> succeeds
+    assert.ok(w4.enqueueIntent(quickCaster, {
+        opcode: C2S.CAST,
+        seq: 1,
+        payload: encodeCast({ spellId: 'quick_strike', targetId: quickDummy.id, x: quickDummy.x, y: quickDummy.y, z: quickDummy.z })
+    }));
+    w4.step(10);
+    const fx1 = decodeCastFx(lastOf(quickCaster.socket, S2C.CAST).payload);
+    assert.strictEqual(fx1.spellId, 'quick_strike');
+
+    // At tick 11 (+1 tick): cast quick_strike -> rejected (on cooldown)
+    assert.ok(w4.enqueueIntent(quickCaster, {
+        opcode: C2S.CAST,
+        seq: 2,
+        payload: encodeCast({ spellId: 'quick_strike', targetId: quickDummy.id, x: quickDummy.x, y: quickDummy.y, z: quickDummy.z })
+    }));
+    w4.step(11);
+    const tiredQuick = decodeSay(lastOf(quickCaster.socket, S2C.SAY).payload);
+    assert.strictEqual(tiredQuick, 'You are exhausted.');
+
+    // At tick 12 (+2 ticks = exact 0.10s): cast quick_strike -> SUCCEEDS without +1 tick float delay!
+    assert.ok(w4.enqueueIntent(quickCaster, {
+        opcode: C2S.CAST,
+        seq: 3,
+        payload: encodeCast({ spellId: 'quick_strike', targetId: quickDummy.id, x: quickDummy.x, y: quickDummy.y, z: quickDummy.z })
+    }));
+    w4.step(12);
+    const fx2 = decodeCastFx(lastOf(quickCaster.socket, S2C.CAST).payload);
+    assert.strictEqual(fx2.spellId, 'quick_strike');
+    quickCaster.kick(REASON.LOGOUT);
+    w4.stop();
+
+    // 2. Creature sleep & condition protection
+    const w5 = makeWorld({
+        autoIntervalTicks: 40
+    });
+    const distantPlayer = makeSession(w5, ash(5), { x: 1, y: 1, z: 0 });
+    const distantMob = w5.spawnCreature('dummy', 22, 22, 0);
+    assert.ok(distantMob);
+    // Initially without condition and far from player (dist = 21 > 12): creature falls asleep
+    w5.updateCreatureSleepStates(10);
+    assert.strictEqual(distantMob.simSleeping, true);
+    assert.strictEqual(w5.activeCreatures.has(distantMob), false);
+
+    // Apply DoT condition to distantMob: updateCreatureSleepStates keeps it awake and active
+    distantMob.hp = 100;
+    distantMob.hpMax = 100;
+    applyCondition(distantMob, { type: 'fire', schedule: [{ turns: 5, damage: 10, intervalSec: 1 }] }, { forceOverride: true });
+    assert.ok(distantMob.conditions && distantMob.conditions.length > 0);
+    w5.updateCreatureSleepStates(11);
+    assert.strictEqual(distantMob.simSleeping, false);
+    assert.strictEqual(w5.activeCreatures.has(distantMob), true);
+
+    // Step 21 ticks (1.05s > 1.0s interval): DoT ticks down and damages creature even while out of player AOI
+    for (let t = 12; t <= 33; t++) {
+        w5.step(t);
+    }
+    assert.ok(distantMob.hp < 100);
+    distantPlayer.kick(REASON.LOGOUT);
+    w5.stop();
+
+    // 3. Field expiration broadcast: S2C.FIELD_GONE
+    const w6 = makeWorld({
+        autoIntervalTicks: 40
+    });
+    const fieldViewer = makeSession(w6, ash(6), { x: 12, y: 12, z: 0 });
+    const shortField = deployFieldToTile(w6.fieldStore, 12, 13, 0, {
+        kind: 'fire',
+        durationSec: 1.0,
+        createdAt: w6.logicNow(10)
+    });
+    assert.ok(shortField);
+    w6.broadcastField(getFieldOnTile(w6.fieldStore, 12, 13, 0));
+    const fieldPlantedMsg = decodeField(lastOf(fieldViewer.socket, S2C.FIELD).payload);
+    assert.strictEqual(fieldPlantedMsg.kind, 'fire');
+    assert.strictEqual(fieldPlantedMsg.x, 12);
+    assert.strictEqual(fieldPlantedMsg.y, 13);
+
+    // Advance 30 ticks (1.5s > 1.0s duration): field expires and S2C.FIELD_GONE is broadcast
+    for (let t = 11; t <= 35; t++) {
+        w6.step(t);
+    }
+    assert.strictEqual(getFieldOnTile(w6.fieldStore, 12, 13, 0), null);
+    const goneMsg = decodeFieldGone(lastOf(fieldViewer.socket, S2C.FIELD_GONE).payload);
+    assert.strictEqual(goneMsg.x, 12);
+    assert.strictEqual(goneMsg.y, 13);
+    assert.strictEqual(goneMsg.z, 0);
+    fieldViewer.kick(REASON.LOGOUT);
+    w6.stop();
 
     console.log('ok spells_world');
 }

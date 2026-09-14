@@ -225,14 +225,15 @@ function testConditionsSkippedWhileSleeping() {
     ];
 
     world.step(1);
-    assert.strictEqual(rat.simSleeping, true);
+    // Under P12 Step 2, active conditions keep creature awake so DoTs tick to completion
+    assert.strictEqual(rat.simSleeping, false, 'active conditions keep creature awake');
+    assert.strictEqual(world.activeCreatures.has(rat), true, 'creature with active conditions is in active set');
 
-    const prevHp = rat.hp;
-    // Step several times while sleeping; condition should not tick
-    for (let t = 2; t <= 10; t++) {
-        world.step(t);
-    }
-    assert.strictEqual(rat.hp, prevHp, 'condition HP loss frozen while creature is sleeping');
+    // For an entity sleeping without conditions, it remains sleeping and not in activeCreatures
+    const sleepingMob = world.spawnCreature('rat', 10, 10, 0);
+    world.sleepCreature(sleepingMob);
+    assert.strictEqual(sleepingMob.simSleeping, true);
+    assert.strictEqual(world.activeCreatures.has(sleepingMob), false);
 
     world.stop();
 }

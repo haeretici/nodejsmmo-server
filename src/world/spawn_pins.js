@@ -47,9 +47,13 @@ function pinKind(row) {
     return '';
 }
 
-function pinSkipReason(template) {
+function pinSkipReason(template, dialogDb) {
     if (!template) return 'unknown';
-    if (template.isNpc && !template.dialog) return 'npc';
+    if (template.isNpc) {
+        if (template.dialog) return null;
+        if (template.dialogId && dialogDb && dialogDb[template.dialogId]) return null;
+        return 'npc';
+    }
     return null;
 }
 

@@ -54,7 +54,7 @@ function makeSession(world, ch, pos) {
     return session;
 }
 
-function testTimestampCooldowns() {
+function testDiscreteTickCooldowns() {
     const entity = { cooldowns: null };
     Cooldowns.ensureCooldowns(entity);
 
@@ -62,27 +62,35 @@ function testTimestampCooldowns() {
     assert.strictEqual(Cooldowns.getRemaining(entity, 'primary', 'attack', 0), 0);
     assert.strictEqual(Cooldowns.isReady(entity, 'primary', 'attack', 0), true);
 
-    // Apply cooldown at t = 1.0 for 2.0s duration -> readyAt = 3.0s
-    Cooldowns.apply(entity, { primary: { attack: 2 } }, 1.0);
-    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 1.0), false);
-    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 2.99), false);
-    assert.strictEqual(Cooldowns.isReady(entity, 'primary', 'attack', 2.5), false);
-    assert.strictEqual(Math.round(Cooldowns.getRemaining(entity, 'primary', 'attack', 2.0) * 10) / 10, 1.0);
+    // Apply cooldown at tickIndex = 20 (t = 1.0s at 20 UPS) for 2.0s duration (40 ticks) -> readyTick = 60
+    Cooldowns.apply(entity, { primary: { attack: 2 } }, 20);
+    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 20), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 59), false);
+    assert.strictEqual(Cooldowns.isReady(entity, 'primary', 'attack', 50), false);
+    assert.strictEqual(Math.round(Cooldowns.getRemaining(entity, 'primary', 'attack', 40) * 10) / 10, 1.0);
 
-    // At t = 3.0, it becomes ready
-    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 3.0), true);
-    assert.strictEqual(Cooldowns.isReady(entity, 'primary', 'attack', 3.0), true);
-    assert.strictEqual(Cooldowns.getRemaining(entity, 'primary', 'attack', 3.0), 0);
-    assert.strictEqual(Cooldowns.getRemaining(entity, 'primary', 'attack', 4.0), 0);
+    // At tickIndex = 60, it becomes ready
+    assert.strictEqual(Cooldowns.canUse(entity, { primary: { attack: 2 } }, 60), true);
+    assert.strictEqual(Cooldowns.isReady(entity, 'primary', 'attack', 60), true);
+    assert.strictEqual(Cooldowns.getRemaining(entity, 'primary', 'attack', 60), 0);
+    assert.strictEqual(Cooldowns.getRemaining(entity, 'primary', 'attack', 80), 0);
+
+    // Verify exact discrete tick expiration without float drift:
+    // Standard 0.10s cooldown = 2 ticks at 20 UPS.
+    // Applied at tick 1 -> readyTick = 1 + 2 = 3.
+    Cooldowns.apply(entity, { item: { use: 0.10 } }, 1);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 0.10 } }, 1), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 0.10 } }, 2), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 0.10 } }, 3), true); // Ready exactly on tick 3!
 
     // Test tryUse
-    assert.strictEqual(Cooldowns.tryUse(entity, { item: { use: 1.5 } }, 5.0), true);
-    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 5.5), false);
-    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 6.5), true);
+    assert.strictEqual(Cooldowns.tryUse(entity, { item: { use: 1.5 } }, 100), true);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 110), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 130), true);
 
-    // Cooldowns.tick is a no-op that doesn't throw or alter timestamps
+    // Cooldowns.tick is a no-op that doesn't throw or alter deadlines
     Cooldowns.tick(entity, 0.5);
-    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 5.5), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 110), false);
 }
 
 function testIntentQueueInPlaceTruncation() {
@@ -167,7 +175,7 @@ function testMonotonicPendingSpawns() {
 }
 
 function main() {
-    testTimestampCooldowns();
+    testDiscreteTickCooldowns();
     testIntentQueueInPlaceTruncation();
     testMonotonicCorpseQueue();
     testMonotonicPendingSpawns();
