@@ -50,32 +50,33 @@ Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins loa
 | `TALK_CLOSE` | 32 | |
 | `SHOP_BUY` / `SHOP_SELL` | 33 / 34 | range 3; currency `gold_coin`; count 1–100 |
 
-Auto-attack is **not** an intent: each tick, if target is Chebyshev ≤ 1 and `attackReadyTick` elapsed, the server swings.
+Auto-attack is **not** an intent: each tick, if target is in weapon range (Chebyshev ≤ 1 for melee, ≤ range with LOS for magic/distance) and `attackReadyTick` elapsed, the server swings. Distance empty ammo: SAY “You need ammunition.” and return **without** arming `attackReadyTick`.
 
-## Damage (melee & wand auto)
+## Damage (melee, wand & distance auto)
 
 Order: miss → **crit** → raw → **fatal** → mit% → resist% → shield block → armor → floor 0.
 
 | Attacker | Raw |
 | :--- | :--- |
-| Player (Melee) | `melee_auto`: non-crit gaussian μ=0.5 σ=0.25 on `[levelBonus, ceil(0.102×atk×skill + levelBonus)]`. Unarmed atk **7** / fist. Equipped: catalog `atk` + weapon skill. Crit = `auto_st` uniform `[max(min, floor(0.65×max)), max]`, then `×(1+critDamage/100)` |
-| Player (Magic) | `wand_auto`: fixed uniform `[min, max]` elemental damage; range from item (fallback 4), requires LOS; bypasses shield block and armor; mitigated by `mitigation%` and `resists[element]%`. Restores `manaGain` MP on hit. No weapon skill tries. |
-| Creature | kit `attacks[]` melee row uniform `[min, max]`. Crit = `multiply` (same roll × extra). Never fatal |
+| Player (Melee) | `melee_auto`: non-crit gaussian μ=0.5 σ=0.25 on `[levelBonus, ceil(0.102×atk×skill + levelBonus)]`. Unarmed atk **7** / fist. Equipped: catalog `atk` + weapon skill. Dual-element (`extraAtk` + `extraAtkElement`, e.g. ember cleaver): auto formula uses combined atk (`atk + extraAtk`), splits raw by `extraAtk/combinedAtk`; physical share through block+armor; extra share through that element resist only. Crit = `auto_st` uniform `[max(min, floor(0.65×max)), max]`, then `×(1+critDamage/100)` |
+| Player (Distance) | `distance_auto`: range from item (fallback **6**, no cap of 7), requires LOS; `effectiveAtk = weapon.atk + ammo.atk` (throwing without ammo: weapon only); hit% = `min(100, ammo.maxHitChance + weapon.hitChanceMod)` (throwing uses weapon `maxHitChance`); non-crit gaussian μ=0.5 σ=0.25 on `[levelBonus, ceil(0.102×effectiveAtk×skills.distance + levelBonus)]`. Crit = `auto_st` uniform `[max(min, floor(0.65×max)), max]`, then `×(1+critDamage/100)`. `isMelee: false` — shield cannot block arrows. Consumes 1 ammo per shot when `features.ammoConsumption`. Skill tries: +2 blood hit / +1 mitigated hit. |
+| Player (Magic) | `wand_auto`: fixed uniform `[min, max]` elemental damage; range from item (fallback 4, no cap of 7), requires LOS; bypasses shield block and armor; mitigated by `mitigation%` and `resists[element]%`. Restores `manaGain` MP on hit. No weapon skill tries. |
+| Creature | kit `attacks[]` rows (melee or ranged) uniform `[min, max]`. Range > 1 requires LOS; elemental bypasses armor and shield block; physical ranged bypasses shield block and applies armor reduction. Crit = `multiply` (same roll × extra). Never fatal |
 
 | Proc | Rule |
 | :--- | :--- |
 | Crit | `critChance` 0–100. Player: class row from pack `classes.json` (unarmed 5/10). Creature: kit `critChance`/`critDamage` (omit = 0) |
 | Fatal | player weapon `tier`>0 only. Chance `0.05t²+0.4t+0.05`%. `raw + round(raw×0.6)` after crit. Unarmed / omit / creature → never |
 
-Armor: `[ceil(a/2), ceil(a/2)×2−1]`. Players: unarmed = armor 0, mit 0, no block, `weaponTier` 0, atk **7**, skill **fist**. Equipped weapon: catalog `atk` + weapon skill (`sword`/`axe`/`club`/`fist`/`distance`/`magic`). Shield/armor from slots. Cap = 600@L1 + vocation curve; weight from catalog (centi-oz / 100). Nested bags in `character_state.inventory` tree. Corpse/world-pin remain flat containers. `features.ammoConsumption` spends quiver/bag ammo on bow/xbow auto. Live rat (`content/creatures/rat.json`): hp 20, armor 1, mit 0.07, melee 0–21 / 2 s. Test fallback `rat`: hp 30, mit 0.1, 0–26.
+Armor: `[ceil(a/2), ceil(a/2)×2−1]`. Shield block: physical + melee only if `canBlock` and `maxBlock > 0` (distance / wand / creature ranged pass `isMelee: false`); at most **2 blocks per 2-second logic window** (40 ticks at 20 UPS); subsequent hits in window bypass shield block directly to armor. Players: unarmed = armor 0, `weaponDefense` **5**, mit from shielding+5, `maxBlock` from fist+5, `weaponTier` 0, atk **7**, skill **fist**. Equipped weapon: catalog `atk` + weapon skill (`sword`/`axe`/`club`/`fist`/`distance`/`magic`). Shield/armor from slots. Cap = 600@L1 + vocation curve; weight from catalog (centi-oz / 100). Nested bags in `character_state.inventory` tree. Corpse/world-pin remain flat containers. `features.ammoConsumption` spends quiver/bag ammo on bow/xbow auto. Live rat (`content/creatures/rat.json`): hp 20, armor 1, mit 0.07, melee 0–21 / 2 s. Test fallback `rat`: hp 30, mit 0.1, 0–26.
 
-`hitChance` 100 except kit `chance`. No spells or mana-shield. PvP off.
+`hitChance` 100 except kit `chance` and distance weapons (ammo `maxHitChance` + weapon modifier). No spells or mana-shield. PvP off.
 
 ## Creatures
 
 Occupy **empty** tiles only except `canPushCreatures` shove/crush. No creature–creature stack, no walk onto players.
 
-AI: aggro nearest player in `aggroRange` (7). A* `followPath` (chase cap **12**, return-home **100**). Optional repath **2 s**; empty/blocked is critical. Melee at Chebyshev ≤ 1. Lose at 12. No target → walk home to spawn. `dummy` kit: `aggro: false` (tests).
+AI: aggro nearest player in `aggroRange` (7) on think interval (integer ticks via `logicNow`, not `Date.now`). Kit rows: arm that row’s CD when the window opens, then range/LOS; OOR or no LOS still burns the interval and does **not** skip to a later in-range row (chance fail still continues). Melee rows are skipped without CD while `runHealth` flee is active. Stand-off `flags.targetDistance`: `dist > want` closes; `dist === want` holds; `dist < want` kites; cornered creatures stand ground. When `hp ≤ flags.runHealth` (or `hp/hpMax ≤ runHealthPercent`), `want` becomes `fleeTargetDistance` (default **10**) and lose-target is `max(loseTargetDistance, fleeTargetDistance)`. A* `followPath` (chase cap **12**, return-home **100**). Optional repath **2 s**; empty/blocked is critical. Melee at Chebyshev ≤ 1. Lose at 12. Idle wander: awake (`activeCreatures` only), no target, player in aggro/AOI (or `flags.idleWander`) → random cardinal step on `moveReadyTick`. Speed 0 does not wander. Leash: on target loss while off spawn, stay awake, path home; arriving spawn restores `hp` to `hpMax`. Sleeping / virtualized bodies do not wander. `dummy` kit: `aggro: false` (tests).
 
 Death: `DISAPPEAR` + corpse on the death tile (not occupancy). Loot chance scale **1e5**. Empty roll still spawns a corpse. Killer: solo share → personal rates (defaults 1) → `experience`. If `expProgression`, `levelFromExp` (one call). Level-up: class `hpPerLevel`/`mpPerLevel` added to pools; `EXP` includes `level u16`. Skill tries: blood bucket **30**; melee/fist **+1**; distance **+2** full / **+1** mitigated; wand/rod no weapon try. Shield: full-zero + `blockChargeSpent` + equipped shield. Persist `character_skills` levels + `*_tries`. Respawn from pin `respawn` seconds × `logicUps` (missing pin delay = `creatureRespawnTicks`). `respawn` **0** = one-shot. On_demand: idle creatures outside AOI for `spawnDespawnIdleTicks` (**40**) despawn without that delay.
 
@@ -111,4 +112,4 @@ Logout always. Interval (1 hour) and wall-clock save all online. Loot/shop/quest
 
 ## Remaining
 
-Spells, conditions, **trap fields**, wander. ML from mana spend waits P12. Talkable NPCs without inline dialog stay skipped (P15). Lever `wave` is a no-op (Hunt Simulator leftover). Do not load HuntDL `presets/`.
+Conditions, **trap fields**. Threat/`changeTarget`/`strategiesTarget`, defense kit, area/wave kit, summons. ML from mana spend waits P12. Talkable NPCs without inline dialog stay skipped (P15). Lever `wave` is a no-op (Hunt Simulator leftover). Do not load HuntDL `presets/`.

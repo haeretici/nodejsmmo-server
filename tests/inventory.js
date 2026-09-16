@@ -6,6 +6,7 @@ const {
     ensureEquippedBackpack,
     createItemInstance,
     placeInContainer,
+    placeInEquipment,
     addItemToInventory,
     countItem,
     takeItem,
@@ -18,9 +19,15 @@ const {
     canCarryAdditional,
     baseCapacity,
     remainingCapacity,
-    bagView
+    bagView,
+    applyPlayerLoadout
 } = require('../src/world/inventory');
-const { FALLBACK_ITEMS } = require('../src/world/items');
+const {
+    FALLBACK_ITEMS,
+    UNARMED_WEAPON_DEFENSE,
+    computeMitigationPercent,
+    computeMaxBlock
+} = require('../src/world/items');
 
 const itemDb = Object.assign(Object.create(null), FALLBACK_ITEMS, {
     bag: {
@@ -37,6 +44,14 @@ const itemDb = Object.assign(Object.create(null), FALLBACK_ITEMS, {
         atk: 42,
         defense: 20,
         weight: 5400
+    },
+    wooden_shield: {
+        id: 'wooden_shield',
+        slot: 'leftHand',
+        category: 'shield',
+        defense: 14,
+        defenseBonus: 1,
+        weight: 4000
     }
 });
 
@@ -104,6 +119,50 @@ function main() {
     assert.strictEqual(countItem(migrated, 'gold_coin'), 0);
 
     assert.strictEqual(countItem([{ id: 'cheese', count: 1 }], 'cheese'), 1);
+
+    const fistSkills = {
+        fist: 10,
+        club: 10,
+        sword: 10,
+        axe: 10,
+        distance: 10,
+        shielding: 10,
+        magic: 0
+    };
+    const naked = {
+        inventory: createEmptyInventory(),
+        skills: fistSkills,
+        critChance: 5,
+        critDamage: 10
+    };
+    applyPlayerLoadout(naked, itemDb);
+    assert.strictEqual(naked.weaponSkill, 'fist');
+    assert.strictEqual(naked.atk, 7);
+    assert.strictEqual(
+        naked.mitigation,
+        computeMitigationPercent(10, UNARMED_WEAPON_DEFENSE),
+        'unarmed mit uses shielding + weaponDefense 5'
+    );
+    assert.strictEqual(
+        naked.maxBlock,
+        computeMaxBlock(10, UNARMED_WEAPON_DEFENSE),
+        'unarmed maxBlock uses fist + weaponDefense 5'
+    );
+    assert.strictEqual(naked.canBlock, naked.maxBlock > 0);
+
+    const shieldedFist = {
+        inventory: createEmptyInventory(),
+        skills: fistSkills,
+        critChance: 5,
+        critDamage: 10
+    };
+    const shUid = createItemInstance(shieldedFist.inventory, 'wooden_shield', itemDb);
+    assert.ok(placeInEquipment(shieldedFist.inventory, shUid, 'leftHand', itemDb).ok);
+    applyPlayerLoadout(shieldedFist, itemDb);
+    const shieldDef = 14 + 1;
+    assert.strictEqual(shieldedFist.mitigation, computeMitigationPercent(10, shieldDef));
+    assert.strictEqual(shieldedFist.maxBlock, computeMaxBlock(10, shieldDef));
+    assert.strictEqual(shieldedFist.canBlock, true);
 
     console.log('ok inventory');
 }

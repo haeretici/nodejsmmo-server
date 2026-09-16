@@ -156,8 +156,15 @@ function main() {
     assert.strictEqual(Array.from(world.creatures.values())[0].kind, 'rat');
 
     world.leave(session);
-    world.step(22);
-    assert.strictEqual(world.creatures.size, 0);
+    let gone = false;
+    for (let t = 22; t <= 50; t++) {
+        world.step(t);
+        if (world.creatures.size === 0) {
+            gone = true;
+            break;
+        }
+    }
+    assert.ok(gone, 'on_demand pin despawns after logout (leash home first if off spawn)');
     world.stop();
 
     const eager = testSettings();

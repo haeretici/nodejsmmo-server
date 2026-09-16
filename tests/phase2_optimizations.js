@@ -161,11 +161,18 @@ function testSleepWhenPlayerMovesAway() {
     session.x = 20;
     session.y = 20;
 
-    // Step 2: rat drops target because distance > loseTargetDistance
-    world.step(2);
-    // Step 3: rat enters sleep state
-    world.step(3);
-    assert.strictEqual(rat.simSleeping, true, 'creature goes to sleep when player moves away');
+    // Lose target, leash home if pulled off spawn, then sleep
+    let slept = false;
+    for (let t = 2; t <= 40; t++) {
+        world.step(t);
+        if (rat.simSleeping) {
+            slept = true;
+            break;
+        }
+    }
+    assert.ok(slept, 'creature goes to sleep when player moves away');
+    assert.strictEqual(rat.x, rat.spawnX);
+    assert.strictEqual(rat.y, rat.spawnY);
 
     session.kick(REASON.LOGOUT);
     world.stop();

@@ -64,7 +64,8 @@ function createEmptyInventory(opts) {
         items: Object.create(null),
         containers: Object.create(null),
         rootUid: ROOT_UID,
-        equipment: Object.create(null)
+        equipment: Object.create(null),
+        totalWeight: 0
     };
     inv.containers[ROOT_UID] = {
         capacity,
@@ -112,7 +113,17 @@ function stackRoom(inst) {
 
 function instanceWeight(inst, item) {
     if (!inst) return 0;
-    const unit = item && item.weight != null ? Number(item.weight) || 0 : 0;
+    let unit = 0;
+    if (item && item.weight != null) {
+        unit = Number(item.weight) || 0;
+    } else if (inst.unitWeight != null) {
+        unit = Number(inst.unitWeight) || 0;
+    } else if (inst.weight != null) {
+        unit = Number(inst.weight) || 0;
+    } else {
+        const fallback = findItem(null, inst.itemId);
+        unit = fallback && fallback.weight != null ? Number(fallback.weight) || 0 : 0;
+    }
     return unit * getStackCount(inst);
 }
 
@@ -130,7 +141,10 @@ function createItemInstance(inv, itemId, itemDb, opts) {
     const item = findItem(itemDb, id);
     if (count > 1 && item && !itemIsStackable(item)) count = 1;
     if ((itemIsStackable(item) || !item) && count > MAX_STACK_SIZE) count = MAX_STACK_SIZE;
-    const inst = { uid, itemId: id, location: null };
+    const unitWeight = item && item.weight != null
+        ? Number(item.weight) || 0
+        : (findItem(null, id) && findItem(null, id).weight != null ? Number(findItem(null, id).weight) || 0 : 0);
+    const inst = { uid, itemId: id, location: null, unitWeight };
     if (count > 1) inst.count = count;
     inv.items[uid] = inst;
     if (itemIsContainer(item) || (item && itemIsBackpackEquip(item))) {
@@ -140,6 +154,9 @@ function createItemInstance(inv, itemId, itemDb, opts) {
             slots: emptySlots(cap),
             isRoot: false
         };
+    }
+    if (typeof inv.totalWeight === 'number') {
+        inv.totalWeight += unitWeight * count;
     }
     return uid;
 }
@@ -188,17 +205,22 @@ function detachItem(inv, uid) {
     return true;
 }
 
-function destroyItem(inv, uid) {
+function destroyItem(inv, uid, itemDb) {
     const inst = inv.items[uid];
     if (!inst) return false;
     const cont = inv.containers[uid];
     if (cont) {
         for (let i = 0; i < cont.slots.length; i++) {
-            if (cont.slots[i]) destroyItem(inv, cont.slots[i]);
+            if (cont.slots[i]) destroyItem(inv, cont.slots[i], itemDb);
         }
         delete inv.containers[uid];
     }
     detachItem(inv, uid);
+    if (typeof inv.totalWeight === 'number') {
+        const item = itemDb ? findItem(itemDb, inst.itemId) : null;
+        const w = instanceWeight(inst, item);
+        inv.totalWeight = Math.max(0, inv.totalWeight - w);
+    }
     delete inv.items[uid];
     return true;
 }
@@ -227,7 +249,7 @@ function canMergeStacks(inv, uidA, uidB, itemDb) {
     return stackRoom(b) > 0;
 }
 
-function mergeStacks(inv, sourceUid, destUid) {
+function mergeStacks(inv, sourceUid, destUid, itemDb) {
     if (!inv || !sourceUid || !destUid || sourceUid === destUid) return false;
     const src = inv.items[sourceUid];
     const dst = inv.items[destUid];
@@ -238,8 +260,8 @@ function mergeStacks(inv, sourceUid, destUid) {
     if (take <= 0) return false;
     setStackCount(dst, getStackCount(dst) + take);
     const left = getStackCount(src) - take;
-    if (left <= 0) destroyItem(inv, sourceUid);
-    else setStackCount(src, left);
+    setStackCount(src, left);
+    if (left <= 0) destroyItem(inv, sourceUid, itemDb);
     return true;
 }
 
@@ -281,7 +303,7 @@ function placeInContainer(inv, uid, containerUid, index, itemDb) {
             while (inv.items[uid] && getStackCount(inv.items[uid]) > 0) {
                 const existing = findStackInContainer(inv, containerUid, inst.itemId, uid);
                 if (!existing || !canMergeStacks(inv, uid, existing, itemDb)) break;
-                mergeStacks(inv, uid, existing);
+                mergeStacks(inv, uid, existing, itemDb);
                 if (!inv.items[uid]) {
                     const dest = inv.items[existing];
                     const destIndex = dest && dest.location && dest.location.kind === 'container'
@@ -299,7 +321,7 @@ function placeInContainer(inv, uid, containerUid, index, itemDb) {
     if (cont.slots[idx] != null) {
         const occ = cont.slots[idx];
         if (occ && canMergeStacks(inv, uid, occ, itemDb)) {
-            mergeStacks(inv, uid, occ);
+            mergeStacks(inv, uid, occ, itemDb);
             if (!inv.items[uid]) return { ok: true, merged: true, uid: occ, index: idx };
             idx = firstFreeSlot(cont);
             if (idx < 0) return { ok: false, error: 'full' };
@@ -374,7 +396,7 @@ function ensureEquippedBackpack(inv, itemDb, itemId) {
     }
     const r = placeInEquipment(inv, uid, 'backpack', itemDb);
     if (!r.ok) {
-        destroyItem(inv, uid);
+        destroyItem(inv, uid, itemDb);
         syncRootToEquippedBackpack(inv);
         return null;
     }
@@ -464,7 +486,7 @@ function moveItem(inv, from, to, itemDb) {
     if (locationsEqual(from, to)) return { ok: true };
     const uidTo = resolveLocationUid(inv, to);
     if (uidTo && canMergeStacks(inv, uidFrom, uidTo, itemDb)) {
-        mergeStacks(inv, uidFrom, uidTo);
+        mergeStacks(inv, uidFrom, uidTo, itemDb);
         return { ok: true, merged: true };
     }
     if (to.kind === 'container' && uidTo && inv.containers[uidTo]) {
@@ -599,7 +621,7 @@ function itemSubtreeWeight(inv, uid, itemDb) {
     return w;
 }
 
-function totalCarriedWeight(inv, itemDb) {
+function computeTotalCarriedWeight(inv, itemDb) {
     if (!isRuntimeInventory(inv)) return 0;
     let w = 0;
     const seen = new Set();
@@ -628,6 +650,21 @@ function totalCarriedWeight(inv, itemDb) {
         }
     }
     return w;
+}
+
+function recomputeTotalWeight(inv, itemDb) {
+    if (!isRuntimeInventory(inv)) return 0;
+    const w = computeTotalCarriedWeight(inv, itemDb);
+    inv.totalWeight = w;
+    return w;
+}
+
+function totalCarriedWeight(inv, itemDb) {
+    if (!isRuntimeInventory(inv)) return 0;
+    if (typeof inv.totalWeight === 'number' && Number.isFinite(inv.totalWeight)) {
+        return Math.max(0, inv.totalWeight);
+    }
+    return recomputeTotalWeight(inv, itemDb);
 }
 
 function resolveCapBand(classId) {
@@ -707,7 +744,7 @@ function countItem(inv, id) {
     return 0;
 }
 
-function consumeItemIdFromInventory(inv, itemId, amount, startUid) {
+function consumeItemIdFromInventory(inv, itemId, amount, startUid, itemDb) {
     let need = Math.max(0, Math.floor(Number(amount) || 0));
     let spent = 0;
     let changed = false;
@@ -735,11 +772,18 @@ function consumeItemIdFromInventory(inv, itemId, amount, startUid) {
             const have = getStackCount(inst);
             const take = Math.min(have, need);
             if (take <= 0) continue;
+            const item = itemDb ? findItem(itemDb, inst.itemId) : null;
+            const unit = item && item.weight != null
+                ? Number(item.weight) || 0
+                : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : (findItem(null, inst.itemId) ? Number(findItem(null, inst.itemId).weight) || 0 : 0));
             setStackCount(inst, have - take);
             need -= take;
             spent += take;
             changed = true;
-            if (getStackCount(inst) <= 0) destroyItem(inv, uid);
+            if (typeof inv.totalWeight === 'number') {
+                inv.totalWeight = Math.max(0, inv.totalWeight - unit * take);
+            }
+            if (getStackCount(inst) <= 0) destroyItem(inv, uid, itemDb);
         }
     }
     return { ok: need <= 0, spent, changed, itemId: want };
@@ -759,11 +803,11 @@ function takeItemFlat(bag, id, count) {
     return false;
 }
 
-function takeItem(inv, id, count) {
+function takeItem(inv, id, count, itemDb) {
     if (Array.isArray(inv)) return takeItemFlat(inv, id, count);
     if (!isRuntimeInventory(inv)) return false;
     const n = Math.max(1, Math.floor(Number(count) || 1));
-    const r = consumeItemIdFromInventory(inv, id, n);
+    const r = consumeItemIdFromInventory(inv, id, n, null, itemDb);
     return r.ok;
 }
 
@@ -792,12 +836,12 @@ function addItemToInventory(inv, itemId, count, itemDb) {
         const uid = createItemInstance(inv, id, itemDb, { count: chunk });
         const free = findFirstFreeSlotBfs(inv, inv.rootUid);
         if (!free) {
-            destroyItem(inv, uid);
+            destroyItem(inv, uid, itemDb);
             return { ok: false, error: 'full', remaining: left };
         }
         const placed = placeInContainer(inv, uid, free.containerUid, null, itemDb);
         if (!placed.ok) {
-            destroyItem(inv, uid);
+            destroyItem(inv, uid, itemDb);
             return { ok: false, error: placed.error || 'full', remaining: left };
         }
         left -= chunk;
@@ -850,12 +894,39 @@ function consumeAmmoFromContainer(inv, containerUid, amount, itemDb, kind) {
         const have = getStackCount(inst);
         const take = Math.min(have, need);
         if (take <= 0) continue;
+        const unit = item && item.weight != null
+            ? Number(item.weight) || 0
+            : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : (findItem(null, inst.itemId) ? Number(findItem(null, inst.itemId).weight) || 0 : 0));
         setStackCount(inst, have - take);
         need -= take;
         spent += take;
-        if (getStackCount(inst) <= 0) destroyItem(inv, uid);
+        if (typeof inv.totalWeight === 'number') {
+            inv.totalWeight = Math.max(0, inv.totalWeight - unit * take);
+        }
+        if (getStackCount(inst) <= 0) destroyItem(inv, uid, itemDb);
     }
     return { ok: need <= 0, spent, changed: spent > 0, ammoItemId };
+}
+
+function consumeInstanceCount(inv, uid, amount, itemDb) {
+    if (!inv || !uid) return false;
+    const inst = inv.items && inv.items[uid];
+    if (!inst) return false;
+    const n = Math.max(1, Math.floor(Number(amount) || 1));
+    const have = getStackCount(inst);
+    const take = Math.min(have, n);
+    if (take <= 0) return false;
+    const item = itemDb ? findItem(itemDb, inst.itemId) : null;
+    const unit = item && item.weight != null
+        ? Number(item.weight) || 0
+        : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : (findItem(null, inst.itemId) ? Number(findItem(null, inst.itemId).weight) || 0 : 0));
+    const left = have - take;
+    setStackCount(inst, left);
+    if (typeof inv.totalWeight === 'number') {
+        inv.totalWeight = Math.max(0, inv.totalWeight - unit * take);
+    }
+    if (left <= 0) destroyItem(inv, uid, itemDb);
+    return true;
 }
 
 function equippedWeaponAmmoKind(inv, itemDb) {
@@ -870,9 +941,30 @@ function consumeAmmoForShot(inv, itemDb, amount) {
     if (!kind) return { ok: true, spent: 0, changed: false, ammoItemId: null, needed: false };
     const n = Math.max(1, Math.floor(Number(amount) || 1));
     const qUid = inv.equipment && inv.equipment.leftHand;
-    if (qUid && inv.containers[qUid]) {
-        const q = consumeAmmoFromContainer(inv, qUid, n, itemDb, kind);
-        if (q.ok) return Object.assign({ needed: true }, q);
+    if (qUid) {
+        if (inv.containers && inv.containers[qUid]) {
+            const q = consumeAmmoFromContainer(inv, qUid, n, itemDb, kind);
+            if (q.ok) return Object.assign({ needed: true }, q);
+        } else if (inv.items && inv.items[qUid]) {
+            const item = findItem(itemDb, inv.items[qUid].itemId);
+            if (ammoMatchesKind(item, kind)) {
+                const inst = inv.items[qUid];
+                const have = getStackCount(inst);
+                const take = Math.min(have, n);
+                if (take > 0) {
+                    const unit = item && item.weight != null
+                        ? Number(item.weight) || 0
+                        : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : (findItem(null, inst.itemId) ? Number(findItem(null, inst.itemId).weight) || 0 : 0));
+                    const left = have - take;
+                    setStackCount(inst, left);
+                    if (typeof inv.totalWeight === 'number') {
+                        inv.totalWeight = Math.max(0, inv.totalWeight - unit * take);
+                    }
+                    if (left <= 0) destroyItem(inv, qUid, itemDb);
+                    return { ok: true, spent: take, changed: true, ammoItemId: inst.itemId, needed: true };
+                }
+            }
+        }
     }
     const start = inv.rootUid;
     const queue = [start];
@@ -897,9 +989,14 @@ function peekAmmoForShot(inv, itemDb) {
     const kind = equippedWeaponAmmoKind(inv, itemDb);
     if (!kind) return null;
     const qUid = inv.equipment && inv.equipment.leftHand;
-    if (qUid && inv.containers[qUid]) {
-        const uid = findFirstAmmoUid(inv, qUid, itemDb, kind);
-        if (uid) return findItem(itemDb, inv.items[uid].itemId);
+    if (qUid) {
+        if (inv.containers && inv.containers[qUid]) {
+            const uid = findFirstAmmoUid(inv, qUid, itemDb, kind);
+            if (uid) return findItem(itemDb, inv.items[uid].itemId);
+        } else if (inv.items && inv.items[qUid]) {
+            const item = findItem(itemDb, inv.items[qUid].itemId);
+            if (ammoMatchesKind(item, kind)) return item;
+        }
     }
     const start = inv.rootUid;
     const queue = [start];
@@ -941,13 +1038,24 @@ function applyPlayerLoadout(session, itemDb) {
     const left = equippedLeftHandItem(inv, itemDb);
     const unarmed = !right;
     let atk = unarmed ? UNARMED_ATK : Number(right.atk) || 0;
+    let ammo = null;
     if (right && weaponRequiredAmmoKind(right)) {
-        const ammo = peekAmmoForShot(inv, itemDb);
+        ammo = peekAmmoForShot(inv, itemDb);
         if (ammo && ammo.atk != null) atk += Number(ammo.atk) || 0;
     }
     session.atk = atk;
-    session.weaponSkill = unarmed ? 'fist' : (resolveWeaponSkillFromItem(right) || 'fist');
+    const weaponSkill = unarmed ? 'fist' : (resolveWeaponSkillFromItem(right) || 'fist');
+    session.weaponSkill = weaponSkill;
     session.weaponTier = unarmed ? 0 : Math.max(0, Math.floor(Number(right && right.tier) || 0));
+
+    const extraAtk = (!unarmed && right && right.extraAtk != null)
+        ? Math.max(0, Number(right.extraAtk) || 0)
+        : 0;
+    const extraAtkElement = (!unarmed && right && extraAtk > 0 && right.extraAtkElement)
+        ? String(right.extraAtkElement).toLowerCase()
+        : null;
+    session.extraAtk = extraAtk;
+    session.extraAtkElement = extraAtkElement;
 
     const isMagic = !!(
         right && (
@@ -957,13 +1065,35 @@ function applyPlayerLoadout(session, itemDb) {
             right.category === 'rod'
         )
     );
+
+    const isDistance = !!(
+        right && (
+            weaponSkill === 'distance' ||
+            right.weaponType === 'distance' ||
+            itemIsBowOrCrossbowWeapon(right) ||
+            right.category === 'bow' ||
+            right.category === 'crossbow' ||
+            right.category === 'spear' ||
+            right.category === 'throwing'
+        )
+    );
+
     if (isMagic) {
         session.weaponType = 'magic';
         session.weaponMin = Number(right.min) || 0;
         session.weaponMax = Number(right.max) || 0;
         session.weaponElement = String(right.element || 'energy').toLowerCase();
-        session.weaponRange = Math.max(1, Math.min(7, Number(right.range) || 4));
+        session.weaponRange = Math.max(1, Number(right.range) || 4);
         session.weaponManaGain = Math.max(0, Math.floor(Number(right.manaGain) || 0));
+        session.extraAtk = 0;
+        session.extraAtkElement = null;
+    } else if (isDistance) {
+        session.weaponType = 'distance';
+        session.weaponMin = 0;
+        session.weaponMax = 0;
+        session.weaponElement = null;
+        session.weaponRange = Math.max(1, Number(right && right.range) || 6);
+        session.weaponManaGain = 0;
     } else {
         session.weaponType = unarmed ? 'fist' : (right.weaponType || 'melee');
         session.weaponMin = 0;
@@ -972,6 +1102,28 @@ function applyPlayerLoadout(session, itemDb) {
         session.weaponRange = 1;
         session.weaponManaGain = 0;
     }
+
+    let hitChance = 100;
+    if (isDistance && right) {
+        if (weaponRequiredAmmoKind(right)) {
+            if (ammo) {
+                const ammoHit = ammo.maxHitChance != null
+                    ? Number(ammo.maxHitChance)
+                    : (ammo.hitChance != null ? Number(ammo.hitChance) : 100);
+                const weaponMod = Number(right.hitChanceMod) || Number(right.hitChance) || 0;
+                hitChance = Math.min(100, Math.max(0, ammoHit + weaponMod));
+            }
+        } else {
+            const weaponMax = right.maxHitChance != null
+                ? Number(right.maxHitChance)
+                : (right.hitChance != null && Number(right.hitChance) > 20 ? Number(right.hitChance) : 100);
+            const weaponMod = (right.maxHitChance != null && right.hitChance != null)
+                ? Number(right.hitChance)
+                : (Number(right.hitChanceMod) || 0);
+            hitChance = Math.min(100, Math.max(0, weaponMax + weaponMod));
+        }
+    }
+    session.hitChance = hitChance;
 
     session._gearSkillBonus = Object.create(null);
     let armor = 0;
@@ -1007,12 +1159,6 @@ function applyPlayerLoadout(session, itemDb) {
     const skills = session.skills;
     const shielding = skillValue(skills, 'shielding');
     const shield = itemIsShield(left);
-    if (unarmed && !shield) {
-        session.mitigation = 0;
-        session.maxBlock = 0;
-        session.canBlock = false;
-        return;
-    }
     if (shield) {
         const def = (Number(left.defense) || 0) + (Number(left.defenseBonus) || 0);
         session.mitigation = computeMitigationPercent(shielding, def);
@@ -1035,14 +1181,18 @@ function applyPlayerLoadout(session, itemDb) {
 
 function serializeInventory(inv) {
     if (!isRuntimeInventory(inv)) return { items: [] };
-    return JSON.parse(JSON.stringify({
+    const payload = {
         version: 1,
         nextUid: inv.nextUid | 0,
         items: inv.items,
         containers: inv.containers,
         rootUid: inv.rootUid,
         equipment: inv.equipment
-    }));
+    };
+    if (typeof inv.totalWeight === 'number' && Number.isFinite(inv.totalWeight)) {
+        payload.totalWeight = Math.max(0, Math.floor(inv.totalWeight));
+    }
+    return JSON.parse(JSON.stringify(payload));
 }
 
 function cloneInventory(inv) {
@@ -1053,7 +1203,10 @@ function cloneInventory(inv) {
         items: Object.create(null),
         containers: Object.create(null),
         rootUid: raw.rootUid || ROOT_UID,
-        equipment: Object.create(null)
+        equipment: Object.create(null),
+        totalWeight: typeof (inv && inv.totalWeight) === 'number'
+            ? inv.totalWeight
+            : (typeof raw.totalWeight === 'number' ? raw.totalWeight : 0)
     };
     const items = raw.items || {};
     const ik = Object.keys(items);
@@ -1064,9 +1217,11 @@ function cloneInventory(inv) {
             uid: String(row.uid),
             itemId: String(row.itemId || ''),
             location: row.location ? Object.assign({}, row.location) : null,
-            count: row.count
+            count: row.count,
+            unitWeight: row.unitWeight != null ? Number(row.unitWeight) || 0 : undefined
         };
         if (row.count == null) delete out.items[row.uid].count;
+        if (out.items[row.uid].unitWeight === undefined) delete out.items[row.uid].unitWeight;
     }
     const containers = raw.containers || {};
     const ck = Object.keys(containers);
@@ -1145,6 +1300,15 @@ function normalizeInventory(raw, itemDb) {
     if (isRuntimeInventory(raw)) {
         const inv = repairInventory(cloneInventory(raw));
         ensureEquippedBackpack(inv, itemDb);
+        const uids = Object.keys(inv.items);
+        for (let i = 0; i < uids.length; i++) {
+            const inst = inv.items[uids[i]];
+            if (inst) {
+                const item = findItem(itemDb, inst.itemId);
+                inst.unitWeight = item && item.weight != null ? Number(item.weight) || 0 : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : 0);
+            }
+        }
+        recomputeTotalWeight(inv, itemDb);
         return inv;
     }
     const inv = createEmptyInventory();
@@ -1153,7 +1317,25 @@ function normalizeInventory(raw, itemDb) {
     else if (raw && typeof raw === 'object' && Array.isArray(raw.items)) {
         migrateFlatItems(inv, raw.items, itemDb);
     }
+    const uids = Object.keys(inv.items);
+    for (let i = 0; i < uids.length; i++) {
+        const inst = inv.items[uids[i]];
+        if (inst) {
+            const item = findItem(itemDb, inst.itemId);
+            inst.unitWeight = item && item.weight != null ? Number(item.weight) || 0 : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : 0);
+        }
+    }
+    recomputeTotalWeight(inv, itemDb);
     return inv;
+}
+
+function canAddItemToInventory(inv, itemId, count, itemDb) {
+    if (!isRuntimeInventory(inv) || itemId == null) return false;
+    const id = String(itemId);
+    const left = Math.max(1, Math.floor(Number(count) || 1));
+    const clone = normalizeInventory(serializeInventory(inv), itemDb);
+    const r = addItemToInventory(clone, id, left, itemDb);
+    return !!(r && r.ok);
 }
 
 function bagView(inv, containerUid, itemDb) {
@@ -1210,6 +1392,123 @@ function ownsContainer(inv, containerUid) {
     return !!(inv.containers[containerUid] && inv.items[containerUid]);
 }
 
+const STARTER_SLOT_ORDER = Object.freeze([
+    'backpack', 'helmet', 'armor', 'legs', 'boots', 'amulet', 'ring', 'leftHand', 'rightHand'
+]);
+
+function starterRowId(row) {
+    if (row == null) return '';
+    if (typeof row === 'string') return row.trim();
+    if (typeof row !== 'object') return '';
+    if (row.id != null && String(row.id).trim() !== '') return String(row.id).trim();
+    if (row.itemId != null && String(row.itemId).trim() !== '') return String(row.itemId).trim();
+    return '';
+}
+
+function starterRowCount(row) {
+    if (row && typeof row === 'object' && row.count != null && Number.isFinite(Number(row.count))) {
+        return Math.max(1, Math.floor(Number(row.count)));
+    }
+    return 1;
+}
+
+function resolveStarterSpec(vocation, startersDoc) {
+    const doc = startersDoc && typeof startersDoc === 'object' ? startersDoc : {};
+    const vocs = doc.vocations && typeof doc.vocations === 'object' ? doc.vocations : {};
+    const key = vocation != null ? String(vocation).trim() : '';
+    const vocSpec = (key && vocs[key] && typeof vocs[key] === 'object') ? vocs[key] : {};
+    const base = doc.baseEquips && typeof doc.baseEquips === 'object' ? doc.baseEquips : {};
+    const vocEquips = vocSpec.equips && typeof vocSpec.equips === 'object' ? vocSpec.equips : {};
+    return {
+        equips: Object.assign({}, base, vocEquips),
+        inventory: Array.isArray(vocSpec.inventory) ? vocSpec.inventory : [],
+        quiver: Array.isArray(vocSpec.quiver) ? vocSpec.quiver : []
+    };
+}
+
+function starterEngineEquips(equips) {
+    const out = Object.create(null);
+    if (!equips || typeof equips !== 'object') return out;
+    const keys = Object.keys(equips);
+    for (let i = 0; i < keys.length; i++) {
+        const slot = canonicalEquipmentSlot(keys[i]) || keys[i];
+        const id = starterRowId(equips[keys[i]]);
+        if (!slot || !id) continue;
+        out[slot] = id;
+    }
+    return out;
+}
+
+function ensureInstanceContainer(inv, uid, itemDb) {
+    if (!inv || !uid || inv.containers[uid]) return;
+    const inst = inv.items[uid];
+    const item = inst ? findItem(itemDb, inst.itemId) : null;
+    const cap = containerCapacity(item || (inst && inst.itemId), itemDb);
+    inv.containers[uid] = { capacity: cap, slots: emptySlots(cap), isRoot: false };
+}
+
+function placeOrBag(inv, uid, itemDb) {
+    const bag = placeInContainer(inv, uid, inv.rootUid, null, itemDb);
+    if (!bag.ok) destroyItem(inv, uid, itemDb);
+    return bag;
+}
+
+function equipStarterSlot(inv, slot, itemId, itemDb) {
+    if (!inv || !slot || !itemId) return;
+    if (inv.equipment && inv.equipment[slot]) return;
+    const uid = createItemInstance(inv, itemId, itemDb);
+    const r = placeInEquipment(inv, uid, slot, itemDb);
+    if (!r.ok) placeOrBag(inv, uid, itemDb);
+}
+
+function applyStarterLoadout(inv, vocation, itemDb, startersDoc) {
+    if (!inv) return inv;
+    const spec = resolveStarterSpec(vocation, startersDoc);
+    const engineEquips = starterEngineEquips(spec.equips);
+    const backpackId = engineEquips.backpack || DEFAULT_BACKPACK_ITEM_ID;
+    if (!inv.equipment || !inv.equipment.backpack) {
+        ensureEquippedBackpack(inv, itemDb, backpackId);
+    }
+    const seen = Object.create(null);
+    for (let i = 0; i < STARTER_SLOT_ORDER.length; i++) {
+        const slot = STARTER_SLOT_ORDER[i];
+        seen[slot] = true;
+        if (slot === 'backpack') continue;
+        equipStarterSlot(inv, slot, engineEquips[slot], itemDb);
+    }
+    const extra = Object.keys(engineEquips);
+    for (let i = 0; i < extra.length; i++) {
+        if (seen[extra[i]] || extra[i] === 'backpack') continue;
+        equipStarterSlot(inv, extra[i], engineEquips[extra[i]], itemDb);
+    }
+    for (let i = 0; i < spec.inventory.length; i++) {
+        const id = starterRowId(spec.inventory[i]);
+        if (!id) continue;
+        addItemToInventory(inv, id, starterRowCount(spec.inventory[i]), itemDb);
+    }
+    if (spec.quiver.length) {
+        const qUid = inv.equipment && inv.equipment.leftHand;
+        if (qUid) {
+            ensureInstanceContainer(inv, qUid, itemDb);
+            for (let i = 0; i < spec.quiver.length; i++) {
+                const id = starterRowId(spec.quiver[i]);
+                if (!id) continue;
+                const uid = createItemInstance(inv, id, itemDb, { count: starterRowCount(spec.quiver[i]) });
+                const r = placeInContainer(inv, uid, qUid, null, itemDb);
+                if (!r.ok) placeOrBag(inv, uid, itemDb);
+            }
+        }
+    }
+    recomputeTotalWeight(inv, itemDb);
+    return inv;
+}
+
+function buildStarterInventory(vocation, itemDb, startersDoc) {
+    const inv = createEmptyInventory();
+    applyStarterLoadout(inv, vocation, itemDb, startersDoc);
+    return inv;
+}
+
 module.exports = {
     ROOT_UID,
     createEmptyInventory,
@@ -1228,8 +1527,12 @@ module.exports = {
     ensureEquippedBackpack,
     syncRootToEquippedBackpack,
     totalCarriedWeight,
+    computeTotalCarriedWeight,
+    recomputeTotalWeight,
     itemSubtreeWeight,
     canCarryAdditional,
+    canAddItemToInventory,
+    consumeInstanceCount,
     baseCapacity,
     remainingCapacity,
     resolveCapBand,
@@ -1251,5 +1554,7 @@ module.exports = {
     playerCap,
     ownsContainer,
     itemIsMagicWeapon,
+    applyStarterLoadout,
+    buildStarterInventory,
     CAP_CLASS_BAND
 };

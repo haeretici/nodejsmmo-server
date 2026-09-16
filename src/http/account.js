@@ -3,6 +3,7 @@
 const { hashPassword, verifyPassword, dummyPasswordHash } = require('../security/password');
 const { randomToken, tokenToHex, parseHexToken, hashToken } = require('../security/token');
 const { sessionCookieHeader, sidFromRequest } = require('./cookies');
+const { buildStarterInventory, serializeInventory } = require('../world/inventory');
 
 const NAME_RE = /^[A-Za-z][A-Za-z0-9]*(?: [A-Za-z0-9]+)*$/;
 const RESERVED_NAMES = new Set([
@@ -51,6 +52,13 @@ function publicAccount(account) {
         status: account.status,
         createdAt: account.createdAt instanceof Date ? account.createdAt.toISOString() : account.createdAt
     };
+}
+
+function inventoryForNewCharacter(ctx, vocation) {
+    const world = ctx && ctx.world;
+    const itemDb = world && typeof world.itemDb === 'function' ? world.itemDb() : null;
+    const starters = world && world.pack ? world.pack.starters : null;
+    return serializeInventory(buildStarterInventory(vocation, itemDb, starters));
 }
 
 function publicCharacter(ch) {
@@ -238,7 +246,7 @@ async function handleCreateCharacter(ctx, req, res, body) {
             mpMax: nc.mpMax,
             townId: nc.townId,
             skills: nc.skills,
-            inventory: { items: [] },
+            inventory: inventoryForNewCharacter(ctx, vocation),
             storage: {},
             conditions: [],
             hotkeys: {},

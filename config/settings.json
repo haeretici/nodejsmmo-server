@@ -120,5 +120,8 @@
         "skillProgression": true
     },
     "contentPath": "../content",
-    "debugPlayPage": true
+    "debugPlayPage": true,
+    "pagedFloors": true,
+    "floorIdleTimeoutSec": 300,
+    "floorSweepIntervalTicks": 200
 }

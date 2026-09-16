@@ -57,6 +57,8 @@ const { MonsterComputeService } = require('./monster_compute');
 const {
     resolveMelee,
     resolveWandAuto,
+    resolveDistanceAuto,
+    resolveCreatureAttack,
     meleeRangeOk,
     chebyshev,
     classRow,
@@ -73,6 +75,8 @@ const {
     takeItem,
     addItemToInventory,
     canCarryAdditional,
+    canAddItemToInventory,
+    consumeInstanceCount,
     totalCarriedWeight,
     serializeInventory,
     normalizeInventory,
@@ -95,7 +99,16 @@ const {
 } = require('./inventory');
 const { TEMPLATES, getTemplate } = require('./templates');
 const { runtimeMap, resolveMapId } = require('../content/load_pack');
-const { dirFromDelta, createCreature, createCorpse, Creature, CreaturePool } = require('./creature');
+const {
+    dirFromDelta,
+    createCreature,
+    createCorpse,
+    Creature,
+    CreaturePool,
+    isCreatureFleeing,
+    creatureStandDistance,
+    creatureLoseTargetDistance
+} = require('./creature');
 const {
     DEFAULT_ACTIVATE_MARGIN,
     DEFAULT_DESPAWN_IDLE_TICKS,
@@ -140,7 +153,8 @@ const {
 const {
     WORLD_PIN_ID_BASE,
     worldPinTileKey,
-    seedWorldPinInstances
+    seedWorldPinInstances,
+    applyWorldPinWalkBlock
 } = require('./world_pins');
 const {
     USE_RANGE,
@@ -160,6 +174,8 @@ const {
 const {
     createFieldStore,
     seedMapFieldsFromTileMap,
+    seedFloorFields,
+    removeFieldsForFloor,
     onEntityTileTransition,
     deployFieldAndTriggerOccupants,
     purgeExpiredFields,
@@ -179,6 +195,13 @@ const { SpatialIndex } = require('./spatial_index');
 const CREATURE_ID_BASE = 1000000000;
 const CORPSE_ID_BASE = 2000000000;
 const LOGOUT_PERSIST = 'logout';
+
+function kitAttackIsMelee(atk) {
+    if (!atk) return false;
+    if (atk.isMelee === true || atk.kind === 'melee') return true;
+    if (atk.kind && atk.kind !== 'melee') return false;
+    return atk.range == null || Number(atk.range) <= 1;
+}
 
 class World {
     /**
@@ -269,6 +292,20 @@ class World {
             creatureIdBase: (opts.settings && opts.settings.creatureIdBase) || 1000000000,
             log: this.log
         });
+        const pagedFloors = opts.settings
+            ? (opts.settings.pagedFloors !== undefined
+                ? !!opts.settings.pagedFloors
+                : (opts.settings.floorWindowing !== undefined ? !!opts.settings.floorWindowing : false))
+            : false;
+        const floorIdleTimeoutSec = opts.settings && opts.settings.floorIdleTimeoutSec != null
+            ? Number(opts.settings.floorIdleTimeoutSec)
+            : 300;
+        this.floorSweepIntervalTicks = opts.settings && opts.settings.floorSweepIntervalTicks != null
+            ? Math.max(1, opts.settings.floorSweepIntervalTicks | 0)
+            : 200;
+        this.floorIdleTimeoutSec = floorIdleTimeoutSec;
+        this.pagedFloors = pagedFloors;
+
         this.tileMap = fromStaticMap(this.map, {
             maxStack: opts.settings && opts.settings.playerTileMaxStack,
             resolveEntity: (id) => this.getEntity(id),
@@ -276,6 +313,22 @@ class World {
             crush: opts.settings && opts.settings.creaturePushCrush,
             playerSpatial: this.playerSpatial,
             creatureSpatial: this.creatureSpatial,
+            pagedFloors: this.pagedFloors,
+            floorIdleTimeoutSec: this.floorIdleTimeoutSec,
+            pinnedFloors: opts.settings && opts.settings.pinnedFloors,
+            wallNow: this.now,
+            onFloorLoaded: (z, layer) => {
+                if (this.fieldStore) {
+                    seedFloorFields(this.fieldStore, layer, z, { createdAt: 0 });
+                }
+                this._applyWorldPinsForFloor(z);
+            },
+            onFloorUnloaded: (z, layer) => {
+                if (this.fieldStore) {
+                    removeFieldsForFloor(this.fieldStore, z);
+                }
+                this._unmarkWorldPinsForFloor(z);
+            },
             onMove: (entity, fromX, fromY, fromZ, toX, toY, toZ) => {
                 this.onEntityMoved(entity, fromX, fromY, fromZ, toX, toY, toZ);
             },
@@ -538,6 +591,26 @@ class World {
         return inst;
     }
 
+    _applyWorldPinsForFloor(z) {
+        if (!this.worldPins || !this.tileMap) return;
+        const zi = z | 0;
+        for (let i = 0; i < this.worldPins.length; i++) {
+            const inst = this.worldPins[i];
+            if (!inst || (inst.z | 0) !== zi) continue;
+            applyWorldPinWalkBlock(this.tileMap, inst);
+        }
+    }
+
+    _unmarkWorldPinsForFloor(z) {
+        if (!this.worldPins) return;
+        const zi = z | 0;
+        for (let i = 0; i < this.worldPins.length; i++) {
+            const inst = this.worldPins[i];
+            if (!inst || (inst.z | 0) !== zi) continue;
+            inst.frictionPatched = false;
+        }
+    }
+
     addLeverSpawns(rows) {
         const list = Array.isArray(rows) ? rows : [];
         for (let i = 0; i < list.length; i++) {
@@ -664,6 +737,7 @@ class World {
     isCreatureInCombat(cr, playerTargets) {
         if (!cr) return false;
         if (cr.targetId) return true;
+        if (cr.leashing) return true;
         if (playerTargets) return playerTargets.has(cr.id);
         const candidates = this.playerSpatial
             ? this.playerSpatial.queryChunkCandidates(cr.x, cr.y, cr.z, 16)
@@ -1096,6 +1170,9 @@ class World {
                 if (tickIndex >= session.respawnTick) {
                     this.respawnPlayer(session, tickIndex);
                 }
+            }
+            if (this.tileMap && typeof this.tileMap.sweepIdleFloors === 'function' && (tickIndex % this.floorSweepIntervalTicks === 0)) {
+                this.tileMap.sweepIdleFloors(this.now(), this.floorIdleTimeoutSec);
             }
         } finally {
             this.flushOutbound();
@@ -1579,8 +1656,11 @@ class World {
     playerCanAttackTarget(attacker, target) {
         if (!attacker || !target) return false;
         if ((attacker.z | 0) !== (target.z | 0)) return false;
-        if (attacker.weaponType === 'magic') {
-            const range = attacker.weaponRange != null ? attacker.weaponRange : 4;
+        const isMagic = attacker.weaponType === 'magic';
+        const isDistance = attacker.weaponType === 'distance';
+        if (isMagic || isDistance) {
+            const defaultRange = isMagic ? 4 : 6;
+            const range = attacker.weaponRange != null ? attacker.weaponRange : defaultRange;
             const dist = chebyshev(attacker.x, attacker.y, target.x, target.y);
             if (dist > range) return false;
             return hasLineOfSight(attacker.x, attacker.y, attacker.z, target.x, target.y, target.z, this.tileMap || this.map);
@@ -1674,7 +1754,7 @@ class World {
             }
 
             const hasActiveConditions = !!(cr.conditions && cr.conditions.length > 0);
-            const inCombat = !!(cr.targetId || playerTargets.has(cr.id) || hasActiveConditions);
+            const inCombat = !!(cr.targetId || cr.leashing || playerTargets.has(cr.id) || hasActiveConditions);
             const wantSleep = !inCombat && !awakeCandidates.has(cr.id);
 
             const wasSleeping = !!cr.simSleeping;
@@ -1716,7 +1796,7 @@ class World {
         if (target) {
             const dist = chebyshev(cr.x, cr.y, target.x, target.y);
             const sameZ = (cr.z | 0) === (target.z | 0);
-            if (!sameZ || dist > cr.loseTargetDistance) {
+            if (!sameZ || dist > creatureLoseTargetDistance(cr)) {
                 target = null;
                 cr.path = [];
             }
@@ -1734,17 +1814,139 @@ class World {
         cr.targetId = target ? target.id : 0;
 
         if (target) {
-            if (meleeRangeOk(cr, target)) {
-                this.trySwing(cr, target, tickIndex);
-                return;
-            }
-            this.tryStepToward(cr, target.x, target.y, tickIndex);
+            cr.leashing = false;
+            this.tickCreatureAi(cr, target, tickIndex);
             return;
         }
-        if (cr.x !== cr.spawnX || cr.y !== cr.spawnY || (cr.z | 0) !== (cr.spawnZ | 0)) {
-            this.tryStepToward(cr, cr.spawnX, cr.spawnY, tickIndex, {
-                maxDistance: (this.settings.pathMaxDistance | 0) || 100
-            });
+
+        const atHome = this.creatureAtHome(cr);
+        const playerNear = this.hasCreatureIdlePresence(cr);
+        const forceWander = !!(cr.flags && cr.flags.idleWander);
+
+        if (cr.leashing || (!atHome && !playerNear)) {
+            if (!atHome) cr.leashing = true;
+            this.tickCreatureLeash(cr, tickIndex);
+            return;
+        }
+
+        cr.leashing = false;
+        if (playerNear || forceWander) {
+            this.tryIdleWander(cr, tickIndex);
+        }
+    }
+
+    creatureAtHome(cr) {
+        if (!cr) return true;
+        return (cr.x | 0) === (cr.spawnX | 0)
+            && (cr.y | 0) === (cr.spawnY | 0)
+            && (cr.z | 0) === (cr.spawnZ | 0);
+    }
+
+    hasCreatureIdlePresence(cr) {
+        if (!cr) return false;
+        const aggro = cr.aggroRange == null ? 7 : cr.aggroRange | 0;
+        const sleepOn = !this.settings || this.settings.aiCreatureSleep !== false;
+        const aoi = (this.settings && this.settings.aiTickRadius != null)
+            ? (this.settings.aiTickRadius | 0)
+            : 12;
+        const range = sleepOn && aoi > 0 ? Math.max(aggro, aoi) : Math.max(0, aggro);
+        if (range <= 0) return false;
+        return !!this.nearestPlayer(cr, range);
+    }
+
+    restoreCreatureAtHome(cr) {
+        if (!cr) return;
+        const max = cr.hpMax | 0;
+        const prev = cr.hp | 0;
+        if (max > 0) this.applyHp(cr, max);
+        cr.leashing = false;
+        cr.path = [];
+        if ((cr.hp | 0) !== prev) this.broadcastStats(cr);
+    }
+
+    tickCreatureLeash(cr, tickIndex) {
+        if (!cr) return;
+        if (this.creatureAtHome(cr)) {
+            this.restoreCreatureAtHome(cr);
+            return;
+        }
+        if (!(cr.speed > 0)) {
+            cr.leashing = false;
+            return;
+        }
+        this.tryStepToward(cr, cr.spawnX, cr.spawnY, tickIndex, {
+            maxDistance: (this.settings.pathMaxDistance | 0) || 100
+        });
+        if (this.creatureAtHome(cr)) this.restoreCreatureAtHome(cr);
+    }
+
+    tryIdleWander(cr, tickIndex) {
+        if (!cr || !(cr.speed > 0)) return false;
+        if (tickIndex < cr.moveReadyTick) return false;
+        const from = { x: cr.x | 0, y: cr.y | 0, z: cr.z | 0 };
+        const opts = [];
+        for (let i = 0; i < DIR_DELTA.length; i++) {
+            const d = DIR_DELTA[i];
+            const nx = from.x + d.dx;
+            const ny = from.y + d.dy;
+            if (this.tileMap.canEnter(nx, ny, from.z, cr)) opts.push(i);
+        }
+        if (!opts.length) return false;
+        const r = this.rng();
+        let pick = Math.floor(r * opts.length);
+        if (pick < 0) pick = 0;
+        if (pick >= opts.length) pick = opts.length - 1;
+        const dir = opts[pick];
+        const d = DIR_DELTA[dir];
+        const nx = from.x + d.dx;
+        const ny = from.y + d.dy;
+        if (!this.tileMap.moveEntityToTile(nx, ny, from.z, cr)) return false;
+        cr.path = [];
+        cr.dir = dir;
+        cr.moveReadyTick = tickIndex + this.stepDelay(
+            cr,
+            this.tileMap.frictionAt(cr.x, cr.y, cr.z),
+            false
+        );
+        this.broadcastMove(cr, from, dir);
+        this.applyWorldPinStep(cr, from, tickIndex);
+        return true;
+    }
+
+    tickCreatureAi(cr, targetOrTick, tickIndex) {
+        let target;
+        let tick;
+        if (typeof targetOrTick === 'number') {
+            tick = targetOrTick;
+            target = this.getEntity(cr.targetId);
+        } else {
+            target = targetOrTick;
+            tick = tickIndex != null ? tickIndex : this._tickIndex;
+        }
+        if (!cr || !target || target.downed || target.dead) return;
+        if ((cr.z | 0) !== (target.z | 0)) return;
+
+        // 1. Attack evaluation: evaluate creature kit attacks (both ranged and melee)
+        this.tryCreatureAttacks(cr, target, tick);
+
+        // If target died or was downed from the attack, no movement needed
+        if (target.dead || target.downed || (target.hp | 0) <= 0) {
+            return;
+        }
+
+        // 2. Stand-off distance and movement (runHealth raises want while fleeing)
+        const want = creatureStandDistance(cr);
+        const dist = chebyshev(cr.x, cr.y, target.x, target.y);
+        const hasLos = hasLineOfSight(cr.x, cr.y, cr.z, target.x, target.y, target.z, this.tileMap || this.map);
+
+        if (dist > want || !hasLos) {
+            this.tryStepToward(cr, target.x, target.y, tick);
+        } else if (dist < want) {
+            cr.path = [];
+            this.tryStepAwayFrom(cr, target.x, target.y, tick);
+        } else {
+            // At ideal stand-off distance with line of sight: hold position
+            cr.path = [];
         }
     }
 
@@ -1792,7 +1994,7 @@ class World {
             cap,
             0,
             {
-                now: this.logicNow(tickIndex),
+                logicNow: this.logicNow(tickIndex),
                 budget: this.pathBudget,
                 computeService: this.computeService,
                 priority
@@ -1816,14 +2018,170 @@ class World {
         return true;
     }
 
+    tryStepAwayFrom(entity, tx, ty, tickIndex) {
+        if (tickIndex < entity.moveReadyTick) return false;
+        const from = { x: entity.x | 0, y: entity.y | 0, z: entity.z | 0 };
+        if ((from.z | 0) !== (entity.z | 0)) {
+            entity.path = [];
+            return false;
+        }
+        const curDist = chebyshev(from.x, from.y, tx, ty);
+        const candidates = [];
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = from.x + dx;
+                const ny = from.y + dy;
+                const ndist = chebyshev(nx, ny, tx, ty);
+                if (ndist > curDist && this.tileMap.canEnter(nx, ny, from.z, entity)) {
+                    candidates.push({
+                        x: nx,
+                        y: ny,
+                        dist: ndist,
+                        diagonal: dx !== 0 && dy !== 0
+                    });
+                }
+            }
+        }
+        if (candidates.length === 0) return false;
+        candidates.sort((a, b) => (b.dist - a.dist) || ((a.diagonal ? 1 : 0) - (b.diagonal ? 1 : 0)));
+        const best = candidates[0];
+        if (!this.tileMap.moveEntityToTile(best.x, best.y, from.z, entity)) {
+            return false;
+        }
+        entity.path = [];
+        const dir = dirFromDelta((entity.x | 0) - from.x, (entity.y | 0) - from.y);
+        entity.dir = dir;
+        entity.moveReadyTick = tickIndex + this.stepDelay(
+            entity,
+            this.tileMap.frictionAt(entity.x, entity.y, entity.z),
+            isDiagonalStep(from.x, from.y, entity.x, entity.y)
+        );
+        if (entity.type === 'player') {
+            entity.movedThisTick = true;
+        }
+        this.broadcastMove(entity, from, dir);
+        this.applyWorldPinStep(entity, from, tickIndex);
+        return true;
+    }
+
+    creatureAttackIntervalTicks(atk) {
+        const baseAuto = this.autoInterval();
+        if (!atk || atk.intervalMs == null) return baseAuto;
+        const ms = Number(atk.intervalMs) || 2000;
+        return Math.max(1, Math.round((ms / 2000) * baseAuto));
+    }
+
+    tryCreatureAttacks(cr, target, tickIndex) {
+        if (!cr || !target) return false;
+        if ((cr.z | 0) !== (target.z | 0)) return false;
+        if (target.dead || target.downed || (target.hp | 0) <= 0) return false;
+
+        const attacks = cr.attacks;
+        if (!attacks || !Array.isArray(attacks) || attacks.length === 0) {
+            if (meleeRangeOk(cr, target)) {
+                return this.trySwing(cr, target, tickIndex);
+            }
+            return false;
+        }
+
+        if (!cr._attackReadyTicks) cr._attackReadyTicks = {};
+        const fleeing = isCreatureFleeing(cr);
+
+        for (let i = 0; i < attacks.length; i++) {
+            const atk = attacks[i];
+            if (!atk) continue;
+            const atkKey = atk.id || String(i);
+
+            const readyTick = cr._attackReadyTicks[atkKey];
+            if (readyTick != null && tickIndex < readyTick) {
+                continue;
+            }
+
+            // Engine: melee is suppressed while runHealth flee is active (no CD arm).
+            if (kitAttackIsMelee(atk) && fleeing) {
+                continue;
+            }
+
+            const intervalTicks = this.creatureAttackIntervalTicks(atk);
+            // Window opened: arm this row first. OOR / no LOS still burns the
+            // interval so the kit cannot skip to a later in-range row.
+            cr._attackReadyTicks[atkKey] = tickIndex + intervalTicks;
+
+            const chance = atk.chance != null ? Number(atk.chance) : 100;
+            if (chance < 100 && (this.rng() * 100 >= chance)) {
+                continue;
+            }
+
+            const reach = atk.range != null
+                ? Math.max(1, Number(atk.range) || 1)
+                : (atk.kind === 'ranged' ? 5 : 1);
+            const dist = chebyshev(cr.x, cr.y, target.x, target.y);
+            if (dist > reach) {
+                return false;
+            }
+
+            if (reach > 1 || dist > 1) {
+                if (!hasLineOfSight(cr.x, cr.y, cr.z, target.x, target.y, target.z, this.tileMap || this.map)) {
+                    return false;
+                }
+            }
+
+            cr.attackReadyTick = tickIndex + Math.min(intervalTicks, this.autoInterval());
+            this.executeCreatureAttack(cr, target, atk, tickIndex);
+            return true;
+        }
+
+        return false;
+    }
+
+    executeCreatureAttack(attacker, defender, attack, tickIndex) {
+        if (!attacker || !defender) return false;
+        if ((attacker.z | 0) !== (defender.z | 0)) return false;
+
+        const isMelee = (attack && attack.range != null)
+            ? Number(attack.range) <= 1
+            : (attack && attack.kind === 'melee');
+        const hitChance = attack && attack.hitChance != null ? Number(attack.hitChance) : 100;
+        const hit = resolveCreatureAttack(attacker, defender, attack, this.rng, {
+            currentTick: tickIndex,
+            isMelee,
+            hitChance
+        });
+
+        let amount = 0;
+        let flags = 0;
+        if (hit.miss) {
+            flags |= SWING_MISS;
+        } else {
+            amount = absorbWithManaShield(defender, Math.min(defender.hp | 0, hit.final)).leftoverHp;
+            this.applyHp(defender, (defender.hp | 0) - amount);
+            if (hit.critical) flags |= SWING_CRIT;
+            if ((defender.hp | 0) <= 0) flags |= SWING_DEATH;
+        }
+
+        this.applyAttackProgression(attacker, defender, hit);
+        this.broadcastSwing(attacker, defender, amount, flags);
+
+        if (flags & SWING_DEATH) {
+            this.kill(defender, attacker, tickIndex);
+        } else if (!hit.miss && defender.type === 'creature') {
+            if (!defender.targetId) defender.targetId = attacker.id;
+            this.wakeCreature(defender, tickIndex);
+        }
+        return true;
+    }
+
     trySwing(attacker, defender, tickIndex) {
         if (tickIndex < attacker.attackReadyTick) return false;
         if (!attacker || !defender) return false;
         if ((attacker.z | 0) !== (defender.z | 0)) return false;
 
         const isMagic = attacker && attacker.weaponType === 'magic';
-        if (isMagic) {
-            const range = attacker.weaponRange != null ? attacker.weaponRange : 4;
+        const isDistance = attacker && attacker.weaponType === 'distance';
+        if (isMagic || isDistance) {
+            const defaultRange = isMagic ? 4 : 6;
+            const range = attacker.weaponRange != null ? attacker.weaponRange : defaultRange;
             if (chebyshev(attacker.x, attacker.y, defender.x, defender.y) > range) return false;
             if (!hasLineOfSight(attacker.x, attacker.y, attacker.z, defender.x, defender.y, defender.z, this.tileMap || this.map)) {
                 return false;
@@ -1832,33 +2190,44 @@ class World {
             if (!meleeRangeOk(attacker, defender)) return false;
         }
 
-        attacker.attackReadyTick = tickIndex + this.autoInterval();
-        if (attacker.type === 'player' && !isMagic) {
-            const itemDb = this.itemDb();
-            if (equippedWeaponAmmoKind(attacker.inventory, itemDb)) {
-                if (!peekAmmoForShot(attacker.inventory, itemDb)) {
-                    this.say(attacker, 'You need ammunition.');
-                    return false;
-                }
-                if (this.packFeature('ammoConsumption')) {
-                    const used = consumeAmmoForShot(attacker.inventory, itemDb, 1);
-                    if (!used.ok) {
-                        this.say(attacker, 'You need ammunition.');
-                        return false;
-                    }
-                    applyPlayerLoadout(attacker, itemDb);
-                    this.sendInventory(attacker);
-                }
+        const itemDb = attacker.type === 'player' ? this.itemDb() : null;
+        const needsAmmo = attacker.type === 'player' && !isMagic && itemDb && equippedWeaponAmmoKind(attacker.inventory, itemDb);
+        if (needsAmmo) {
+            if (!peekAmmoForShot(attacker.inventory, itemDb)) {
+                this.say(attacker, 'You need ammunition.');
+                return false;
             }
         }
+
+        attacker.attackReadyTick = tickIndex + this.autoInterval();
 
         let hit;
         if (isMagic) {
             hit = resolveWandAuto(attacker, defender, this.rng);
+        } else if (isDistance) {
+            hit = resolveDistanceAuto(attacker, defender, this.rng, {
+                factor: this.settings.meleeAutoFactor,
+                currentTick: tickIndex,
+                isMelee: false
+            });
         } else {
-            const meleeOpts = { factor: this.settings.meleeAutoFactor };
+            const meleeOpts = {
+                factor: this.settings.meleeAutoFactor,
+                currentTick: tickIndex
+            };
             if (attacker.atk == null) meleeOpts.unarmedAtk = this.settings.unarmedAtk;
             hit = resolveMelee(attacker, defender, this.rng, meleeOpts);
+        }
+
+        if (needsAmmo) {
+            const ammoOn = this.featureFlag('ammoConsumption', this.packFeature('ammoConsumption'));
+            if (ammoOn) {
+                const used = consumeAmmoForShot(attacker.inventory, itemDb, 1);
+                if (used.ok) {
+                    applyPlayerLoadout(attacker, itemDb);
+                    this.sendInventory(attacker);
+                }
+            }
         }
 
         let amount = 0;
@@ -2232,7 +2601,10 @@ class World {
             }
         }
         for (const cr of this.activeCreatures) {
-            if (cr.targetId === n) cr.targetId = 0;
+            if (cr.targetId === n) {
+                cr.targetId = 0;
+                if (!this.creatureAtHome(cr)) cr.leashing = true;
+            }
         }
     }
 
@@ -2733,7 +3105,7 @@ class World {
             return;
         }
         if (reply.take) {
-            if (!takeItem(session.inventory, reply.take.itemId, reply.take.count)) {
+            if (!takeItem(session.inventory, reply.take.itemId, reply.take.count, this.itemDb())) {
                 this.say(session, 'You do not have that.');
                 return;
             }
@@ -2821,7 +3193,7 @@ class World {
                 this.say(session, 'You cannot carry that.');
                 return;
             }
-            if (!takeItem(session.inventory, shop.currency, cost)) {
+            if (!takeItem(session.inventory, shop.currency, cost, this.itemDb())) {
                 this.say(session, 'You cannot afford that.');
                 return;
             }
@@ -2832,7 +3204,7 @@ class World {
                 this.say(session, 'I do not buy that.');
                 return;
             }
-            if (!takeItem(session.inventory, row.itemId, count)) {
+            if (!takeItem(session.inventory, row.itemId, count, this.itemDb())) {
                 this.say(session, 'Nothing to sell.');
                 return;
             }
@@ -2862,9 +3234,7 @@ class World {
         if (!canCarryAdditional(session.level, totalCarriedWeight(session.inventory, itemDb), unit * n, voc)) {
             return false;
         }
-        const clone = normalizeInventory(serializeInventory(session.inventory), itemDb);
-        const r = addItemToInventory(clone, itemId, n, itemDb);
-        return !!(r && r.ok);
+        return canAddItemToInventory(session.inventory, itemId, n, itemDb);
     }
 
     tryGiveItem(session, itemId, count) {
@@ -3067,32 +3437,61 @@ class World {
         for (let i = 0; i < gone.length; i++) {
             this.broadcastFieldGone(gone[i].x, gone[i].y, gone[i].z);
         }
-        this.tickDelayedCasts(tickIndex, now);
+        this.tickDelayedCasts(tickIndex);
     }
 
-    tickDelayedCasts(tickIndex, now) {
+    enqueueDelayedCast(entry) {
+        if (!entry) return;
+        const ups = (this.settings.logicUps | 0) || 20;
+        if (entry.readyTick == null && entry.readyAt != null) {
+            entry.readyTick = Math.round(Number(entry.readyAt) * ups);
+        }
+        entry.readyTick = entry.readyTick | 0;
+        if (Object.prototype.hasOwnProperty.call(entry, 'readyAt')) {
+            delete entry.readyAt;
+        }
+        let low = 0;
+        let high = this.delayedCasts.length;
+        const target = entry.readyTick;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            const midVal = this.delayedCasts[mid]
+                ? (this.delayedCasts[mid].readyTick | 0)
+                : 0;
+            if (midVal <= target) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        this.delayedCasts.splice(low, 0, entry);
+    }
+
+    tickDelayedCasts(tickIndex) {
         if (!this.delayedCasts.length) return;
-        const keep = [];
-        for (let i = 0; i < this.delayedCasts.length; i++) {
-            const row = this.delayedCasts[i];
-            if (!row) continue;
-            if (now < row.readyAt) {
-                keep.push(row);
+        const tick = tickIndex | 0;
+        while (this.delayedCasts.length > 0) {
+            const head = this.delayedCasts[0];
+            if (!head) {
+                this.delayedCasts.shift();
                 continue;
             }
-            const caster = this.getEntity(row.casterId);
+            if ((head.readyTick | 0) > tick) {
+                break;
+            }
+            this.delayedCasts.shift();
+            const caster = this.getEntity(head.casterId);
             if (!caster || !isCombatantAlive(caster)) continue;
-            this.runCast(caster, row.spell, {
+            this.runCast(caster, head.spell, {
                 target: null,
-                aim: row.center,
-                tickIndex,
+                aim: head.center,
+                tickIndex: tick,
                 detonate: true,
                 skipMana: true,
                 skipCooldown: true,
                 skipMoveLock: true
             });
         }
-        this.delayedCasts = keep;
     }
 
     applyCastIntent(session, intent, tickIndex) {
@@ -3125,6 +3524,7 @@ class World {
             rng: this.rng,
             now: this.logicNow(tickIndex),
             tickIndex,
+            logicUps: (this.settings.logicUps | 0) || 20,
             skipMana: !!o.skipMana,
             skipCooldown: !!o.skipCooldown,
             skipMoveLock: !!o.skipMoveLock,
@@ -3159,11 +3559,14 @@ class World {
             return result;
         }
         if (result.delayed) {
-            this.delayedCasts.push({
+            const ups = (this.settings.logicUps | 0) || 20;
+            const delaySec = Number(result.delayed.delaySec) || 0;
+            const delayTicks = Math.max(1, Math.round(delaySec * ups));
+            this.enqueueDelayedCast({
                 casterId: attacker.id,
                 spell,
                 center: result.delayed.center,
-                readyAt: this.logicNow(tickIndex) + result.delayed.delaySec
+                readyTick: (tickIndex | 0) + delayTicks
             });
         }
         const lock = result.moveLock || 0;
@@ -3277,9 +3680,7 @@ class World {
                 session.mp = Math.max(0, Math.min(session.mpMax | 0, (session.mp | 0) + roll));
                 if (session.character) session.character.mp = session.mp;
             }
-            const left = getStackCount(inst) - 1;
-            if (left <= 0) destroyItem(session.inventory, uid);
-            else inst.count = left;
+            consumeInstanceCount(session.inventory, uid, 1, itemDb);
             this.sendInventory(session);
             session.send(S2C.STATS, encodeStats(session));
             return;

@@ -205,13 +205,14 @@ function canCastPlayerAreaOnTile(attacker, tileMap) {
 
 function canCast(attacker, spell, ctx) {
     const c = ctx || {};
+    const tickIndex = c.tickIndex != null ? (c.tickIndex | 0) : 0;
     if (!attacker || !spell) return { ok: false, reason: 'unknown_spell' };
     if (!isCombatantAlive(attacker)) return { ok: false, reason: 'missing_combatant' };
     if (isAutoAttackId(spell.id)) return { ok: false, reason: 'unknown_spell' };
     if (!canUseSpell(attacker, spell)) return { ok: false, reason: 'unknown_spell' };
     if (!meetsSpellLevel(attacker, spell)) return { ok: false, reason: 'level' };
     if (!meetsSpellMagicLevel(attacker, spell)) return { ok: false, reason: 'magic_level' };
-    if ((attacker.moveReadyTick | 0) > (c.tickIndex | 0) && !c.skipMoveLock) {
+    if ((attacker.moveReadyTick | 0) > tickIndex && !c.skipMoveLock) {
         return { ok: false, reason: 'busy' };
     }
     if (isCannotAttack(attacker) && isHarmfulSpell(spell)) {
@@ -222,7 +223,6 @@ function canCast(attacker, spell, ctx) {
         && tileMap.blocksCast(attacker.x, attacker.y, attacker.z)) {
         return { ok: false, reason: 'no_cast' };
     }
-    const tickIndex = c.tickIndex != null ? (c.tickIndex | 0) : (c.now != null ? Math.round(Number(c.now) * 20) : null);
     Cooldowns.ensureCooldowns(attacker);
     if (!c.skipCooldown && !Cooldowns.canUse(attacker, spell.cooldowns, tickIndex)) {
         return { ok: false, reason: 'cooldown' };
@@ -432,13 +432,14 @@ function resolveCast(opts) {
         center = casterPos;
     }
 
-    const tickIndex = o.tickIndex != null ? (o.tickIndex | 0) : (o.now != null ? Math.round(Number(o.now) * 20) : 0);
-    const now = o.now != null ? Number(o.now) : tickIndex / 20;
+    const tickIndex = o.tickIndex != null ? (o.tickIndex | 0) : 0;
+    const ups = (o.logicUps != null && Number(o.logicUps) > 0) ? Number(o.logicUps) : 20;
+    const now = o.now != null ? Number(o.now) : tickIndex / ups;
     const delaySec = spell.delaySec != null ? Number(spell.delaySec) : 0;
     if (delaySec > 0 && !o.detonate) {
         const manaCost = spell.mana != null ? spell.mana : 0;
         if (!o.skipMana) spendMana(attacker, manaCost);
-        if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, tickIndex);
+        if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, tickIndex, ups);
         if (isRuneSpell(spell) && o.runeConsumption && typeof o.consumeRune === 'function') {
             o.consumeRune(attacker, spell);
         }
@@ -462,7 +463,7 @@ function resolveCast(opts) {
 
     const manaCost = spell.mana != null ? spell.mana : 0;
     if (!o.skipMana) spendMana(attacker, manaCost);
-    if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, tickIndex);
+    if (!o.skipCooldown) Cooldowns.apply(attacker, spell.cooldowns, tickIndex, ups);
     if (isRuneSpell(spell) && o.runeConsumption && typeof o.consumeRune === 'function') {
         o.consumeRune(attacker, spell);
     }

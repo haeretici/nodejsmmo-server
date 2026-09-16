@@ -35,6 +35,49 @@ function greedyOrthogonal(fromX, fromY, toX, toY) {
     return out;
 }
 
+/** Engine `AI_CREATURE_FLEE_STAND_DIST` default. */
+const DEFAULT_FLEE_STAND_DIST = 10;
+
+function isCreatureFleeing(cr) {
+    if (!cr) return false;
+    const f = cr.flags;
+    if (!f) return false;
+    const runHealth = Number(f.runHealth) || 0;
+    const runPct = Number(f.runHealthPercent) || 0;
+    const hp = cr.hp | 0;
+    const max = cr.hpMax | 0;
+    if (runHealth > 0 && hp <= runHealth) return true;
+    if (runPct > 0 && max > 0 && hp / max <= runPct) return true;
+    return false;
+}
+
+function creatureFleeStandDistance(cr) {
+    const f = cr && cr.flags;
+    const raw = f && f.fleeTargetDistance != null
+        ? Number(f.fleeTargetDistance)
+        : DEFAULT_FLEE_STAND_DIST;
+    const n = raw | 0;
+    return Math.max(1, n || DEFAULT_FLEE_STAND_DIST);
+}
+
+function creatureStandDistance(cr) {
+    if (isCreatureFleeing(cr)) return creatureFleeStandDistance(cr);
+    if (cr && cr.targetDistance != null) return Math.max(1, cr.targetDistance | 0);
+    const f = cr && cr.flags;
+    if (f && f.targetDistance != null) return Math.max(1, f.targetDistance | 0);
+    return 1;
+}
+
+function creatureLoseTargetDistance(cr) {
+    const base = cr && cr.loseTargetDistance != null
+        ? Math.max(1, cr.loseTargetDistance | 0)
+        : 12;
+    if (isCreatureFleeing(cr)) {
+        return Math.max(base, creatureFleeStandDistance(cr));
+    }
+    return base;
+}
+
 function resetCooldowns(cds) {
     if (!cds || typeof cds !== 'object') return;
     if (cds.auto) cds.auto.attack = 0;
@@ -94,6 +137,8 @@ class Creature {
         this.mitigation = template ? template.mitigation : undefined;
         this.maxBlock = (template && template.maxBlock) || 0;
         this.canBlock = !!(template && template.canBlock);
+        this.shieldBlocksThisWindow = 0;
+        this.shieldBlockWindowTick = 0;
         this.resists = (template && template.resists) || { physical: 0 };
         this.critChance = Math.max(0, Number(template && template.critChance) || 0);
         this.critDamage = Math.max(0, Number(template && template.critDamage) || 0);
@@ -108,9 +153,11 @@ class Creature {
         this.dialog = (template && template.dialog) || null;
         this.dialogId = (template && template.dialogId) || null;
         this.shop = (template && template.shop) || (this.dialog && this.dialog.shop) || null;
+        this.targetDistance = flags.targetDistance != null ? Math.max(1, flags.targetDistance | 0) : 1;
         this.aggroRange = flags.aggroRange == null ? 7 : flags.aggroRange | 0;
         this.loseTargetDistance = flags.loseTargetDistance == null ? 12 : flags.loseTargetDistance | 0;
         this.targetId = 0;
+        this.leashing = false;
         if (Array.isArray(this.path)) {
             this.path.length = 0;
         } else {
@@ -118,6 +165,7 @@ class Creature {
         }
         this.moveReadyTick = 0;
         this.attackReadyTick = 0;
+        this._attackReadyTicks = {};
         this.simSleeping = false;
         this.pinIndex = null;
         this.baseSpeed = this.speed;
@@ -155,6 +203,8 @@ class Creature {
         this.mitigation = undefined;
         this.maxBlock = 0;
         this.canBlock = false;
+        this.shieldBlocksThisWindow = 0;
+        this.shieldBlockWindowTick = 0;
         this.resists = null;
         this.critChance = 0;
         this.critDamage = 0;
@@ -169,9 +219,11 @@ class Creature {
         this.dialog = null;
         this.dialogId = null;
         this.shop = null;
+        this.targetDistance = 1;
         this.aggroRange = 7;
         this.loseTargetDistance = 12;
         this.targetId = 0;
+        this.leashing = false;
         if (Array.isArray(this.path)) {
             this.path.length = 0;
         } else {
@@ -179,6 +231,7 @@ class Creature {
         }
         this.moveReadyTick = 0;
         this.attackReadyTick = 0;
+        this._attackReadyTicks = {};
         this.simSleeping = false;
         this.pinIndex = null;
         this.baseSpeed = 100;
@@ -274,6 +327,11 @@ function createCorpse(id, creature, items, tickIndex) {
 module.exports = {
     dirFromDelta,
     greedyOrthogonal,
+    DEFAULT_FLEE_STAND_DIST,
+    isCreatureFleeing,
+    creatureFleeStandDistance,
+    creatureStandDistance,
+    creatureLoseTargetDistance,
     Creature,
     CreaturePool,
     createCreature,

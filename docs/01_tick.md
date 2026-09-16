@@ -18,6 +18,16 @@ One OS process. One mutator. S5: occupancy, combat, loot, NPC talk/shop, and **o
 | Step delay | friction×speed tables (friction 100 + speed 110 → **0.4 s** = **8** ticks). `stepDelayTicks` **4** only when `fixedStepDelay` (tests) |
 | Persist | off-tick only. Logout always; interval **1 hour**; wall-clock `06:00` then shutdown. No loot/shop SQL |
 
+## Clocks
+
+| Clock | Role |
+| :--- | :--- |
+| Integer `tickIndex` | Gameplay: move, attack, CD, spawn, corpse, shield, delayed-cast fuse |
+| `logicNow = tickIndex / logicUps` | Convenience float for fields / world-pin decay / path extras. Not a second deadline store |
+| `Date.now` / `World.now` | `WorldTick` scheduler, persist, PONG, floor paging idle |
+
+MUST NOT use wall clock for combat, movement, spawn idle, corpse, shield, spells. MUST NOT pass `World.now()` into `followPath`.
+
 ## Key files
 
 | Path | Role |
@@ -40,4 +50,4 @@ Tick drains intent queues, then player chase/swing, on_demand pin activate/despa
 
 ## Remaining
 
-S8 own GitHub remote. Spells stay out. Account UI is `../frontend`. Pack is `../content` at boot. Next named port stage is **P6**.
+S8 own GitHub remote. Account UI is `../frontend`. Pack is `../content` at boot. Think/repath intervals still float `logicNow`. Conditions still `durationSec -= dt`. `S2C.FIELD` does not send `createdAt`.

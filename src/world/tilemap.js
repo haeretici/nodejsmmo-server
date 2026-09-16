@@ -231,8 +231,11 @@ class TileMap {
      *   z?: number,
      *   friction?: Uint8Array,
      *   maxStack?: number,
-     *   resolveEntity?: (id: number) => object|null
+     *   resolveEntity?: (id: number) => object|null,
+     *   wallNow?: () => number,
+     *   now?: () => number
      * }} opts
+     * wallNow (alias: now) is wall ms for floor paging. followPath extras.logicNow is logic seconds.
      */
     constructor(opts) {
         const cols = opts.cols | 0;
@@ -242,6 +245,8 @@ class TileMap {
         const friction = opts.friction instanceof Uint8Array
             ? opts.friction
             : new Uint8Array(n);
+        this.cols = cols;
+        this.rows = rows;
         this.z = z;
         this.layers = Object.create(null);
         this.layers[String(z)] = {
@@ -268,6 +273,28 @@ class TileMap {
         this.budget = opts.budget || null;
         this.computeService = opts.computeService || null;
         this.pathOpts = opts.path && typeof opts.path === 'object' ? opts.path : {};
+
+        // Continental floor windowing & demand paging (Phase 6.5)
+        this.pagedFloors = opts.pagedFloors !== undefined ? !!opts.pagedFloors : false;
+        this.floorProvider = typeof opts.floorProvider === 'function' ? opts.floorProvider : null;
+        this.floorIdleTimeoutMs = (opts.floorIdleTimeoutSec != null ? Math.max(0, Number(opts.floorIdleTimeoutSec)) : 300) * 1000;
+        this.floorStates = new Map();
+        this.cellPatches = new Map();
+        this.wallNow = typeof opts.wallNow === 'function'
+            ? opts.wallNow
+            : (typeof opts.now === 'function' ? opts.now : () => Date.now());
+        this.onFloorLoaded = typeof opts.onFloorLoaded === 'function' ? opts.onFloorLoaded : null;
+        this.onFloorUnloaded = typeof opts.onFloorUnloaded === 'function' ? opts.onFloorUnloaded : null;
+
+        const homeState = this.getFloorState(this.z);
+        homeState.pinned = true;
+        homeState.inflatedAt = this.wallNow();
+
+        if (Array.isArray(opts.pinnedFloors) || opts.pinnedFloors instanceof Set) {
+            for (const pz of opts.pinnedFloors) {
+                this.pinFloor(pz);
+            }
+        }
     }
 
     tileStackKey(x, y, z) {
@@ -278,16 +305,202 @@ class TileMap {
         return y * cols + x;
     }
 
+    getFloorState(z) {
+        const zi = z | 0;
+        let state = this.floorStates.get(zi);
+        if (!state) {
+            state = {
+                z: zi,
+                pinned: (zi === (this.z | 0)),
+                playerIds: new Set(),
+                creatureIds: new Set(),
+                lastActiveAt: this.wallNow(),
+                inflatedAt: (this.layers && this.layers[String(zi)] && this.layers[String(zi)].friction) ? this.wallNow() : 0,
+                unloadedAt: 0
+            };
+            this.floorStates.set(zi, state);
+        }
+        return state;
+    }
+
+    isFloorInflated(z) {
+        const key = String(z | 0);
+        return !!(this.layers && this.layers[key] && this.layers[key].friction);
+    }
+
+    getFloorPlayerCount(z) {
+        return this.getFloorState(z).playerIds.size;
+    }
+
+    getFloorCreatureCount(z) {
+        return this.getFloorState(z).creatureIds.size;
+    }
+
+    getFloorOccupantCount(z) {
+        const s = this.getFloorState(z);
+        return s.playerIds.size + s.creatureIds.size;
+    }
+
+    pinFloor(z) {
+        this.getFloorState(z).pinned = true;
+    }
+
+    unpinFloor(z) {
+        this.getFloorState(z).pinned = false;
+    }
+
+    isFloorPinned(z) {
+        return this.getFloorState(z).pinned;
+    }
+
+    inflateFloor(z) {
+        const zi = z | 0;
+        const key = String(zi);
+        if (this.layers[key] && this.layers[key].friction) {
+            return this.layers[key];
+        }
+        if (!this.floorProvider) return null;
+        const channels = this.floorProvider(zi);
+        if (!channels) return null;
+        const layer = this.addLayer(zi, channels);
+        const state = this.getFloorState(zi);
+        state.inflatedAt = this.wallNow();
+        state.lastActiveAt = this.wallNow();
+
+        if (this.cellPatches && this.cellPatches.has(zi)) {
+            const patches = this.cellPatches.get(zi);
+            for (const p of patches.values()) {
+                this.applyCellPatch(Object.assign({}, p, { inflate: true }));
+            }
+        }
+
+        if (this.onFloorLoaded) {
+            try {
+                this.onFloorLoaded(zi, layer);
+            } catch (err) {
+                // ignore error in consumer callback
+            }
+        }
+        return layer;
+    }
+
+    unloadFloor(z, force = false) {
+        const zi = z | 0;
+        const key = String(zi);
+        const layer = this.layers[key];
+        if (!layer || !layer.friction) return false;
+
+        const state = this.getFloorState(zi);
+        if (!force) {
+            if (state.pinned) return false;
+            if (state.playerIds.size > 0 || state.creatureIds.size > 0) return false;
+            const idleTime = this.wallNow() - state.lastActiveAt;
+            if (idleTime < this.floorIdleTimeoutMs) return false;
+        }
+
+        delete this.layers[key];
+        state.unloadedAt = this.wallNow();
+
+        for (const k of this.playerStacks.keys()) {
+            if (k.startsWith(`${zi}:`)) {
+                this.playerStacks.delete(k);
+            }
+        }
+        for (const k of this.noPlayerStackTiles.keys()) {
+            if (k.startsWith(`${zi}:`)) {
+                this.noPlayerStackTiles.delete(k);
+            }
+        }
+
+        if (this.onFloorUnloaded) {
+            try {
+                this.onFloorUnloaded(zi, layer);
+            } catch (err) {
+                // ignore
+            }
+        }
+
+        layer.friction = null;
+        layer.sight = null;
+        layer.flags = null;
+        layer.fields = null;
+        layer.occupancy = null;
+
+        return true;
+    }
+
+    sweepIdleFloors(wallNow, timeoutSec) {
+        const currentTime = wallNow != null ? wallNow : this.wallNow();
+        const timeoutMs = timeoutSec != null
+            ? Math.max(0, timeoutSec) * 1000
+            : this.floorIdleTimeoutMs;
+        const unloaded = [];
+        for (const key of Object.keys(this.layers)) {
+            const zi = Number(key);
+            if (!Number.isFinite(zi)) continue;
+            const state = this.getFloorState(zi);
+            if (state.pinned) continue;
+            if (state.playerIds.size > 0 || state.creatureIds.size > 0) continue;
+            const idleTime = currentTime - state.lastActiveAt;
+            if (idleTime >= timeoutMs) {
+                if (this.unloadFloor(zi, false)) {
+                    unloaded.push(zi);
+                }
+            }
+        }
+        return unloaded;
+    }
+
+    _trackEntityEnter(z, entity, id) {
+        const eid = id || entityIdOf(entity);
+        if (!eid) return;
+        const zi = z | 0;
+        const state = this.getFloorState(zi);
+        const isPlayer = isPlayerEntity(entity) || (entity && entity.type === 'player');
+        if (isPlayer) {
+            state.playerIds.add(eid);
+        } else {
+            state.creatureIds.add(eid);
+        }
+        state.lastActiveAt = this.wallNow();
+    }
+
+    _trackEntityLeave(z, entity, id) {
+        const eid = id || entityIdOf(entity);
+        if (!eid) return;
+        const zi = z | 0;
+        const state = this.getFloorState(zi);
+        const isPlayer = isPlayerEntity(entity) || (entity && entity.type === 'player');
+        if (isPlayer) {
+            state.playerIds.delete(eid);
+        } else {
+            state.creatureIds.delete(eid);
+        }
+        if (state.playerIds.size === 0 && state.creatureIds.size === 0) {
+            state.lastActiveAt = this.wallNow();
+        }
+    }
+
     getLayer(z) {
-        return this.layers[String(z)] || null;
+        const key = String(z | 0);
+        const layer = this.layers[key] || null;
+        if (layer && layer.friction) {
+            return layer;
+        }
+        if (this.floorProvider) {
+            return this.inflateFloor(z);
+        }
+        return layer;
     }
 
     addLayer(z, opts) {
         const key = String(z | 0);
-        if (this.layers[key]) return this.layers[key];
-        const sample = this.layers[String(this.z)] || Object.values(this.layers)[0];
-        const cols = (opts && opts.cols) || sample.cols;
-        const rows = (opts && opts.rows) || sample.rows;
+        if (this.layers[key] && this.layers[key].friction) return this.layers[key];
+        const sample = (this.layers[String(this.z)] && this.layers[String(this.z)].friction)
+            ? this.layers[String(this.z)]
+            : Object.values(this.layers).find((l) => l && l.friction);
+        const cols = (opts && opts.cols) || (sample && sample.cols) || this.cols;
+        const rows = (opts && opts.rows) || (sample && sample.rows) || this.rows;
         const n = cols * rows;
         const layer = {
             cols,
@@ -435,7 +648,23 @@ class TileMap {
             return { ok: false, reason: 'bad_args' };
         }
         const z = patch.z !== undefined && patch.z !== null ? patch.z : 0;
-        const layer = this.getLayer(z);
+        const zi = z | 0;
+        const key = String(zi);
+        let layer = this.layers[key] || null;
+        if (!layer || !layer.friction) {
+            if (this.pagedFloors && !patch.inflate) {
+                if (!this.cellPatches) this.cellPatches = new Map();
+                let floorPatches = this.cellPatches.get(zi);
+                if (!floorPatches) {
+                    floorPatches = new Map();
+                    this.cellPatches.set(zi, floorPatches);
+                }
+                const idx = y * this.cols + x;
+                floorPatches.set(idx, { x, y, z: zi, friction: patch.friction, sight: patch.sight, flags: patch.flags, fields: patch.fields });
+                return { ok: false, reason: 'no_layer' };
+            }
+            layer = this.getLayer(z);
+        }
         if (!layer || !layer.friction) return { ok: false, reason: 'no_layer' };
         if (x < 0 || y < 0 || x >= layer.cols || y >= layer.rows) {
             return { ok: false, reason: 'oob' };
@@ -467,6 +696,15 @@ class TileMap {
         if (patch.sight != null) setByte('sight', patch.sight);
         if (patch.flags != null) setByte('flags', patch.flags);
         if (patch.fields != null) setByte('fields', patch.fields);
+
+        if (!this.cellPatches) this.cellPatches = new Map();
+        let floorPatches = this.cellPatches.get(zi);
+        if (!floorPatches) {
+            floorPatches = new Map();
+            this.cellPatches.set(zi, floorPatches);
+        }
+        floorPatches.set(idx, { x, y, z: zi, friction: patch.friction, sight: patch.sight, flags: patch.flags, fields: patch.fields });
+
         return { ok: true, changed, prev };
     }
 
@@ -706,10 +944,16 @@ class TileMap {
         if (ix < 0 || iy < 0 || ix >= layer.cols || iy >= layer.rows) return false;
         const idx = this.index(ix, iy, layer.cols);
         const firstId = layer.occupancy[idx] | 0;
-        if (firstId === id) return true;
+        if (firstId === id) {
+            this._trackEntityEnter(z, entity, id);
+            return true;
+        }
         const key = this.tileStackKey(ix, iy, z);
         const existing = this.playerStacks.get(key);
-        if (existing && existing.indexOf(id) >= 0) return true;
+        if (existing && existing.indexOf(id) >= 0) {
+            this._trackEntityEnter(z, entity, id);
+            return true;
+        }
 
         const mover = entity && typeof entity === 'object'
             ? entity
@@ -728,9 +972,13 @@ class TileMap {
         const occNow = layer.occupancy[idx] | 0;
         if (occNow === 0) {
             layer.occupancy[idx] = id;
+            this._trackEntityEnter(z, entity, id);
             return true;
         }
-        if (occNow === id) return true;
+        if (occNow === id) {
+            this._trackEntityEnter(z, entity, id);
+            return true;
+        }
 
         let stack = this.playerStacks.get(key);
         if (!stack) {
@@ -740,6 +988,7 @@ class TileMap {
             stack.push(id);
         }
         layer.occupancy[idx] = stack[0];
+        this._trackEntityEnter(z, entity, id);
         return true;
     }
 
@@ -765,12 +1014,14 @@ class TileMap {
             } else {
                 layer.occupancy[idx] = stack[0];
             }
+            this._trackEntityLeave(z, entity, id);
             return true;
         }
 
         if ((layer.occupancy[idx] | 0) !== id) return false;
         layer.occupancy[idx] = 0;
         this.playerStacks.delete(key);
+        this._trackEntityLeave(z, entity, id);
         return true;
     }
 
@@ -842,7 +1093,9 @@ class TileMap {
             ? maxDistance
             : (knobs.maxDistance != null ? knobs.maxDistance : DEFAULT_MAX_DISTANCE);
         const attempt = retries | 0;
-        const now = extras && extras.now != null ? Number(extras.now) : 0;
+        const now = extras && extras.logicNow != null
+            ? Number(extras.logicNow)
+            : (extras && extras.now != null ? Number(extras.now) : 0);
         const budget = extras && extras.budget ? extras.budget : this.budget;
 
         if (
@@ -1075,16 +1328,29 @@ class TileMap {
     clearOccupancy(z) {
         if (z == null) {
             for (const key of Object.keys(this.layers)) {
-                this.layers[key].occupancy.fill(0);
+                if (this.layers[key] && this.layers[key].occupancy) {
+                    this.layers[key].occupancy.fill(0);
+                }
             }
             this.playerStacks.clear();
+            for (const state of this.floorStates.values()) {
+                state.playerIds.clear();
+                state.creatureIds.clear();
+                state.lastActiveAt = this.wallNow();
+            }
             return;
         }
         const layer = this.getLayer(z);
-        if (layer) layer.occupancy.fill(0);
+        if (layer && layer.occupancy) layer.occupancy.fill(0);
         const prefix = `${z | 0}:`;
         for (const key of Array.from(this.playerStacks.keys())) {
             if (key.startsWith(prefix)) this.playerStacks.delete(key);
+        }
+        const state = this.floorStates.get(z | 0);
+        if (state) {
+            state.playerIds.clear();
+            state.creatureIds.clear();
+            state.lastActiveAt = this.wallNow();
         }
     }
 }
@@ -1104,7 +1370,13 @@ function frictionFromTiles(map, n) {
 }
 
 function layerChannels(map, z, n) {
-    const fl = map.floors && (map.floors[String(z)] || map.floors[z]);
+    if (typeof map.getFloorChannels === 'function') {
+        const c = map.getFloorChannels(z, n);
+        if (c) return c;
+    }
+    const fl = map.floors && (typeof map.floors === 'function'
+        ? map.floors(z)
+        : (map.floors[String(z)] || map.floors[z]));
     if (fl && fl.friction && fl.friction.length === n) {
         return {
             friction: fl.friction instanceof Uint8Array
@@ -1144,6 +1416,8 @@ function fromStaticMap(map, opts) {
     const zMin = map.zMin != null ? map.zMin : homeZ;
     const zMax = map.zMax != null ? map.zMax : homeZ;
     const home = layerChannels(map, homeZ, n);
+    const pagedFloors = opts && (opts.pagedFloors !== undefined ? !!opts.pagedFloors : !!opts.floorWindowing);
+    const floorProvider = (z) => layerChannels(map, z, n);
     const tm = new TileMap({
         cols,
         rows,
@@ -1163,11 +1437,22 @@ function fromStaticMap(map, opts) {
         creatureSpatial: opts && opts.creatureSpatial,
         budget: opts && opts.budget,
         computeService: opts && opts.computeService,
-        path: opts && opts.path
+        path: opts && opts.path,
+        pagedFloors,
+        floorProvider,
+        floorIdleTimeoutSec: opts && opts.floorIdleTimeoutSec,
+        pinnedFloors: opts && opts.pinnedFloors,
+        onFloorLoaded: opts && opts.onFloorLoaded,
+        onFloorUnloaded: opts && opts.onFloorUnloaded,
+        wallNow: opts && (opts.wallNow || opts.now)
     });
-    for (let z = zMin; z <= zMax; z++) {
-        if ((z | 0) === (homeZ | 0)) continue;
-        tm.addLayer(z, layerChannels(map, z, n));
+    tm.zMin = zMin;
+    tm.zMax = zMax;
+    if (!pagedFloors) {
+        for (let z = zMin; z <= zMax; z++) {
+            if ((z | 0) === (homeZ | 0)) continue;
+            tm.addLayer(z, layerChannels(map, z, n));
+        }
     }
     if (Array.isArray(map.stairs)) tm.installStairs(map.stairs);
     return tm;

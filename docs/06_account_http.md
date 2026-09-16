@@ -21,7 +21,7 @@ S1 surface. Same process as the tick. Passwords never go on the game socket.
 | POST | `/v1/logout` | cookie |
 | GET | `/v1/me` | cookie |
 | GET | `/v1/characters` | cookie |
-| POST | `/v1/characters` | `{ name, vocation }` |
+| POST | `/v1/characters` | `{ name, vocation }` seeds L1 kit from `content/starters.json` (leather + vocation weapon). Missing pack → backpack only. |
 | DELETE | `/v1/characters/:id` | cookie |
 | POST | `/v1/play` | `{ characterId }` → `{ token, expiresAt }` |
 

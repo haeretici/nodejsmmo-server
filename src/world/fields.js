@@ -517,14 +517,54 @@ function purgeExpiredFields(store, currentTime, getOccupants) {
     return gone;
 }
 
-function seedMapFieldsFromTileMap(store, tileMap, opts) {
-    if (!store || !tileMap || !tileMap.layers) return 0;
+function seedFloorFields(store, layer, z, opts) {
+    if (!store || !layer || !layer.fields) return 0;
     const o = opts || {};
     const durationSec = o.durationSec != null && Number.isFinite(Number(o.durationSec))
         ? Math.max(0, Number(o.durationSec))
         : MAP_FIELD_DEFAULT_TTL_SEC;
     const source = o.source || FIELD_SOURCES.SCENARIO;
     const createdAt = o.createdAt != null ? Number(o.createdAt) : 0;
+    let deployed = 0;
+    const cols = layer.cols | 0;
+    const rows = layer.rows | 0;
+    const fields = layer.fields;
+    const n = Math.min(fields.length | 0, cols * rows);
+    const zVal = z != null ? z : (layer.z != null ? layer.z : 0);
+    for (let i = 0; i < n; i++) {
+        const mask = fields[i] & 0xff;
+        if (!mask) continue;
+        const kind = fieldKindFromMask(mask);
+        if (!kind) continue;
+        const x = i % cols;
+        const y = (i / cols) | 0;
+        const item = deployFieldToTile(store, x, y, zVal, {
+            kind,
+            source,
+            durationSec,
+            createdAt
+        });
+        if (item) deployed += 1;
+    }
+    return deployed;
+}
+
+function removeFieldsForFloor(store, z) {
+    if (!store || !store.byKey) return 0;
+    const zInt = z | 0;
+    let removed = 0;
+    for (const key of Object.keys(store.byKey)) {
+        const parsed = parseTileKey(key);
+        if (parsed && (parsed.z | 0) === zInt) {
+            delete store.byKey[key];
+            removed++;
+        }
+    }
+    return removed;
+}
+
+function seedMapFieldsFromTileMap(store, tileMap, opts) {
+    if (!store || !tileMap || !tileMap.layers) return 0;
     if (!store.tileMap) store.tileMap = tileMap;
     let deployed = 0;
     const zKeys = Object.keys(tileMap.layers);
@@ -532,26 +572,7 @@ function seedMapFieldsFromTileMap(store, tileMap, opts) {
         const zKey = zKeys[zi];
         const layer = tileMap.layers[zKey];
         if (!layer || !layer.fields) continue;
-        const cols = layer.cols | 0;
-        const rows = layer.rows | 0;
-        const fields = layer.fields;
-        const n = Math.min(fields.length | 0, cols * rows);
-        const z = layer.z != null ? layer.z : (Number.isFinite(Number(zKey)) ? Number(zKey) : zKey);
-        for (let i = 0; i < n; i++) {
-            const mask = fields[i] & 0xff;
-            if (!mask) continue;
-            const kind = fieldKindFromMask(mask);
-            if (!kind) continue;
-            const x = i % cols;
-            const y = (i / cols) | 0;
-            const item = deployFieldToTile(store, x, y, z, {
-                kind,
-                source,
-                durationSec,
-                createdAt
-            });
-            if (item) deployed += 1;
-        }
+        deployed += seedFloorFields(store, layer, zKey, opts);
     }
     return deployed;
 }
@@ -564,8 +585,46 @@ function listFieldsInRect(store, originX, originY, z, w, h) {
     const width = w | 0;
     const height = h | 0;
     const zInt = z | 0;
+
+    if (width <= 0 || height <= 0) return out;
+
+    const tileMap = store.tileMap;
+    const layer = tileMap
+        ? (typeof tileMap.getLayer === 'function'
+            ? (tileMap.getLayer(zInt) || tileMap.getLayer(z))
+            : (tileMap.layers && (tileMap.layers[String(zInt)] || tileMap.layers[String(z)] || tileMap.layers[z])))
+        : null;
+
+    // Phase 6.2: Direct 2D window reading from layer typed array (layer.fields).
+    // Avoids O(N_world_fields) Object.keys(store.byKey) scans and empty tile string allocations.
+    if (layer && layer.fields && layer.cols > 0 && layer.rows > 0) {
+        const cols = layer.cols | 0;
+        const rows = layer.rows | 0;
+        const fields = layer.fields;
+
+        const startX = Math.max(0, x0);
+        const endX = Math.min(cols, x0 + width);
+        const startY = Math.max(0, y0);
+        const endY = Math.min(rows, y0 + height);
+
+        if (startX >= endX || startY >= endY) return out;
+
+        for (let curY = startY; curY < endY; curY++) {
+            const rowOffset = curY * cols;
+            for (let curX = startX; curX < endX; curX++) {
+                if ((fields[rowOffset + curX] & 0xff) === 0) continue;
+                const slot = store.byKey[tileKey(curX, curY, zInt)];
+                if (slot && slot.field) {
+                    out.push(slot.field);
+                }
+            }
+        }
+        return out;
+    }
+
+    // Fallback when tileMap / layer.fields is not attached (e.g. standalone test stores)
     const tileCount = width * height;
-    if (tileCount > 0 && tileCount <= 512) {
+    if (tileCount <= 4096) {
         for (let dy = 0; dy < height; dy++) {
             const curY = y0 + dy;
             for (let dx = 0; dx < width; dx++) {
@@ -578,11 +637,11 @@ function listFieldsInRect(store, originX, originY, z, w, h) {
         }
         return out;
     }
+
     const x1 = x0 + width;
     const y1 = y0 + height;
-    const keys = Object.keys(store.byKey);
-    for (let i = 0; i < keys.length; i++) {
-        const slot = store.byKey[keys[i]];
+    for (const key in store.byKey) {
+        const slot = store.byKey[key];
         const f = slot && slot.field;
         if (!f) continue;
         if ((f.z | 0) !== zInt) continue;
@@ -617,5 +676,7 @@ module.exports = {
     deployFieldAndTriggerOccupants,
     purgeExpiredFields,
     seedMapFieldsFromTileMap,
+    seedFloorFields,
+    removeFieldsForFloor,
     listFieldsInRect
 };

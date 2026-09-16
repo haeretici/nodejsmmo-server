@@ -124,10 +124,18 @@ function testActiveSetSpawnAndSleepLifecycle() {
     session.x = 50;
     session.y = 50;
 
-    // Step 3: rat drops target; Step 4: enters sleep
-    world.step(3);
-    world.step(4);
-    assert.strictEqual(rat.simSleeping, true, 'creature sleeps when player moves far away');
+    // Lose target, leash home if pulled off spawn, then sleep
+    let slept = false;
+    for (let t = 3; t <= 40; t++) {
+        world.step(t);
+        if (rat.simSleeping) {
+            slept = true;
+            break;
+        }
+    }
+    assert.ok(slept, 'creature sleeps when player moves far away');
+    assert.strictEqual(rat.x, rat.spawnX);
+    assert.strictEqual(rat.y, rat.spawnY);
     assert.strictEqual(world.activeCreatures.size, 0, 'creature removed from activeCreatures');
     assert.strictEqual(world.activeCreatures.has(rat), false);
 
@@ -264,11 +272,18 @@ function testCombatWakeUpAndStickyChasing() {
     assert.strictEqual(mob.simSleeping, false, 'mob targeting player stays awake');
     assert.ok(world.activeCreatures.has(mob), 'mob targeting player stays in activeCreatures');
 
-    // 3. Clear target -> goes to sleep and leaves activeCreatures
+    // 3. Clear target -> leash home if off spawn, then sleep
     world.clearTarget(session.character.id);
     assert.strictEqual(mob.targetId, 0, 'targetId cleared by clearTarget');
-    world.step(4);
-    assert.strictEqual(mob.simSleeping, true, 'mob goes to sleep once target cleared');
+    let slept = false;
+    for (let t = 4; t <= 80; t++) {
+        world.step(t);
+        if (mob.simSleeping) {
+            slept = true;
+            break;
+        }
+    }
+    assert.ok(slept, 'mob goes to sleep once target cleared');
     assert.strictEqual(world.activeCreatures.has(mob), false, 'mob removed from activeCreatures');
 
     // 4. Swing wake-up: trySwing against sleeping mob wakes it up

@@ -30,7 +30,10 @@ const ENV_MAP = [
     ['GAME_COALESCE_PAYLOADS', ['limits', 'coalescePayloads'], toBool],
     ['GAME_COMPUTE_WORKERS', ['computeWorkers'], toWorkerSetting],
     ['GAME_COMPUTE_QUEUE_CAPACITY', ['computeQueueCapacity'], toInt],
-    ['GAME_COMPUTE_APPLY_DELAY_TICKS', ['computeApplyDelayTicks'], toInt]
+    ['GAME_COMPUTE_APPLY_DELAY_TICKS', ['computeApplyDelayTicks'], toInt],
+    ['GAME_PAGED_FLOORS', ['pagedFloors'], toBool],
+    ['GAME_FLOOR_IDLE_TIMEOUT_SEC', ['floorIdleTimeoutSec'], toInt],
+    ['GAME_FLOOR_SWEEP_INTERVAL_TICKS', ['floorSweepIntervalTicks'], toInt]
 ];
 
 function toWorkerSetting(v) {

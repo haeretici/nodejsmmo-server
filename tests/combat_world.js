@@ -277,9 +277,10 @@ function main() {
     assert.strictEqual(critter.critChance, 100);
     const hpBeforeCrit = critHunter.hp;
     w6.step(1);
-    assert.strictEqual(critHunter.hp, hpBeforeCrit - 11);
+    // crit multiply 10×1.10 = 11; unarmed mit (shielding 10 + def 5) floors that to 10
+    assert.strictEqual(critHunter.hp, hpBeforeCrit - 10);
     const critSwing = decodeSwing(lastOf(critHunter.socket, S2C.SWING).payload);
-    assert.strictEqual(critSwing.amount, 11);
+    assert.strictEqual(critSwing.amount, 10);
     assert.strictEqual(critSwing.flags & SWING_FLAG.CRIT, SWING_FLAG.CRIT);
     assert.strictEqual(critSwing.flags & SWING_FLAG.FATAL, 0);
     critHunter.kick(REASON.LOGOUT);

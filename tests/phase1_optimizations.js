@@ -91,6 +91,12 @@ function testDiscreteTickCooldowns() {
     // Cooldowns.tick is a no-op that doesn't throw or alter deadlines
     Cooldowns.tick(entity, 0.5);
     assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 1.5 } }, 110), false);
+
+    // logicUps !== 20: 0.10s at 10 UPS is 1 tick. Applied at tick 1, ready at tick 2.
+    // Hardcoded *20 would wait until tick 3.
+    Cooldowns.apply(entity, { item: { use: 0.10 } }, 1, 10);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 0.10 } }, 1), false);
+    assert.strictEqual(Cooldowns.canUse(entity, { item: { use: 0.10 } }, 2), true);
 }
 
 function testIntentQueueInPlaceTruncation() {

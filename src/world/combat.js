@@ -15,6 +15,42 @@ const FATAL_CHANCE_A = 0.05;
 const FATAL_CHANCE_B = 0.4;
 const FATAL_CHANCE_C = 0.05;
 const FATAL_DAMAGE_BONUS = 0.6;
+const SHIELD_BLOCK_MAX_PER_WINDOW = 2;
+const SHIELD_BLOCK_WINDOW_TICKS = 40;
+
+function checkCanBlock(defender, isMelee, element, currentTick, windowTicks) {
+    if (!defender) return false;
+    if (!isMelee || element !== 'physical') return false;
+    if (!defender.canBlock) return false;
+    const maxBlock = defender.maxBlock != null ? Number(defender.maxBlock) || 0 : 0;
+    if (maxBlock <= 0) return false;
+
+    const wTicks = windowTicks != null ? Number(windowTicks) : SHIELD_BLOCK_WINDOW_TICKS;
+    if (currentTick != null && Number.isFinite(Number(currentTick))) {
+        const tick = Number(currentTick);
+        if (defender.shieldBlockWindowTick == null || tick >= defender.shieldBlockWindowTick + wTicks) {
+            defender.shieldBlocksThisWindow = 0;
+            defender.shieldBlockWindowTick = tick;
+        }
+    } else if (defender.shieldBlocksThisWindow == null) {
+        defender.shieldBlocksThisWindow = 0;
+    }
+
+    if ((defender.shieldBlocksThisWindow || 0) >= SHIELD_BLOCK_MAX_PER_WINDOW) {
+        return false;
+    }
+    return true;
+}
+
+function spendShieldBlock(defender, currentTick) {
+    if (!defender) return;
+    defender.shieldBlocksThisWindow = (defender.shieldBlocksThisWindow || 0) + 1;
+    if (defender.shieldBlockWindowTick == null) {
+        defender.shieldBlockWindowTick = (currentTick != null && Number.isFinite(Number(currentTick)))
+            ? Number(currentTick)
+            : 0;
+    }
+}
 
 function chebyshev(ax, ay, bx, by) {
     return Math.max(Math.abs((ax | 0) - (bx | 0)), Math.abs((ay | 0) - (by | 0)));
@@ -266,10 +302,14 @@ function rollRaw(min, max, isCritical, critDamage, rng, critBand) {
  */
 function resolveMelee(attacker, defender, rng, opts) {
     const o = opts || {};
-    const kit = attacker && attacker.type === 'creature' ? kitAttack(attacker) : null;
-    const hitChance = kit
-        ? (kit.hitChance != null ? Number(kit.hitChance) : kit.chance != null ? Number(kit.chance) : 100)
-        : (attacker && attacker.hitChance != null ? Number(attacker.hitChance) : 100);
+    const kit = attacker && attacker.type === 'creature'
+        ? (o.kitAttack || o.attack || kitAttack(attacker))
+        : null;
+    const hitChance = o.hitChance != null
+        ? Number(o.hitChance)
+        : (kit
+            ? (kit.hitChance != null ? Number(kit.hitChance) : kit.chance != null ? Number(kit.chance) : 100)
+            : (attacker && attacker.hitChance != null ? Number(attacker.hitChance) : 100));
     if (o.hit === false || (o.hit !== true && !rollHit(hitChance, rng))) {
         return missResult();
     }
@@ -279,13 +319,28 @@ function resolveMelee(attacker, defender, rng, opts) {
         ? !!o.critical
         : rollCritical(critChanceFor(attacker), rng);
 
+    const extraAtk = Math.max(0, Number(
+        o.extraAtk != null
+            ? o.extraAtk
+            : (attacker && attacker.extraAtk != null ? attacker.extraAtk : 0)
+    ) || 0);
+    const extraAtkElement = (
+        o.extraAtkElement ||
+        (attacker && attacker.extraAtkElement) ||
+        null
+    );
+    const extraEl = extraAtkElement ? String(extraAtkElement).toLowerCase() : null;
+
     let raw;
+    const baseAtk = playerAtk(attacker, o);
+    const combinedAtk = (!kit && extraAtk > 0 && extraEl) ? (baseAtk + extraAtk) : baseAtk;
+
     if (kit) {
         raw = rollRaw(kit.min, kit.max, isCritical, critDamageFor(attacker), rng, critBand);
     } else {
         const bounds = meleeAutoBounds(
             attacker && attacker.level,
-            playerAtk(attacker, o),
+            combinedAtk,
             playerSkill(attacker),
             o.factor
         );
@@ -304,20 +359,76 @@ function resolveMelee(attacker, defender, rng, opts) {
         if (isFatal) raw = applyFatalBonus(raw);
     }
 
-    const mit = Math.max(0, Math.min(100, Number(defender && defender.mitigation) || 0));
-    let remaining = raw * (1 - mit / 100);
+    const currentTick = o.currentTick != null
+        ? o.currentTick
+        : (o.tickIndex != null ? o.tickIndex : (attacker && attacker.currentTick != null ? attacker.currentTick : null));
 
+    const isDual = !kit && extraAtk > 0 && !!extraEl && combinedAtk > 0;
+    const isMelee = o.isMelee !== undefined ? !!o.isMelee : true;
+    const mit = Math.max(0, Math.min(100, Number(defender && defender.mitigation) || 0));
     const resists = defender && defender.resists;
+
+    if (isDual) {
+        const elemShare = Math.min(1, extraAtk / combinedAtk);
+        const elemRaw = Math.round(raw * elemShare);
+        const physRaw = Math.max(0, raw - elemRaw);
+
+        let physRemaining = physRaw * (1 - mit / 100);
+        const physResist = resists && resists.physical != null ? Number(resists.physical) : 0;
+        physRemaining = physRemaining * (1 - Math.max(0, Math.min(100, physResist)) / 100);
+        physRemaining = Math.max(0, physRemaining);
+
+        const maxBlock = defender && defender.maxBlock != null ? defender.maxBlock : 0;
+        const canBlock = checkCanBlock(defender, isMelee, 'physical', currentTick, o.windowTicks);
+        let shieldBlock = 0;
+        if (canBlock) {
+            shieldBlock = Math.min(rollShieldBlock(maxBlock, rng), physRemaining);
+            physRemaining -= shieldBlock;
+            spendShieldBlock(defender, currentTick);
+        }
+
+        const armorReduction = Math.min(rollArmorReduction(defender && defender.armor, rng), physRemaining);
+        physRemaining -= armorReduction;
+        const physFinal = Math.max(0, Math.floor(physRemaining));
+
+        let elemRemaining = elemRaw * (1 - mit / 100);
+        const elemResist = resists && resists[extraEl] != null ? Number(resists[extraEl]) : 0;
+        elemRemaining = elemRemaining * (1 - Math.max(0, Math.min(100, elemResist)) / 100);
+        elemRemaining = Math.max(0, elemRemaining);
+        const elemFinal = Math.max(0, Math.floor(elemRemaining));
+
+        const final = physFinal + elemFinal;
+        return {
+            miss: false,
+            hit: true,
+            raw,
+            final,
+            critical: isCritical,
+            fatal: isFatal,
+            shieldBlock,
+            armorReduction,
+            blockChargeSpent: canBlock,
+            element: 'physical',
+            extraAtkElement: extraEl,
+            elemRaw,
+            physRaw,
+            physFinal,
+            elemFinal
+        };
+    }
+
+    let remaining = raw * (1 - mit / 100);
     const resist = resists && resists[element] != null ? Number(resists[element]) : 0;
     remaining = remaining * (1 - Math.max(0, Math.min(100, resist)) / 100);
-
     remaining = Math.max(0, remaining);
+
     const maxBlock = defender && defender.maxBlock != null ? defender.maxBlock : 0;
-    const canBlock = !!(defender && defender.canBlock && maxBlock > 0 && element === 'physical');
+    const canBlock = checkCanBlock(defender, isMelee, element, currentTick, o.windowTicks);
     let shieldBlock = 0;
     if (canBlock) {
         shieldBlock = Math.min(rollShieldBlock(maxBlock, rng), remaining);
         remaining -= shieldBlock;
+        spendShieldBlock(defender, currentTick);
     }
 
     let armorReduction = 0;
@@ -336,7 +447,8 @@ function resolveMelee(attacker, defender, rng, opts) {
         fatal: isFatal,
         shieldBlock,
         armorReduction,
-        blockChargeSpent: canBlock
+        blockChargeSpent: canBlock,
+        element
     };
 }
 
@@ -415,6 +527,38 @@ function resolveWandAuto(attacker, defender, rng, opts) {
         element,
         manaGain
     };
+}
+
+/**
+ * Authoritative distance weapon auto-attack (bow, crossbow, spear, throwing).
+ * Uses effectiveAtk = weapon.atk + ammo.atk, and attacker.hitChance.
+ * Standard auto formula:
+ * min = levelBonus, max = ceil(0.102 * effectiveAtk * skills.distance + levelBonus).
+ * Non-crit: gaussian N(0.5, 0.25). Crit: auto_st raised floor.
+ * Always isMelee: false — physical arrows still take armor, never shield block.
+ * Subject to defender mitigation%, resists[element]%, armor reduction.
+ */
+function resolveDistanceAuto(attacker, defender, rng, opts) {
+    const o = opts || {};
+    return resolveMelee(attacker, defender, rng, Object.assign({}, o, { isMelee: false }));
+}
+
+/**
+ * Authoritative creature kit attack resolution (melee or ranged).
+ * Uses attack row from creature.attacks (min, max, range, element, hitChance, chance).
+ * Physical melee attacks can be shield-blocked; ranged or non-physical attacks bypass shield block.
+ * Physical attacks are subject to armor reduction; elemental bypasses armor reduction.
+ */
+function resolveCreatureAttack(attacker, defender, attack, rng, opts) {
+    const o = opts || {};
+    const atk = attack || kitAttack(attacker);
+    const isMelee = o.isMelee !== undefined
+        ? !!o.isMelee
+        : ((atk && atk.range != null) ? Number(atk.range) <= 1 : (atk && atk.kind === 'melee'));
+    return resolveMelee(attacker, defender, rng, Object.assign({}, o, {
+        kitAttack: atk,
+        isMelee
+    }));
 }
 
 function meleeRangeOk(a, b) {
@@ -578,15 +722,11 @@ function applyMitigation(raw, element, defender, opts) {
     const elementReduction = dmg * (resistPct / 100);
     dmg -= elementReduction;
     let shieldBlock = 0;
-    if (
-        options.isMelee &&
-        el === 'physical' &&
-        defender &&
-        defender.canBlock &&
-        (defender.maxBlock || 0) > 0
-    ) {
+    const canBlock = checkCanBlock(defender, !!options.isMelee, el, options.currentTick, options.windowTicks);
+    if (canBlock) {
         shieldBlock = Math.min(rollShieldBlock(defender.maxBlock, rng), dmg);
         dmg -= shieldBlock;
+        spendShieldBlock(defender, options.currentTick);
     }
     let armorReduction = 0;
     if (el === 'physical' && defender && (defender.armor || 0) > 0) {
@@ -601,7 +741,7 @@ function applyMitigation(raw, element, defender, opts) {
         shieldBlock,
         armorReduction,
         element: el,
-        blockChargeSpent: shieldBlock > 0
+        blockChargeSpent: canBlock
     };
 }
 
@@ -708,6 +848,10 @@ module.exports = {
     CRIT_BAND_MULTIPLY,
     AUTO_ST_CRIT_FLOOR,
     FATAL_DAMAGE_BONUS,
+    SHIELD_BLOCK_MAX_PER_WINDOW,
+    SHIELD_BLOCK_WINDOW_TICKS,
+    checkCanBlock,
+    spendShieldBlock,
     chebyshev,
     levelBonus,
     meleeAutoBounds,
@@ -727,6 +871,8 @@ module.exports = {
     playerSkill,
     resolveMelee,
     resolveWandAuto,
+    resolveDistanceAuto,
+    resolveCreatureAttack,
     meleeRangeOk,
     getMagicSpellParameters,
     getMeleeSpellParameters,

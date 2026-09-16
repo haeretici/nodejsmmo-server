@@ -598,6 +598,7 @@ function onWorldPinStep(entity, prevTile, nextTile, instances, nowSec) {
     return fired;
 }
 
+/** nowSec is World.logicNow (tickIndex / ups), not Date.now. */
 function tickWorldPinCooldowns(instances, nowSec) {
     const now = Number(nowSec);
     if (!Number.isFinite(now)) return 0;
@@ -627,6 +628,7 @@ function tickWorldPinCooldowns(instances, nowSec) {
     return n;
 }
 
+/** nowSec is World.logicNow (tickIndex / ups). decayAt is logic seconds. */
 function tickWorldPinDecay(instances, nowSec, tileMap) {
     const now = Number(nowSec);
     if (!Number.isFinite(now)) return [];
