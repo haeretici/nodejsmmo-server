@@ -1,6 +1,7 @@
 'use strict';
 
 const { DIR } = require('../protocol/opcodes');
+const { copyNpcWanderFields } = require('./npc');
 
 function dirFromDelta(dx, dy) {
     const adx = Math.abs(dx | 0);
@@ -153,6 +154,14 @@ class Creature {
         this.dialog = (template && template.dialog) || null;
         this.dialogId = (template && template.dialogId) || null;
         this.shop = (template && template.shop) || (this.dialog && this.dialog.shop) || null;
+        this.walkInterval = 0;
+        this.walkRadius = 0;
+        this.voices = null;
+        this.voiceInterval = 0;
+        this.voiceChance = 0;
+        this._npcWalkTicks = 0;
+        this._npcVoiceTicks = 0;
+        if (isNpc) copyNpcWanderFields(this, template);
         this.targetDistance = flags.targetDistance != null ? Math.max(1, flags.targetDistance | 0) : 1;
         this.aggroRange = flags.aggroRange == null ? 7 : flags.aggroRange | 0;
         this.loseTargetDistance = flags.loseTargetDistance == null ? 12 : flags.loseTargetDistance | 0;
@@ -219,6 +228,13 @@ class Creature {
         this.dialog = null;
         this.dialogId = null;
         this.shop = null;
+        this.walkInterval = 0;
+        this.walkRadius = 0;
+        this.voices = null;
+        this.voiceInterval = 0;
+        this.voiceChance = 0;
+        this._npcWalkTicks = 0;
+        this._npcVoiceTicks = 0;
         this.targetDistance = 1;
         this.aggroRange = 7;
         this.loseTargetDistance = 12;

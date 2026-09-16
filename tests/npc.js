@@ -10,7 +10,15 @@ const {
     resolveShop,
     listShopRows,
     talkRangeOk,
-    isNpcEntity
+    isNpcEntity,
+    SPECTATOR_RANGE,
+    normalizeVoices,
+    copyNpcWanderFields,
+    hasNpcIdle,
+    intervalMsToTicks,
+    inWalkZone,
+    npcIsInConversation,
+    hasNearbySpectator
 } = require('../src/world/npc');
 
 function main() {
@@ -52,6 +60,37 @@ function main() {
     assert.strictEqual(talkRangeOk({ x: 12, y: 12, z: 0 }, { x: 12, y: 8, z: 0 }, 3), false);
     assert.ok(isNpcEntity({ type: 'npc', isNpc: true }));
     assert.ok(!isNpcEntity({ type: 'creature' }));
+
+    assert.deepStrictEqual(normalizeVoices(['Hi', '  ', { text: 'Yo', yellText: true }]), [
+        { text: 'Hi', yell: false },
+        { text: 'Yo', yell: true }
+    ]);
+    const dest = {};
+    copyNpcWanderFields(dest, {
+        walkInterval: 2000,
+        walkRadius: 2,
+        voiceVector: [{ text: 'A', yellText: true }],
+        yellSpeedTicks: 15000,
+        yellChance: 25
+    });
+    assert.strictEqual(dest.walkInterval, 2000);
+    assert.strictEqual(dest.walkRadius, 2);
+    assert.strictEqual(dest.voiceInterval, 15000);
+    assert.strictEqual(dest.voiceChance, 25);
+    assert.deepStrictEqual(dest.voices, [{ text: 'A', yell: true }]);
+    assert.strictEqual(hasNpcIdle(dest), true);
+    assert.strictEqual(hasNpcIdle({}), false);
+    assert.strictEqual(SPECTATOR_RANGE, 8);
+    assert.strictEqual(intervalMsToTicks(2000, 20), 40);
+    assert.strictEqual(intervalMsToTicks(0, 20), 0);
+    const home = { x: 5, y: 5, z: 0 };
+    assert.strictEqual(inWalkZone(home, { x: 7, y: 5, z: 0 }, 2), true);
+    assert.strictEqual(inWalkZone(home, { x: 8, y: 5, z: 0 }, 2), false);
+    const npc = { id: 9, x: 5, y: 5, z: 0 };
+    assert.strictEqual(npcIsInConversation(npc, [{ talkNpcId: 9 }]), true);
+    assert.strictEqual(npcIsInConversation(npc, [{ talkNpcId: 0 }]), false);
+    assert.strictEqual(hasNearbySpectator(npc, [{ x: 5, y: 13, z: 0, hp: 10 }], 8), true);
+    assert.strictEqual(hasNearbySpectator(npc, [{ x: 5, y: 14, z: 0, hp: 10 }], 8), false);
 
     console.log('ok npc');
 }

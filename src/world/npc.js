@@ -304,6 +304,178 @@ function clampDealCount(raw) {
     return n > MAX_DEAL_COUNT ? MAX_DEAL_COUNT : n;
 }
 
+/** Fallback spectator Chebyshev when AI tick radius is not a positive number. */
+const SPECTATOR_RANGE = 8;
+
+const CARDINALS = Object.freeze([
+    { dx: 0, dy: -1 },
+    { dx: -1, dy: 0 },
+    { dx: 1, dy: 0 },
+    { dx: 0, dy: 1 }
+]);
+
+function nonNegInt(raw) {
+    if (raw == null || raw === '') return 0;
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function chancePct(raw) {
+    const n = nonNegInt(raw);
+    return n > 100 ? 100 : n;
+}
+
+function normalizeVoices(raw) {
+    const list = Array.isArray(raw) ? raw : [];
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+        const row = list[i];
+        if (row == null) continue;
+        if (typeof row === 'string') {
+            const text = row.trim();
+            if (text) out.push({ text, yell: false });
+            continue;
+        }
+        if (typeof row !== 'object') continue;
+        const text = String(row.text != null ? row.text : '').trim();
+        if (!text) continue;
+        out.push({
+            text,
+            yell: row.yell === true || row.yellText === true
+        });
+    }
+    return out;
+}
+
+function copyNpcWanderFields(creature, template) {
+    if (!creature || !template || typeof template !== 'object') return creature;
+    if (template.walkInterval != null) {
+        creature.walkInterval = nonNegInt(template.walkInterval);
+    }
+    if (template.walkRadius != null) {
+        creature.walkRadius = nonNegInt(template.walkRadius);
+    }
+    const rawVoices =
+        template.voices != null
+            ? template.voices
+            : template.voiceVector != null
+              ? template.voiceVector
+              : null;
+    if (rawVoices != null) {
+        creature.voices = normalizeVoices(rawVoices);
+    }
+    const intervalRaw =
+        template.voiceInterval != null
+            ? template.voiceInterval
+            : template.yellSpeedTicks;
+    if (intervalRaw != null) {
+        creature.voiceInterval = nonNegInt(intervalRaw);
+    }
+    const chanceRaw =
+        template.voiceChance != null
+            ? template.voiceChance
+            : template.yellChance;
+    if (chanceRaw != null) {
+        creature.voiceChance = chancePct(chanceRaw);
+    }
+    return creature;
+}
+
+function hasNpcIdle(npc) {
+    if (!npc) return false;
+    if (npc.walkInterval > 0) return true;
+    return !!(
+        npc.voiceInterval > 0 &&
+        npc.voices &&
+        npc.voices.length
+    );
+}
+
+function intervalMsToTicks(ms, logicUps) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    const ups = (logicUps | 0) || 20;
+    return Math.max(1, Math.round((n / 1000) * ups));
+}
+
+function inWalkZone(home, dest, radius) {
+    if (!home || !dest || !(radius > 0)) return false;
+    if (home.x == null || home.y == null || dest.x == null || dest.y == null) {
+        return false;
+    }
+    if ((home.z | 0) !== (dest.z | 0)) return false;
+    return (
+        Math.abs((dest.x | 0) - (home.x | 0)) <= radius &&
+        Math.abs((dest.y | 0) - (home.y | 0)) <= radius
+    );
+}
+
+function npcHomeTile(npc) {
+    if (!npc) return null;
+    return {
+        x: npc.spawnX | 0,
+        y: npc.spawnY | 0,
+        z: npc.spawnZ | 0
+    };
+}
+
+function npcIsInConversation(npc, players) {
+    if (!npc || npc.id == null || !Array.isArray(players)) return false;
+    for (let i = 0; i < players.length; i++) {
+        const p = players[i];
+        if (p && (p.talkNpcId | 0) === (npc.id | 0) && p.talkNpcId) return true;
+    }
+    return false;
+}
+
+function hasNearbySpectator(npc, players, range) {
+    if (!npc || !Array.isArray(players) || !players.length) return false;
+    const r = range != null ? Number(range) : SPECTATOR_RANGE;
+    if (!Number.isFinite(r) || r < 0) return false;
+    const nz = npc.z | 0;
+    for (let i = 0; i < players.length; i++) {
+        const p = players[i];
+        if (!p) continue;
+        if (p.dead || p.downed) continue;
+        if ((p.hp | 0) <= 0) continue;
+        if ((p.z | 0) !== nz) continue;
+        const d = Math.max(
+            Math.abs((p.x | 0) - (npc.x | 0)),
+            Math.abs((p.y | 0) - (npc.y | 0))
+        );
+        if (d <= r) return true;
+    }
+    return false;
+}
+
+function shuffledCardinals(rng) {
+    const dirs = CARDINALS.slice();
+    const rand = typeof rng === 'function' ? rng : Math.random;
+    for (let i = dirs.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        const tmp = dirs[i];
+        dirs[i] = dirs[j];
+        dirs[j] = tmp;
+    }
+    return dirs;
+}
+
+function canNpcWalkTo(npc, dir, tileMap) {
+    if (!npc || !dir || !tileMap) return false;
+    const radius = nonNegInt(npc.walkRadius);
+    if (!(radius > 0)) return false;
+    const home = npcHomeTile(npc);
+    if (!home) return false;
+    const dest = {
+        x: (npc.x | 0) + (dir.dx | 0),
+        y: (npc.y | 0) + (dir.dy | 0),
+        z: npc.z | 0
+    };
+    if (!inWalkZone(home, dest, radius)) return false;
+    if (!tileMap.canEnter(dest.x, dest.y, dest.z, npc)) return false;
+    return true;
+}
+
 function resolveDialog(source, dialogDb) {
     if (!source) return null;
     if (typeof source === 'string') {
@@ -330,6 +502,7 @@ module.exports = {
     DEFAULT_TALK_RANGE,
     DEFAULT_CURRENCY,
     MAX_DEAL_COUNT,
+    SPECTATOR_RANGE,
     isNpcEntity,
     talkRangeOk,
     normalizeItemSpec,
@@ -347,5 +520,16 @@ module.exports = {
     resolveShop,
     listShopRows,
     findShopRow,
-    clampDealCount
+    clampDealCount,
+    nonNegInt,
+    normalizeVoices,
+    copyNpcWanderFields,
+    hasNpcIdle,
+    intervalMsToTicks,
+    inWalkZone,
+    npcHomeTile,
+    npcIsInConversation,
+    hasNearbySpectator,
+    shuffledCardinals,
+    canNpcWalkTo
 };

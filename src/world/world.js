@@ -137,6 +137,7 @@ const { parseClock, msUntilClock, globalSaveMessage } = require('./clock_save');
 const { PersistGate } = require('../persist/persist_gate');
 const {
     DEFAULT_TALK_RANGE,
+    SPECTATOR_RANGE,
     isNpcEntity,
     talkRangeOk,
     normalizeDialog,
@@ -148,7 +149,13 @@ const {
     listShopRows,
     findShopRow,
     evalWhen,
-    clampDealCount
+    clampDealCount,
+    hasNpcIdle,
+    intervalMsToTicks,
+    npcIsInConversation,
+    hasNearbySpectator,
+    shuffledCardinals,
+    canNpcWalkTo
 } = require('./npc');
 const {
     WORLD_PIN_ID_BASE,
@@ -180,7 +187,8 @@ const {
     deployFieldAndTriggerOccupants,
     purgeExpiredFields,
     listFieldsInRect,
-    getFieldKind
+    getFieldKind,
+    getFieldOnTile
 } = require('./fields');
 const {
     indexSpellBook,
@@ -1161,6 +1169,7 @@ class World {
             for (const cr of this.activeCreatures) {
                 this.tickCreature(cr, tickIndex);
             }
+            this.tickNpcIdle(tickIndex);
             this.tickWorldPins(tickIndex);
             this.tickCombatStatus(tickIndex);
             this.tickCorpses(tickIndex);
@@ -1910,6 +1919,114 @@ class World {
         );
         this.broadcastMove(cr, from, dir);
         this.applyWorldPinStep(cr, from, tickIndex);
+        return true;
+    }
+
+    npcSpectatorRange() {
+        return SPECTATOR_RANGE;
+    }
+
+    tickNpcIdle(tickIndex) {
+        if (!this.players.size) return;
+        const range = this.npcSpectatorRange();
+        const players = [];
+        for (const p of this.players.values()) {
+            if (p.dead || p.downed) continue;
+            players.push(p);
+        }
+        if (!players.length) return;
+
+        const seen = new Set();
+        for (let i = 0; i < players.length; i++) {
+            const p = players[i];
+            const candidates = this.creatureSpatial
+                ? this.creatureSpatial.queryChunkCandidates(p.x, p.y, p.z, range)
+                : this.creatures.values();
+            for (const cr of candidates) {
+                if (!cr || seen.has(cr.id)) continue;
+                if (!isNpcEntity(cr)) continue;
+                if ((cr.hp | 0) <= 0) continue;
+                if ((cr.z | 0) !== (p.z | 0)) continue;
+                if (chebyshev(cr.x | 0, cr.y | 0, p.x | 0, p.y | 0) > range) continue;
+                seen.add(cr.id);
+                if (!hasNpcIdle(cr)) continue;
+                this.tickNpcVoices(cr, players, range);
+                this.tickNpcWander(cr, tickIndex, players, range);
+            }
+        }
+    }
+
+    tickNpcWander(npc, tickIndex, players, range) {
+        if (!npc || !(npc.walkInterval > 0)) return false;
+        if (!(npc.speed > 0)) return false;
+        if (npc.aggro === true) return false;
+        if (npcIsInConversation(npc, players)) {
+            npc._npcWalkTicks = 0;
+            return false;
+        }
+        if (!hasNearbySpectator(npc, players, range)) return false;
+
+        const intervalTicks = intervalMsToTicks(
+            npc.walkInterval,
+            (this.settings && this.settings.logicUps) || 20
+        );
+        if (!(intervalTicks > 0)) return false;
+        npc._npcWalkTicks = (npc._npcWalkTicks | 0) + 1;
+        if (npc._npcWalkTicks < intervalTicks) return false;
+        npc._npcWalkTicks = 0;
+
+        if (tickIndex < (npc.moveReadyTick | 0)) return false;
+        const from = { x: npc.x | 0, y: npc.y | 0, z: npc.z | 0 };
+        const dirs = shuffledCardinals(this.rng);
+        for (let i = 0; i < dirs.length; i++) {
+            const dir = dirs[i];
+            if (!canNpcWalkTo(npc, dir, this.tileMap)) continue;
+            const nx = from.x + (dir.dx | 0);
+            const ny = from.y + (dir.dy | 0);
+            if (this.fieldStore && getFieldOnTile(this.fieldStore, nx, ny, from.z)) continue;
+            if (!this.tileMap.moveEntityToTile(nx, ny, from.z, npc)) continue;
+            const face = dirFromDelta((npc.x | 0) - from.x, (npc.y | 0) - from.y);
+            npc.dir = face;
+            npc.path = [];
+            npc.moveReadyTick = tickIndex + this.stepDelay(
+                npc,
+                this.tileMap.frictionAt(npc.x, npc.y, npc.z),
+                false
+            );
+            this.broadcastMove(npc, from, face);
+            this.applyWorldPinStep(npc, from, tickIndex);
+            return true;
+        }
+        return false;
+    }
+
+    tickNpcVoices(npc, players, range) {
+        if (!npc || !(npc.voiceInterval > 0)) return false;
+        const voices = Array.isArray(npc.voices) ? npc.voices : [];
+        if (!voices.length) return false;
+        if (!hasNearbySpectator(npc, players, range)) return false;
+
+        const intervalTicks = intervalMsToTicks(
+            npc.voiceInterval,
+            (this.settings && this.settings.logicUps) || 20
+        );
+        if (!(intervalTicks > 0)) return false;
+        npc._npcVoiceTicks = (npc._npcVoiceTicks | 0) + 1;
+        if (npc._npcVoiceTicks < intervalTicks) return false;
+        npc._npcVoiceTicks = 0;
+
+        const chance = npc.voiceChance | 0;
+        if (chance <= 0) return false;
+        const rng = this.rng || Math.random;
+        const roll = Math.floor(rng() * 100) + 1;
+        if (roll > chance) return false;
+
+        const pick = voices[Math.floor(rng() * voices.length)] || voices[0];
+        if (!pick || !pick.text) return false;
+        const payload = encodeSay(pick.text);
+        this.broadcastToViewers(npc.x, npc.y, npc.z, (p) => {
+            p.send(S2C.SAY, payload);
+        });
         return true;
     }
 

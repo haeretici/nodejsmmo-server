@@ -10,7 +10,7 @@
 - Spells, fields, conditions.
 - SQL on the tick.
 - Load HuntDL `presets/`. Live kits come from `../content`. Built-in `rat` / `dummy` / `guide` are test fallbacks only.
-- Lua VM, wander/voices, bank/depot. Quickloot.
+- Lua VM, bank/depot. Quickloot.
 - Furniture stamps as behavior (pins are `world[]` in RAM).
 
 ## Pins
@@ -84,7 +84,7 @@ Player HP 0: leave tile, `DEATH`, others `DISAPPEAR`, `downed` (not socket `dead
 
 ## NPC
 
-`guide` occupies an empty tile (same as creatures). Not attackable (`SET_TARGET` → `BLOCKED`). Talk range Chebyshev ≤ 3, same `z`. Walk out of range → `DIALOG_CLOSE`. Shop currency `gold_coin`. Quest flag `guide.mission` in `character_state.storage`. Missing dialog → `SAY` “Nothing to say.”
+`guide` occupies an empty tile (same as creatures). Not attackable (`SET_TARGET` → `BLOCKED`). Talk range Chebyshev ≤ 3, same `z`. Walk out of range → `DIALOG_CLOSE`. Shop currency `gold_coin`. Quest flag `guide.mission` in `character_state.storage`. Missing dialog → `SAY` “Nothing to say.” Idle walk: copy `walkInterval` (ms → ticks via `logicUps`) / `walkRadius` / `voices` on NPC init. Cardinal step in Chebyshev radius of spawn when a living player is within Chebyshev **8**, same `z`. Freeze walk while any `talkNpcId` is this NPC. `aggro === true` does not wander. Voices `S2C.SAY` to viewers (no combat). NPCs stay off `activeCreatures` / `tickCreatureAi`.
 
 ## Persist (off tick)
 
@@ -103,7 +103,7 @@ Logout always. Interval (1 hour) and wall-clock save all online. Loot/shop/quest
 | `src/world/creature.js` | spawn + speed / push flags |
 | `src/world/pathfinder.js` | A* |
 | `src/world/path_budget.js` | optional repath budget |
-| `src/world/npc.js` | dialog / `when` / shop |
+| `src/world/npc.js` | dialog / `when` / shop / wander fields |
 | `src/world/snapshot.js` | persist clone |
 | `src/world/world.js` | tick: intents → chase/swing → on_demand pins → AI → decay |
 | `src/world/spawn_pins.js` | pin catalog / AOI / respawn seconds |
@@ -112,4 +112,4 @@ Logout always. Interval (1 hour) and wall-clock save all online. Loot/shop/quest
 
 ## Remaining
 
-Conditions, **trap fields**. Threat/`changeTarget`/`strategiesTarget`, defense kit, area/wave kit, summons. ML from mana spend waits P12. Talkable NPCs without inline dialog stay skipped (P15). Lever `wave` is a no-op (Hunt Simulator leftover). Do not load HuntDL `presets/`.
+Conditions, **trap fields**. Threat/`changeTarget`/`strategiesTarget`, defense kit, area/wave kit, summons. ML from mana spend waits P12. Bank/depot. Lever `wave` is a no-op (Hunt Simulator leftover). Do not load HuntDL `presets/`.
