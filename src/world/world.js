@@ -117,6 +117,7 @@ const {
     resolveSpawnMode,
     spawnActivateMargin,
     spawnDespawnIdleTicks,
+    spawnDespawnHomeDist,
     pinSkipReason,
     respawnDelayTicks,
     inSpawnAoi,
@@ -169,8 +170,9 @@ const {
     useWorldPin,
     useWorldToolWith,
     onWorldPinStep,
-    tickWorldPinCooldowns,
-    tickWorldPinDecay
+    tickWorldPinDeadlineQueue,
+    nextWorldPinDeadline,
+    enqueueWorldPinDeadline
 } = require('./world_pin_actions');
 const Cooldowns = require('./cooldowns');
 const {
@@ -250,6 +252,7 @@ class World {
         this.byAccount = new Map();
         this.creatures = new Map();
         this.activeCreatures = new Set();
+        this._aoiFrame = null;
         const poolCap = (opts.settings && opts.settings.creaturePoolCapacity != null)
             ? opts.settings.creaturePoolCapacity
             : 4096;
@@ -279,6 +282,7 @@ class World {
         this.worldPinById = new Map();
         this.worldPinByNumeric = new Map();
         this.worldPinsByTile = new Map();
+        this.worldPinDeadlines = [];
         this.worldPinLever = { state: Object.create(null), snapshots: Object.create(null) };
         this._persistTails = new Map();
         this._persistGate = new PersistGate(
@@ -571,6 +575,7 @@ class World {
         this.worldPinById = new Map();
         this.worldPinByNumeric = new Map();
         this.worldPinsByTile = new Map();
+        this.worldPinDeadlines = [];
         if (this.worldPinSpatial) this.worldPinSpatial.clear();
         this.worldPinLever = { state: Object.create(null), snapshots: Object.create(null) };
         const seeded = seedWorldPinInstances(
@@ -591,6 +596,14 @@ class World {
         this.worldPinByNumeric.set(inst.id, inst);
         this.worldPinsByTile.set(worldPinTileKey(inst.x, inst.y, inst.z), inst);
         if (this.worldPinSpatial) this.worldPinSpatial.insert(inst);
+        this.scheduleWorldPinDeadline(inst, 0);
+    }
+
+    scheduleWorldPinDeadline(inst, nowSec) {
+        if (!inst || inst.removed) return;
+        const at = nextWorldPinDeadline(inst, nowSec);
+        if (at == null) return;
+        enqueueWorldPinDeadline(this.worldPinDeadlines, at, inst.id);
     }
 
     worldPinAt(x, y, z) {
@@ -697,12 +710,14 @@ class World {
         if (maxLiving > 0 && !pin.eager && this.livingPins && this.livingPins.size >= maxLiving) {
             const victim = this.pickBudgetVictim(null, pin);
             if (!victim) return null;
-            this.despawnPin(victim);
+            this.despawnPin(victim, { reason: 'budget', tickIndex });
         }
-        const creature = this.spawnCreature(pin.kind, pin.x, pin.y, pin.z, {
-            pinIndex: pin.index,
-            appear: opts && opts.appear
-        });
+        const creature = pin.parkedEntity
+            ? this.unparkPin(pin, tickIndex, opts)
+            : this.spawnCreature(pin.kind, pin.x, pin.y, pin.z, {
+                pinIndex: pin.index,
+                appear: opts && opts.appear
+            });
         if (!creature) {
             pin.readyTick = (tickIndex | 0) + 20;
             return null;
@@ -710,17 +725,55 @@ class World {
         pin.state = 'living';
         pin.entityId = creature.id;
         pin.idleTicks = 0;
+        pin.parkedEntity = null;
         if (this.livingPins) this.livingPins.add(pin);
         creature.spawnX = pin.x;
         creature.spawnY = pin.y;
         creature.spawnZ = pin.z;
+        creature.pinIndex = pin.index;
+        this.noteAoiCreature(creature);
         return creature;
     }
 
-    despawnPin(pin) {
+    unparkPin(pin, tickIndex, opts) {
+        const creature = pin.parkedEntity;
+        if (!creature) return null;
+        const appear = !opts || opts.appear !== false;
+        let x = creature.x | 0;
+        let y = creature.y | 0;
+        let z = creature.z != null ? creature.z | 0 : pin.z | 0;
+        if (!this.tileMap.enterTile(x, y, z, creature)) {
+            const alt = this.tileMap.findNearestEnterable(x, y, z, creature)
+                || this.tileMap.findNearestEnterable(pin.x, pin.y, pin.z, creature);
+            if (!alt || !this.tileMap.enterTile(alt.x, alt.y, alt.z, creature)) {
+                return null;
+            }
+            x = alt.x;
+            y = alt.y;
+            z = alt.z;
+            creature.x = x;
+            creature.y = y;
+            creature.z = z;
+        }
+        creature.targetId = 0;
+        creature.leashing = false;
+        if (Array.isArray(creature.path)) creature.path.length = 0;
+        this.creatures.set(creature.id, creature);
+        if (this.creatureSpatial) this.creatureSpatial.insert(creature);
+        if (!creature.simSleeping && (creature.hp | 0) > 0 && !isNpcEntity(creature)) {
+            this.activeCreatures.add(creature);
+        }
+        if (appear) this.broadcastAppear(creature);
+        return creature;
+    }
+
+    despawnPin(pin, opts) {
         if (!pin || pin.state !== 'living' || pin.eager) return;
+        const reason = (opts && opts.reason) || 'idle_aoi';
+        const tickIndex = opts && opts.tickIndex != null ? opts.tickIndex : this._tickIndex;
         if (this.livingPins) this.livingPins.delete(pin);
         const creature = this.creatures.get(pin.entityId);
+        const park = (reason === 'idle_aoi' || reason === 'budget') && creature && (creature.hp | 0) > 0;
         if (creature) {
             if (this.computeService) {
                 this.computeService.cancelEntityJobs(creature.id);
@@ -734,11 +787,35 @@ class World {
             this.broadcastToViewers(creature.x, creature.y, creature.z, (p) => {
                 p.send(S2C.DISAPPEAR, encodeDisappear(creature.id));
             });
-            if (this.creaturePool) this.creaturePool.release(creature);
+            if (park) {
+                creature.simSleeping = true;
+                creature.targetId = 0;
+                creature.leashing = false;
+                if (Array.isArray(creature.path)) creature.path.length = 0;
+                pin.parkedEntity = creature;
+            } else {
+                pin.parkedEntity = null;
+                if (this.creaturePool) this.creaturePool.release(creature);
+            }
+        } else {
+            pin.parkedEntity = null;
         }
-        pin.state = 'idle';
         pin.entityId = 0;
         pin.idleTicks = 0;
+        if (reason === 'home_distance' || reason === 'home_floor') {
+            pin.parkedEntity = null;
+            const delay = respawnDelayTicks(pin, this.settings);
+            if (delay <= 0) {
+                pin.state = 'skipped';
+                pin.skipReason = 'oneshot';
+                pin.readyTick = 0;
+            } else {
+                pin.state = 'cooldown';
+                pin.readyTick = (tickIndex | 0) + delay;
+            }
+            return;
+        }
+        pin.state = 'idle';
         pin.readyTick = 0;
     }
 
@@ -795,12 +872,24 @@ class World {
         return bestPin;
     }
 
-    tickSpawnPins(tickIndex, opts) {
-        if (!this.spawnPins.length) return;
-        const appear = !opts || opts.appear !== false;
+    invalidateAoiFrame() {
+        this._aoiFrame = null;
+    }
+
+    aoiFrameKey(tickIndex, observers, radius, margin) {
+        let key = (tickIndex | 0) + '|' + (radius | 0) + '|' + (margin | 0) + '|' + observers.length;
+        for (let i = 0; i < observers.length; i++) {
+            const o = observers[i];
+            key += '|' + (o.id | 0) + ':' + (o.x | 0) + ',' + (o.y | 0) + ',' + (o.z | 0);
+        }
+        return key;
+    }
+
+    ensureAoiFrame(tickIndex) {
+        const radius = (this.settings && this.settings.aiTickRadius != null)
+            ? (this.settings.aiTickRadius | 0)
+            : 12;
         const margin = spawnActivateMargin(this.settings);
-        const idleLimit = spawnDespawnIdleTicks(this.settings);
-        const maxLiving = spawnMaxLiving(this.settings);
         const observers = [];
         const playerTargets = new Set();
         for (const p of this.players.values()) {
@@ -808,6 +897,98 @@ class World {
             observers.push(p);
             if (p.targetId) playerTargets.add(p.targetId);
         }
+        const key = this.aoiFrameKey(tickIndex, observers, radius, margin);
+        if (this._aoiFrame && this._aoiFrame.key === key) {
+            this._aoiFrame.playerTargets = playerTargets;
+            return this._aoiFrame;
+        }
+        return this.buildAoiFrame(tickIndex | 0, observers, playerTargets, radius, margin, key);
+    }
+
+    buildAoiFrame(tickIndex, observers, playerTargets, radius, margin, key) {
+        const nearbyCreatures = new Set();
+        const nearbyCreatureIds = new Set();
+        const spawnPins = [];
+        const spawnPinSeen = new Set();
+        let usedCreatureSpatial = false;
+        let usedSpawnPinSpatial = false;
+
+        for (let i = 0; i < observers.length; i++) {
+            const ob = observers[i];
+            const px = ob.x | 0;
+            const py = ob.y | 0;
+            const pz = ob.z | 0;
+            if (radius > 0) {
+                const creatureCandidates = this.creatureSpatial
+                    ? this.creatureSpatial.queryChunkCandidates(px, py, pz, radius)
+                    : this.creatures.values();
+                if (this.creatureSpatial) usedCreatureSpatial = true;
+                for (const cr of creatureCandidates) {
+                    if (!cr || (cr.hp | 0) <= 0 || isNpcEntity(cr)) continue;
+                    if ((cr.z | 0) !== pz) continue;
+                    if (chebyshev(cr.x | 0, cr.y | 0, px, py) <= radius) {
+                        nearbyCreatures.add(cr);
+                        nearbyCreatureIds.add(cr.id);
+                    }
+                }
+            }
+            if (this.spawnPins && this.spawnPins.length) {
+                const win = viewportWindow(this.map, px, py, null, null, pz);
+                const minX = win.originX - margin;
+                const maxX = win.originX + win.width + margin - 1;
+                const minY = win.originY - margin;
+                const maxY = win.originY + win.height + margin - 1;
+                const pinEntries = this.spawnPinSpatial
+                    ? this.spawnPinSpatial.queryRect(minX, minY, maxX, maxY, pz)
+                    : this.spawnPins;
+                if (this.spawnPinSpatial) usedSpawnPinSpatial = true;
+                for (let p = 0; p < pinEntries.length; p++) {
+                    const entry = pinEntries[p];
+                    const pin = entry.pin || entry;
+                    if (!pin || pin.state === 'skipped') continue;
+                    if (spawnPinSeen.has(pin.index)) continue;
+                    spawnPinSeen.add(pin.index);
+                    if (inSpawnAoi(this.map, px, py, pz, pin.x, pin.y, pin.z, margin)) {
+                        spawnPins.push(pin);
+                    }
+                }
+            }
+        }
+
+        const frame = {
+            key,
+            tickIndex: tickIndex | 0,
+            radius,
+            margin,
+            observers,
+            playerTargets,
+            nearbyCreatures,
+            nearbyCreatureIds,
+            spawnPins,
+            usedCreatureSpatial,
+            usedSpawnPinSpatial
+        };
+        this._aoiFrame = frame;
+        return frame;
+    }
+
+    noteAoiCreature(creature) {
+        const frame = this._aoiFrame;
+        if (!frame || !creature) return;
+        frame.nearbyCreatures.add(creature);
+        if (creature.id != null) frame.nearbyCreatureIds.add(creature.id);
+    }
+
+    tickSpawnPins(tickIndex, opts) {
+        if (!this.spawnPins.length) return;
+        const appear = !opts || opts.appear !== false;
+        const frame = this.ensureAoiFrame(tickIndex);
+        const margin = frame.margin;
+        const idleLimit = spawnDespawnIdleTicks(this.settings);
+        const homeDist = spawnDespawnHomeDist(this.settings);
+        const maxLiving = spawnMaxLiving(this.settings);
+        const observers = frame.observers;
+        const playerTargets = frame.playerTargets;
 
         if (this.livingPins && this.livingPins.size > 0) {
             const livingList = Array.from(this.livingPins);
@@ -821,13 +1002,20 @@ class World {
                     this.livingPins.delete(pin);
                     continue;
                 }
+                if (homeDist > 0) {
+                    const sameFloor = (creature.z | 0) === (pin.z | 0);
+                    if (!sameFloor) {
+                        this.despawnPin(pin, { reason: 'home_floor', tickIndex });
+                        continue;
+                    }
+                    if (chebyshev(creature.x | 0, creature.y | 0, pin.x | 0, pin.y | 0) > homeDist) {
+                        this.despawnPin(pin, { reason: 'home_distance', tickIndex });
+                        continue;
+                    }
+                }
                 let seen = false;
-                const candidateObservers = this.playerSpatial
-                    ? this.playerSpatial.queryChunkCandidates(creature.x, creature.y, creature.z, 16 + margin)
-                    : observers;
-                for (let o = 0; o < candidateObservers.length; o++) {
-                    const ob = candidateObservers[o];
-                    if (ob.dead || ob.downed) continue;
+                for (let o = 0; o < observers.length; o++) {
+                    const ob = observers[o];
                     if (inSpawnAoi(
                         this.map, ob.x, ob.y, ob.z, creature.x, creature.y, creature.z, margin
                     )) {
@@ -840,7 +1028,9 @@ class World {
                     continue;
                 }
                 pin.idleTicks += 1;
-                if (pin.idleTicks >= idleLimit) this.despawnPin(pin);
+                if (pin.idleTicks >= idleLimit) {
+                    this.despawnPin(pin, { reason: 'idle_aoi', tickIndex });
+                }
             }
         }
 
@@ -848,7 +1038,7 @@ class World {
             while (this.livingPins.size > maxLiving) {
                 const victim = this.pickBudgetVictim(observers, null, playerTargets);
                 if (!victim) break;
-                this.despawnPin(victim);
+                this.despawnPin(victim, { reason: 'budget', tickIndex });
             }
         }
 
@@ -862,28 +1052,11 @@ class World {
         }
 
         if (observers.length > 0) {
-            const seenPins = new Set();
             const candidates = [];
-            for (let o = 0; o < observers.length; o++) {
-                const ob = observers[o];
-                const win = viewportWindow(this.map, ob.x, ob.y, null, null, ob.z);
-                const minX = win.originX - margin;
-                const maxX = win.originX + win.width + margin - 1;
-                const minY = win.originY - margin;
-                const maxY = win.originY + win.height + margin - 1;
-                const candidateEntries = this.spawnPinSpatial
-                    ? this.spawnPinSpatial.queryRect(minX, minY, maxX, maxY, ob.z)
-                    : this.spawnPins;
-                for (let i = 0; i < candidateEntries.length; i++) {
-                    const entry = candidateEntries[i];
-                    const pin = entry.pin || entry;
-                    if (pin.state === 'skipped' || pin.state === 'living' || pin.eager) continue;
-                    if (seenPins.has(pin.index)) continue;
-                    seenPins.add(pin.index);
-                    if (inSpawnAoi(this.map, ob.x, ob.y, ob.z, pin.x, pin.y, pin.z, margin)) {
-                        candidates.push(pin);
-                    }
-                }
+            for (let i = 0; i < frame.spawnPins.length; i++) {
+                const pin = frame.spawnPins[i];
+                if (pin.state === 'skipped' || pin.state === 'living' || pin.eager) continue;
+                candidates.push(pin);
             }
             if (candidates.length > 0) {
                 if (maxLiving > 0 && candidates.length > 1) {
@@ -899,7 +1072,7 @@ class World {
                     if (maxLiving > 0 && this.livingPins && this.livingPins.size >= maxLiving) {
                         const victim = this.pickBudgetVictim(observers, pin, playerTargets);
                         if (!victim) continue;
-                        this.despawnPin(victim);
+                        this.despawnPin(victim, { reason: 'budget', tickIndex });
                     }
                     this.activatePin(pin, tickIndex, { appear });
                 }
@@ -939,6 +1112,7 @@ class World {
         this.players.set(ch.id, session);
         this.byAccount.set(ch.accountId, session);
         if (this.playerSpatial) this.playerSpatial.insert(session);
+        this.invalidateAoiFrame();
         return true;
     }
 
@@ -959,6 +1133,7 @@ class World {
         }
         this.clearTarget(ch.id);
         this.closeTalk(session, false);
+        this.invalidateAoiFrame();
         this.broadcastDisappear(ch.id, session);
         if (this._dirtyOutboundSessions) {
             this._dirtyOutboundSessions.delete(session);
@@ -1049,9 +1224,7 @@ class World {
 
     broadcastAppear(entity) {
         const buf = encodeAppear(entity);
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(entity.x, entity.y, entity.z, 16);
         for (const p of candidates) {
             if (p.downed || p.dead) continue;
             if (this.sees(p, entity.x, entity.y, entity.z)) {
@@ -1064,9 +1237,7 @@ class World {
         const x = leaving.x;
         const y = leaving.y;
         const z = leaving.z;
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(x, y, z, 16);
         for (const other of candidates) {
             if (other === leaving || other.downed || other.dead) continue;
             if (this.sees(other, x, y, z)) {
@@ -1144,6 +1315,7 @@ class World {
         this._tickIndex = tickIndex | 0;
         this.pathBudget.begin(this._tickIndex);
         this._batchingOutbound = true;
+        this.invalidateAoiFrame();
         try {
             this.drainComputeCompletions(tickIndex);
             for (const session of this.players.values()) {
@@ -1164,6 +1336,7 @@ class World {
                 this.tickPlayerCombat(session, tickIndex);
                 this.tickTalkRange(session);
             }
+            this.ensureAoiFrame(tickIndex);
             this.tickSpawnPins(tickIndex);
             this.updateCreatureSleepStates(tickIndex);
             for (const cr of this.activeCreatures) {
@@ -1448,6 +1621,7 @@ class World {
             this.sendViewportToViewers(inst.x, inst.y, inst.z);
             this.broadcastWorldPin(inst);
         }
+        this.scheduleWorldPinDeadline(inst, this.logicNow(tickIndex));
     }
 
     applyWorldPinStep(entity, from, tickIndex) {
@@ -1485,6 +1659,7 @@ class World {
                 this.applyDamage(entity, row.result.damage, 'physical', tickIndex, null);
             }
             this.broadcastWorldPin(row.inst);
+            this.scheduleWorldPinDeadline(row.inst, now);
         }
         const fieldEvents = onEntityTileTransition(entity, from, to, this.fieldStore, now);
         for (let i = 0; i < fieldEvents.length; i++) {
@@ -1497,14 +1672,20 @@ class World {
 
     tickWorldPins(tickIndex) {
         const now = this.logicNow(tickIndex);
-        tickWorldPinCooldowns(this.worldPins, now);
-        const decayed = tickWorldPinDecay(this.worldPins, now, this.tileMap);
+        const out = tickWorldPinDeadlineQueue(
+            this.worldPinDeadlines,
+            (id) => this.worldPinByNumeric.get(id) || this.worldPinById.get(id) || null,
+            now,
+            this.tileMap
+        );
+        const decayed = out.decayed || [];
         for (let i = 0; i < decayed.length; i++) {
             const row = decayed[i];
             if (row.removed) {
                 this.forgetWorldPin(row.inst);
             } else {
                 this.broadcastWorldPin(row.inst);
+                this.scheduleWorldPinDeadline(row.inst, now);
             }
         }
     }
@@ -1535,9 +1716,7 @@ class World {
     }
 
     sendViewportToViewers(x, y, z) {
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(x, y, z, 16);
         for (const p of candidates) {
             if (!p || p.dead || p.downed) continue;
             if (this.sees(p, x, y, z)) {
@@ -1697,13 +1876,17 @@ class World {
         }
     }
 
+    creatureIsStickyAwake(cr, playerTargets) {
+        if (!cr || (cr.hp | 0) <= 0 || isNpcEntity(cr)) return false;
+        if (cr.targetId) return true;
+        if (cr.leashing) return true;
+        if (playerTargets && playerTargets.has(cr.id)) return true;
+        if (cr.conditions && cr.conditions.length > 0) return true;
+        return false;
+    }
+
     updateCreatureSleepStates(tickIndex) {
         const sleepEnabled = !this.settings || this.settings.aiCreatureSleep !== false;
-        const now = this.logicNow(tickIndex);
-        const repathSec = (this.settings && this.settings.aiRepathIntervalSec != null)
-            ? Number(this.settings.aiRepathIntervalSec)
-            : 2.0;
-
         const radius = (this.settings && this.settings.aiTickRadius != null)
             ? (this.settings.aiTickRadius | 0)
             : 12;
@@ -1716,63 +1899,39 @@ class World {
             return;
         }
 
-        const activePlayers = [];
-        const playerTargets = new Set();
-        for (const p of this.players.values()) {
-            if (!p.dead && !p.downed) {
-                activePlayers.push(p);
-                if (p.targetId) playerTargets.add(p.targetId);
-            }
+        const frame = this.ensureAoiFrame(tickIndex);
+        const playerTargets = frame.playerTargets;
+
+        // Observer-centric gather from the shared AOI frame, then sleep/wake
+        // deltas only against the previous-awake set — never this.creatures.values().
+        const wantAwake = new Set();
+        for (const cr of frame.nearbyCreatures) {
+            if (cr && (cr.hp | 0) > 0 && !isNpcEntity(cr)) wantAwake.add(cr);
         }
 
-        // Observer-Centric AOI Frame:
-        // Query outward only from active players into creatureSpatial (O(N_players))
-        // instead of querying playerSpatial from every creature in the world (O(N_creatures)).
-        const awakeCandidates = new Set();
-        if (activePlayers.length > 0) {
-            for (let i = 0; i < activePlayers.length; i++) {
-                const p = activePlayers[i];
-                const px = p.x | 0;
-                const py = p.y | 0;
-                const pz = p.z | 0;
-                const candidates = this.creatureSpatial
-                    ? this.creatureSpatial.queryChunkCandidates(px, py, pz, radius)
-                    : this.creatures.values();
-                for (const cr of candidates) {
-                    if (!cr || (cr.hp | 0) <= 0 || isNpcEntity(cr)) continue;
-                    if ((cr.z | 0) !== pz) continue;
-                    if (chebyshev(cr.x | 0, cr.y | 0, px, py) <= radius) {
-                        awakeCandidates.add(cr.id);
-                    }
-                }
-            }
-        }
-
-        // Add creatures currently targeted by any active player
         for (const targetId of playerTargets) {
-            awakeCandidates.add(targetId);
+            const cr = this.creatures.get(targetId);
+            if (cr && (cr.hp | 0) > 0 && !isNpcEntity(cr)) wantAwake.add(cr);
         }
 
-        // Update sleep states only for entities that changed status
-        for (const cr of this.creatures.values()) {
-            if (isNpcEntity(cr)) continue;
+        const prevAwake = [];
+        for (const cr of this.activeCreatures) {
+            prevAwake.push(cr);
+            if (this.creatureIsStickyAwake(cr, playerTargets)) wantAwake.add(cr);
+        }
+
+        for (let i = 0; i < prevAwake.length; i++) {
+            const cr = prevAwake[i];
             if ((cr.hp | 0) <= 0) {
                 if (cr.simSleeping) cr.simSleeping = false;
                 this.activeCreatures.delete(cr);
                 continue;
             }
-
-            const hasActiveConditions = !!(cr.conditions && cr.conditions.length > 0);
-            const inCombat = !!(cr.targetId || cr.leashing || playerTargets.has(cr.id) || hasActiveConditions);
-            const wantSleep = !inCombat && !awakeCandidates.has(cr.id);
-
-            const wasSleeping = !!cr.simSleeping;
-            if (wasSleeping && !wantSleep) {
+            if (!wantAwake.has(cr)) this.sleepCreature(cr);
+        }
+        for (const cr of wantAwake) {
+            if (cr.simSleeping || !this.activeCreatures.has(cr)) {
                 this.wakeCreature(cr, tickIndex);
-            } else if (!wasSleeping && wantSleep) {
-                this.sleepCreature(cr);
-            } else if (!wasSleeping && !wantSleep) {
-                this.activeCreatures.add(cr);
             }
         }
     }
@@ -2071,9 +2230,12 @@ class World {
         const r = Math.max(0, Number(range) || 0);
         let best = null;
         let bestD = r + 1;
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, r)
-            : this.players.values();
+        const frame = this._aoiFrame;
+        const candidates = (frame && frame.observers)
+            ? frame.observers
+            : (this.playerSpatial
+                ? this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, r)
+                : this.players.values());
         for (const p of candidates) {
             if (!p || p.downed || p.dead) continue;
             if ((p.z | 0) !== (from.z | 0)) continue;
@@ -2509,9 +2671,7 @@ class World {
         if (entity.type === 'player' && entity.send && !entity.dead) {
             entity.send(S2C.STATS, stats);
         }
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(entity.x, entity.y, entity.z, 16);
         for (const p of candidates) {
             if (!p || p === entity || p.downed || p.dead) continue;
             if (this.sees(p, entity.x, entity.y, entity.z)) {
@@ -2528,9 +2688,7 @@ class World {
             flags
         });
         const stats = encodeStats(defender);
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(defender.x, defender.y, defender.z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(defender.x, defender.y, defender.z, 16);
         for (const p of candidates) {
             if (!p || (p.downed && p !== defender) || p.dead) continue;
             if (p === attacker || p === defender
@@ -2596,6 +2754,7 @@ class World {
         if (pin) {
             if (this.livingPins) this.livingPins.delete(pin);
             pin.entityId = 0;
+            pin.parkedEntity = null;
             pin.idleTicks = 0;
             const delay = respawnDelayTicks(pin, this.settings);
             if (delay <= 0) {
@@ -2725,13 +2884,20 @@ class World {
         }
     }
 
+    viewerCandidates(x, y, z, radius) {
+        const frame = this._aoiFrame;
+        if (frame && frame.observers) return frame.observers;
+        if (this.playerSpatial) {
+            return this.playerSpatial.queryChunkCandidates(x, y, z, radius != null ? radius : 16);
+        }
+        return this.players.values();
+    }
+
     broadcastToViewers(x, y, z, fn, include) {
         if (include && !include.dead) {
             fn(include);
         }
-        const candidates = this.playerSpatial
-            ? this.playerSpatial.queryChunkCandidates(x, y, z, 16)
-            : this.players.values();
+        const candidates = this.viewerCandidates(x, y, z, 16);
         for (const p of candidates) {
             if (!p || p.dead || p === include) continue;
             if (this.sees(p, x, y, z)) fn(p);
@@ -2753,22 +2919,17 @@ class World {
         }
 
         const candidatePlayers = [];
-        if (this.playerSpatial) {
-            const seen = new Set();
-            const addPlayers = (list) => {
-                for (let i = 0; i < list.length; i++) {
-                    const p = list[i];
-                    if (!p || seen.has(p.id)) continue;
-                    seen.add(p.id);
-                    candidatePlayers.push(p);
-                }
-            };
-            addPlayers(this.playerSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
-            if ((from.z | 0) !== (entity.z | 0)) {
-                addPlayers(this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+        const seen = new Set();
+        const addPlayers = (list) => {
+            for (const p of list) {
+                if (!p || seen.has(p.id)) continue;
+                seen.add(p.id);
+                candidatePlayers.push(p);
             }
-        } else {
-            for (const p of this.players.values()) candidatePlayers.push(p);
+        };
+        addPlayers(this.viewerCandidates(entity.x, entity.y, entity.z, 16));
+        if ((from.z | 0) !== (entity.z | 0) && !(this._aoiFrame && this._aoiFrame.observers)) {
+            addPlayers(this.viewerCandidates(from.x, from.y, from.z, 16));
         }
 
         for (let i = 0; i < candidatePlayers.length; i++) {

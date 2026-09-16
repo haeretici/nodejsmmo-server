@@ -305,19 +305,21 @@ function testWorldDespawnPinRecycling() {
     assert.strictEqual(world.creaturePool.size, 0);
     assert.strictEqual(world.creaturePool.totalCreated, 1);
 
-    // Despawn pin -> returns creature to pool
-    world.despawnPin(pin);
+    // Idle despawn parks the body (remaining HP) instead of pool-reset
+    world.despawnPin(pin, { reason: 'idle_aoi', tickIndex: 2 });
     assert.strictEqual(pin.state, 'idle');
     assert.strictEqual(pin.entityId, 0);
     assert.strictEqual(world.creatures.size, 0);
-    assert.strictEqual(world.creaturePool.size, 1);
-    assert.strictEqual(world.creaturePool.totalReleased, 1);
+    assert.strictEqual(pin.parkedEntity, c, 'idle despawn parks the living body');
+    assert.strictEqual(world.creaturePool.size, 0, 'park does not release to the pool');
+    assert.strictEqual(world.creaturePool.totalReleased, 0);
 
-    // Re-activate pin -> reuses the exact same creature instance
+    // Re-activate pin -> unparks the same instance
     const c2 = world.activatePin(pin, 2);
-    assert.strictEqual(c2, c, 'pin activation reuses pooled creature');
+    assert.strictEqual(c2, c, 'pin activation unparks the parked body');
     assert.strictEqual(world.creaturePool.totalCreated, 1);
     assert.strictEqual(world.creaturePool.size, 0);
+    assert.strictEqual(pin.parkedEntity, null);
 
     world.leave(session);
     world.stop();
@@ -347,15 +349,15 @@ function testWorldSoftCapBudgetEvictionRecycling() {
     assert.strictEqual(world.creaturePool.totalCreated, 2);
     assert.strictEqual(world.creaturePool.size, 0);
 
-    // Activating pinC exceeds maxLiving (2), triggering pickBudgetVictim to despawn a victim.
-    // The victim is released to creaturePool and immediately obtained for pinC!
+    // Activating pinC exceeds maxLiving (2): victim is parked (keeps HP), pinC gets a fresh body.
     const cC = world.activatePin(pinC, 2);
     assert.ok(cC);
     assert.strictEqual(world.livingPins.size, 2);
     assert.strictEqual(world.creatures.size, 2);
-    assert.strictEqual(world.creaturePool.totalCreated, 2, 'No new Creature was allocated during budget eviction spawn');
-    assert.strictEqual(world.creaturePool.totalObtained, 3);
-    assert.strictEqual(world.creaturePool.totalReleased, 1);
+    const parked = pinA.parkedEntity || pinB.parkedEntity;
+    assert.ok(parked, 'budget victim is parked on its pin');
+    assert.notStrictEqual(cC, parked, 'incoming pin does not steal the parked body');
+    assert.strictEqual(world.creaturePool.totalReleased, 0, 'budget park does not pool-reset');
 
     world.leave(session);
     world.stop();

@@ -344,9 +344,11 @@ function main() {
     assert.strictEqual(distantMob.simSleeping, true);
     assert.strictEqual(w5.activeCreatures.has(distantMob), false);
 
-    // Apply DoT condition to distantMob: updateCreatureSleepStates keeps it awake and active
+    // Apply DoT while the mob is in the awake set (spell/field hits wake first).
+    // Sleep apply then keeps it via previous-awake sticky, without walking creatures.values().
     distantMob.hp = 100;
     distantMob.hpMax = 100;
+    w5.wakeCreature(distantMob, 10);
     applyCondition(distantMob, { type: 'fire', schedule: [{ turns: 5, damage: 10, intervalSec: 1 }] }, { forceOverride: true });
     assert.ok(distantMob.conditions && distantMob.conditions.length > 0);
     w5.updateCreatureSleepStates(11);

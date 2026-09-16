@@ -242,7 +242,9 @@ function testCombatExemptionsObserverCentric() {
     world.updateCreatureSleepStates(3);
     assert.strictEqual(distantMob.simSleeping, true, 'mob goes back to sleep after target cleared');
 
-    // 2. Creature targets player -> stays awake despite being far away
+    // 2. Creature already awake with a target stays awake when the player leaves AOI.
+    // Sleep apply only walks the previous-awake set (not this.creatures.values()).
+    world.wakeCreature(distantMob, 4);
     distantMob.targetId = session.character.id;
     world.updateCreatureSleepStates(4);
     assert.strictEqual(distantMob.simSleeping, false, 'mob targeting player stays awake');
@@ -280,6 +282,70 @@ function testFloorIsolationObserverCentric() {
     world.stop();
 }
 
+function testSharedAoiFramePerTick() {
+    const world = makeWorld(null, multiFloorMap(80, 80));
+    world.spawnCreature('rat', 11, 10, 0);
+    world.spawnCreature('rat', 12, 10, 0);
+    const session = makeSession(world, ash(1), { x: 10, y: 10, z: 0 });
+
+    let creatureQueries = 0;
+    let playerQueries = 0;
+    const origCr = world.creatureSpatial.queryChunkCandidates.bind(world.creatureSpatial);
+    world.creatureSpatial.queryChunkCandidates = (x, y, z, r) => {
+        creatureQueries += 1;
+        return origCr(x, y, z, r);
+    };
+    const origPl = world.playerSpatial.queryChunkCandidates.bind(world.playerSpatial);
+    world.playerSpatial.queryChunkCandidates = (x, y, z, r) => {
+        playerQueries += 1;
+        return origPl(x, y, z, r);
+    };
+
+    world.ensureAoiFrame(1);
+    const frame = world._aoiFrame;
+    assert.ok(frame, 'AOI frame is cached');
+    world.tickSpawnPins(1);
+    world.updateCreatureSleepStates(1);
+    const near = world.nearestPlayer({ x: 11, y: 10, z: 0 }, 7);
+    assert.ok(near, 'aggro uses AOI observers');
+    world.broadcastToViewers(11, 10, 0, () => {});
+
+    assert.strictEqual(world._aoiFrame, frame, 'spawn/sleep/aggro/broadcast reuse one AOI frame');
+    assert.strictEqual(creatureQueries, 1, 'creatureSpatial queried once for the single observer');
+    assert.strictEqual(playerQueries, 0, 'playerSpatial not queried once the AOI frame exists');
+
+    session.kick(REASON.LOGOUT);
+    world.stop();
+}
+
+function testSleepApplyDoesNotWalkCreatureMap() {
+    const world = makeWorld(null, multiFloorMap(200, 200));
+    const near = world.spawnCreature('rat', 10, 10, 0);
+    const far = [];
+    for (let i = 0; i < 80; i++) {
+        far.push(world.spawnCreature('rat', 80 + (i % 10), 80 + Math.floor(i / 10), 0));
+    }
+    const session = makeSession(world, ash(1), { x: 10, y: 10, z: 0 });
+
+    let mapWalks = 0;
+    const origValues = world.creatures.values.bind(world.creatures);
+    world.creatures.values = function sleepApplyValuesProbe() {
+        mapWalks += 1;
+        return origValues();
+    };
+
+    world.updateCreatureSleepStates(1);
+    assert.strictEqual(mapWalks, 0, 'sleep apply must not walk this.creatures.values()');
+    assert.strictEqual(near.simSleeping, false, 'near rat stays awake');
+    for (let i = 0; i < far.length; i++) {
+        assert.strictEqual(far[i].simSleeping, true, 'far rat sleeps via previous-awake delta');
+    }
+
+    world.creatures.values = origValues;
+    session.kick(REASON.LOGOUT);
+    world.stop();
+}
+
 function testDisabledSleepAndZeroRadius() {
     // aiCreatureSleep = false
     const worldDisabled = makeWorld({ aiCreatureSleep: false });
@@ -312,6 +378,8 @@ function main() {
     testMultiplePlayersObserverCentric();
     testCombatExemptionsObserverCentric();
     testFloorIsolationObserverCentric();
+    testSharedAoiFramePerTick();
+    testSleepApplyDoesNotWalkCreatureMap();
     testDisabledSleepAndZeroRadius();
     console.log('ok phase4_2_observer_centric_sleep');
 }

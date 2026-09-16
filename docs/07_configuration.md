@@ -40,9 +40,10 @@ Authoritative settings contract, environment overrides, multi-core compute worke
 | :--- | :--- | :--- | :--- |
 | `spawnMaxLiving` | `3000` | `3000` | Soft cap for instantiated living entities ($C_{\text{slots}} \gg C_{\text{living}}$). Unengaged idle mobs are evicted beyond this limit. |
 | `spawnActivateMargin` | `8` | `8` | Tile padding beyond the observer viewport rectangle to activate dormant spawn pins. |
-| `spawnDespawnIdleTicks` | `40` | `40` | Ticks (2.0s at 20 UPS) an unengaged mob remains alive without players in range before despawning back to its pin. |
-| `aiCreatureSleep` | `true` | `true` | Enables sleep state. Dormant mobs skip AI, targeting, cooldown updates, and return pathing. |
-| `aiTickRadius` | `12` | `12` | Observer-centric wake radius. Sweep radiates outward from active players ($O(N_{\text{players}})$). |
+| `spawnDespawnIdleTicks` | `40` | `40` | Ticks (2.0s at 20 UPS) an unengaged mob remains alive without players in range before despawning back to its pin. Idle/budget unload **parks** remaining HP. |
+| `spawnDespawnHomeDist` | `20` | `20` | Chebyshev tiles from pin home. Greater → destroy + respawn cooldown (not park). `0` disables. Same-floor only; other floor is home-floor unload. |
+| `aiCreatureSleep` | `true` | `true` | Enables sleep state. Dormant mobs skip AI, targeting, cooldown updates, and return pathing. Sleep apply is previous-awake deltas, not `creatures.values()`. |
+| `aiTickRadius` | `12` | `12` | Observer-centric wake radius. Sweep radiates outward from active players ($O(N_{\text{players}})$). One AOI frame per tick is shared by sleep, spawn, aggro, and broadcast. |
 
 ## Network & Batching Limits
 

@@ -201,7 +201,8 @@ function testCombatExemption() {
     world.step(1);
     assert.strictEqual(rat.simSleeping, true);
 
-    // Exemption 1: Creature has active targetId
+    // Exemption 1: Creature already in the awake set with a target stays awake
+    world.wakeCreature(rat, 2);
     rat.targetId = session.character.id;
     world.step(2);
     assert.strictEqual(rat.simSleeping, false, 'creature with targetId is never asleep');

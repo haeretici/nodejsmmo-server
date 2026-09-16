@@ -5,6 +5,7 @@ const { viewportWindow } = require('./static_map');
 const DEFAULT_ACTIVATE_MARGIN = 8;
 const DEFAULT_DESPAWN_IDLE_TICKS = 40;
 const DEFAULT_MAX_LIVING = 3000;
+const DEFAULT_DESPAWN_HOME_DIST = 20;
 
 function resolveSpawnMode(settings, overlay) {
     const raw = settings && settings.spawnMode;
@@ -28,6 +29,13 @@ function spawnDespawnIdleTicks(settings) {
         return Math.max(0, Math.round(Number(settings.spawnDespawnIdleSec) * ups));
     }
     return DEFAULT_DESPAWN_IDLE_TICKS;
+}
+
+function spawnDespawnHomeDist(settings) {
+    if (settings && settings.spawnDespawnHomeDist != null) {
+        return Math.max(0, settings.spawnDespawnHomeDist | 0);
+    }
+    return DEFAULT_DESPAWN_HOME_DIST;
 }
 
 function spawnMaxLiving(settings) {
@@ -94,6 +102,7 @@ function makePinState(row, index, eager) {
         readyTick: 0,
         idleTicks: 0,
         skipReason: null,
+        parkedEntity: null,
         rarity: row && row.rarity ? String(row.rarity) : undefined
     };
 }
@@ -155,10 +164,12 @@ function livingPinKeepPriority(pin, creature, observers, template) {
 module.exports = {
     DEFAULT_ACTIVATE_MARGIN,
     DEFAULT_DESPAWN_IDLE_TICKS,
+    DEFAULT_DESPAWN_HOME_DIST,
     DEFAULT_MAX_LIVING,
     resolveSpawnMode,
     spawnActivateMargin,
     spawnDespawnIdleTicks,
+    spawnDespawnHomeDist,
     spawnMaxLiving,
     pinKind,
     pinSkipReason,

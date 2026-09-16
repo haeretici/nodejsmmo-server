@@ -598,6 +598,118 @@ function onWorldPinStep(entity, prevTile, nextTile, instances, nowSec) {
     return fired;
 }
 
+function applyWorldPinCooldown(inst, nowSec) {
+    if (!inst || inst.removed) return 0;
+    const now = Number(nowSec);
+    if (!Number.isFinite(now)) return 0;
+    if (inst.kind === 'harvest' && inst.harvestReadyAt != null) {
+        if (now < Number(inst.harvestReadyAt)) return 0;
+        inst.harvestReadyAt = null;
+        inst.used = false;
+        if (inst.catalogBase && inst.catalogId !== inst.catalogBase) {
+            applyCatalogTransform(inst, inst.catalogBase);
+        }
+        return 1;
+    }
+    if (inst.kind === 'trap' && inst.trapReadyAt != null) {
+        if (now < Number(inst.trapReadyAt)) return 0;
+        inst.trapReadyAt = null;
+        inst.used = false;
+        if (inst.catalogBase && inst.catalogId !== inst.catalogBase) {
+            applyCatalogTransform(inst, inst.catalogBase);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+function applyWorldPinDecayOne(inst, nowSec, tileMap) {
+    if (!inst || inst.removed || !inst.decay) return null;
+    const now = Number(nowSec);
+    if (!Number.isFinite(now)) return null;
+    const sec = Number(inst.decay.sec);
+    if (!Number.isFinite(sec) || sec <= 0) return null;
+    if (inst.decayAt == null) inst.decayAt = now + sec;
+    if (now < inst.decayAt) return null;
+    const to = inst.decay.to != null ? String(inst.decay.to).trim() : '';
+    inst.decay = null;
+    inst.decayAt = null;
+    if (to) {
+        applyCatalogTransform(inst, to);
+        return { inst, removed: false };
+    }
+    restoreWorldPinWalkBlock(tileMap, inst);
+    inst.removed = true;
+    return { inst, removed: true };
+}
+
+function ensureWorldPinDecayAt(inst, nowSec) {
+    if (!inst || !inst.decay || inst.removed) return null;
+    const sec = Number(inst.decay.sec);
+    if (!Number.isFinite(sec) || sec <= 0) return null;
+    if (inst.decayAt == null) {
+        const now = Number(nowSec);
+        inst.decayAt = (Number.isFinite(now) ? now : 0) + sec;
+    }
+    return Number(inst.decayAt);
+}
+
+function nextWorldPinDeadline(inst, nowSec) {
+    if (!inst || inst.removed) return null;
+    let soonest = null;
+    if (inst.harvestReadyAt != null) {
+        const t = Number(inst.harvestReadyAt);
+        if (Number.isFinite(t)) soonest = t;
+    }
+    if (inst.trapReadyAt != null) {
+        const t = Number(inst.trapReadyAt);
+        if (Number.isFinite(t) && (soonest == null || t < soonest)) soonest = t;
+    }
+    const decayAt = ensureWorldPinDecayAt(inst, nowSec);
+    if (decayAt != null && Number.isFinite(decayAt) && (soonest == null || decayAt < soonest)) {
+        soonest = decayAt;
+    }
+    return soonest;
+}
+
+function enqueueWorldPinDeadline(queue, at, instId) {
+    if (!queue || instId == null) return;
+    const target = Number(at);
+    if (!Number.isFinite(target)) return;
+    const item = { at: target, id: instId };
+    let low = 0;
+    let high = queue.length;
+    while (low < high) {
+        const mid = (low + high) >>> 1;
+        const midAt = queue[mid] ? Number(queue[mid].at) : 0;
+        if (midAt <= target) low = mid + 1;
+        else high = mid;
+    }
+    queue.splice(low, 0, item);
+}
+
+function tickWorldPinDeadlineQueue(queue, getInst, nowSec, tileMap) {
+    const now = Number(nowSec);
+    const decayed = [];
+    let cooled = 0;
+    if (!queue || !Number.isFinite(now) || typeof getInst !== 'function') {
+        return { cooled, decayed };
+    }
+    while (queue.length > 0) {
+        const head = queue[0];
+        if (Number(head.at) > now) break;
+        queue.shift();
+        const inst = getInst(head.id);
+        if (!inst || inst.removed) continue;
+        cooled += applyWorldPinCooldown(inst, now);
+        const d = applyWorldPinDecayOne(inst, now, tileMap);
+        if (d) decayed.push(d);
+        const next = nextWorldPinDeadline(inst, now);
+        if (next != null && next > now) enqueueWorldPinDeadline(queue, next, inst.id);
+    }
+    return { cooled, decayed };
+}
+
 /** nowSec is World.logicNow (tickIndex / ups), not Date.now. */
 function tickWorldPinCooldowns(instances, nowSec) {
     const now = Number(nowSec);
@@ -605,25 +717,7 @@ function tickWorldPinCooldowns(instances, nowSec) {
     const list = instances || [];
     let n = 0;
     for (let i = 0; i < list.length; i++) {
-        const inst = list[i];
-        if (!inst || inst.removed) continue;
-        if (inst.kind === 'harvest' && inst.harvestReadyAt != null) {
-            if (now < Number(inst.harvestReadyAt)) continue;
-            inst.harvestReadyAt = null;
-            inst.used = false;
-            if (inst.catalogBase && inst.catalogId !== inst.catalogBase) {
-                applyCatalogTransform(inst, inst.catalogBase);
-            }
-            n += 1;
-        } else if (inst.kind === 'trap' && inst.trapReadyAt != null) {
-            if (now < Number(inst.trapReadyAt)) continue;
-            inst.trapReadyAt = null;
-            inst.used = false;
-            if (inst.catalogBase && inst.catalogId !== inst.catalogBase) {
-                applyCatalogTransform(inst, inst.catalogBase);
-            }
-            n += 1;
-        }
+        n += applyWorldPinCooldown(list[i], now);
     }
     return n;
 }
@@ -635,23 +729,8 @@ function tickWorldPinDecay(instances, nowSec, tileMap) {
     const list = instances || [];
     const changed = [];
     for (let i = 0; i < list.length; i++) {
-        const inst = list[i];
-        if (!inst || inst.removed || !inst.decay) continue;
-        const sec = Number(inst.decay.sec);
-        if (!Number.isFinite(sec) || sec <= 0) continue;
-        if (inst.decayAt == null) inst.decayAt = now + sec;
-        if (now < inst.decayAt) continue;
-        const to = inst.decay.to != null ? String(inst.decay.to).trim() : '';
-        inst.decay = null;
-        inst.decayAt = null;
-        if (to) {
-            applyCatalogTransform(inst, to);
-            changed.push({ inst, removed: false });
-        } else {
-            restoreWorldPinWalkBlock(tileMap, inst);
-            inst.removed = true;
-            changed.push({ inst, removed: true });
-        }
+        const row = applyWorldPinDecayOne(list[i], now, tileMap);
+        if (row) changed.push(row);
     }
     return changed;
 }
@@ -678,5 +757,10 @@ module.exports = {
     onWorldPinStep,
     tickWorldPinCooldowns,
     tickWorldPinDecay,
+    applyWorldPinCooldown,
+    applyWorldPinDecayOne,
+    nextWorldPinDeadline,
+    enqueueWorldPinDeadline,
+    tickWorldPinDeadlineQueue,
     pinByPinId
 };

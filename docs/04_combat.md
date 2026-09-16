@@ -23,7 +23,8 @@
 | `corpseDecayTicks` | **600** (30 s) |
 | `creatureRespawnTicks` | **200** (10 s; used when pin `respawn` is missing) |
 | `spawnActivateMargin` | **8** (tiles beyond the viewport rect, same `z`) |
-| `spawnDespawnIdleTicks` | **40** (2 s). On_demand only. **0** = next tick out of AOI |
+| `spawnDespawnIdleTicks` | **40** (2 s). On_demand only. **0** = next tick out of AOI. Idle/budget **parks** HP |
+| `spawnDespawnHomeDist` | **20** Chebyshev from pin home. Beyond → destroy + `respawn` cooldown. **0** disables |
 | `unarmedAtk` | **7** |
 | `meleeAutoFactor` | **0.102** |
 | `features.pvp` | **false** |
@@ -32,7 +33,7 @@
 | Creature ids | `creatureIdBase` **1000000000** |
 | Corpse ids | `corpseIdBase` **2000000000** |
 
-Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins load at boot; `spawnMode` **on_demand** (viewport + margin **8**). Tests set `spawns: []` `npcs: []` (eager overlay when those keys are present) or delete the keys to use pack pins.
+Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins load at boot; `spawnMode` **on_demand** (viewport + margin **8**). Tests set `spawns: []` `npcs: []` (eager overlay when those keys are present) or delete the keys to use pack pins. One AOI frame per tick (observers + nearby creatures + spawn-pin candidates) is reused by sleep, spawn, aggro, and broadcast.
 
 ## Intents
 
@@ -78,7 +79,7 @@ Occupy **empty** tiles only except `canPushCreatures` shove/crush. No creature�
 
 AI: aggro nearest player in `aggroRange` (7) on think interval (integer ticks via `logicNow`, not `Date.now`). Kit rows: arm that row’s CD when the window opens, then range/LOS; OOR or no LOS still burns the interval and does **not** skip to a later in-range row (chance fail still continues). Melee rows are skipped without CD while `runHealth` flee is active. Stand-off `flags.targetDistance`: `dist > want` closes; `dist === want` holds; `dist < want` kites; cornered creatures stand ground. When `hp ≤ flags.runHealth` (or `hp/hpMax ≤ runHealthPercent`), `want` becomes `fleeTargetDistance` (default **10**) and lose-target is `max(loseTargetDistance, fleeTargetDistance)`. A* `followPath` (chase cap **12**, return-home **100**). Optional repath **2 s**; empty/blocked is critical. Melee at Chebyshev ≤ 1. Lose at 12. Idle wander: awake (`activeCreatures` only), no target, player in aggro/AOI (or `flags.idleWander`) → random cardinal step on `moveReadyTick`. Speed 0 does not wander. Leash: on target loss while off spawn, stay awake, path home; arriving spawn restores `hp` to `hpMax`. Sleeping / virtualized bodies do not wander. `dummy` kit: `aggro: false` (tests).
 
-Death: `DISAPPEAR` + corpse on the death tile (not occupancy). Loot chance scale **1e5**. Empty roll still spawns a corpse. Killer: solo share → personal rates (defaults 1) → `experience`. If `expProgression`, `levelFromExp` (one call). Level-up: class `hpPerLevel`/`mpPerLevel` added to pools; `EXP` includes `level u16`. Skill tries: blood bucket **30**; melee/fist **+1**; distance **+2** full / **+1** mitigated; wand/rod no weapon try. Shield: full-zero + `blockChargeSpent` + equipped shield. Persist `character_skills` levels + `*_tries`. Respawn from pin `respawn` seconds × `logicUps` (missing pin delay = `creatureRespawnTicks`). `respawn` **0** = one-shot. On_demand: idle creatures outside AOI for `spawnDespawnIdleTicks` (**40**) despawn without that delay.
+Death: `DISAPPEAR` + corpse on the death tile (not occupancy). Loot chance scale **1e5**. Empty roll still spawns a corpse. Killer: solo share → personal rates (defaults 1) → `experience`. If `expProgression`, `levelFromExp` (one call). Level-up: class `hpPerLevel`/`mpPerLevel` added to pools; `EXP` includes `level u16`. Skill tries: blood bucket **30**; melee/fist **+1**; distance **+2** full / **+1** mitigated; wand/rod no weapon try. Shield: full-zero + `blockChargeSpent` + equipped shield. Persist `character_skills` levels + `*_tries`. Respawn from pin `respawn` seconds × `logicUps` (missing pin delay = `creatureRespawnTicks`). `respawn` **0** = one-shot. On_demand: idle creatures outside AOI for `spawnDespawnIdleTicks` (**40**) **park** (same body / remaining HP, no respawn delay). Home-distance **> 20** destroys and waits pin `respawn`. World-pin harvest/trap cooldown and decay use a monotonic deadline queue (no full pin scan each tick).
 
 Player HP 0: leave tile, `DEATH`, others `DISAPPEAR`, `downed` (not socket `dead`). After `deathDelayTicks` occupy spawn, full HP, `STATS`+`MOVE`+`VIEWPORT`. Downed admits only `PING`/`LOGOUT` (`BUSY` else).
 

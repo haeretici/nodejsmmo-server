@@ -30,6 +30,7 @@
     "creatureRespawnTicks": 200,
     "spawnActivateMargin": 8,
     "spawnDespawnIdleTicks": 40,
+    "spawnDespawnHomeDist": 20,
     "spawnMaxLiving": 3000,
     "unarmedAtk": 7,
     "meleeAutoFactor": 0.102,
