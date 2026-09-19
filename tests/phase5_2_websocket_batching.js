@@ -320,7 +320,8 @@ function testDecodeFramesMultiFrameParser() {
 
     assert.strictEqual(parsed[2].opcode, S2C.SAY);
     assert.strictEqual(parsed[2].seq, 12);
-    assert.strictEqual(decodeSay(parsed[2].payload), 'Watch out!');
+    assert.strictEqual(decodeSay(parsed[2].payload).text, 'Watch out!');
+    assert.strictEqual(decodeSay(parsed[2].payload).speakerId, 0);
 
     assert.strictEqual(parsed[3].opcode, S2C.VIEWPORT);
     assert.strictEqual(parsed[3].seq, 13);

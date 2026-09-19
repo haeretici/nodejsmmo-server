@@ -188,6 +188,11 @@ async function main() {
     assert.ok(calder, 'Calder must spawn in plaza AOI');
     assert.ok(brannok, 'Brannok must spawn in plaza AOI');
     assert.ok(quell, 'Quell must spawn in plaza AOI');
+    for (const npc of [hale, osric, calder, brannok]) {
+        assert.ok(npc.voices && npc.voices.length, npc.kind + ' idle voices');
+        assert.ok(npc.voiceInterval > 0, npc.kind + ' voiceInterval');
+        assert.ok(npc.voiceChance > 0, npc.kind + ' voiceChance');
+    }
 
     assert.strictEqual(hale.type, 'npc');
     assert.strictEqual(hale.name, 'Hale');

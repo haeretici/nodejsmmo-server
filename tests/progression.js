@@ -18,7 +18,9 @@ const {
     classifyAttackBlockType,
     processAttackSkillProgression,
     resolveWeaponSkillBag,
-    SKILL_FLOOR
+    SKILL_FLOOR,
+    poolMaxForLevel,
+    applyLevelPoolDelta
 } = require('../src/world/progression');
 
 function main() {
@@ -66,6 +68,51 @@ function main() {
     assert.strictEqual(prog.levelUps, 1);
     assert.strictEqual(p.level, 2);
     assert.strictEqual(p.experience, 100);
+
+    const hp1to8 = [150, 155, 160, 165, 170, 175, 180, 185];
+    const mp1to8 = [55, 60, 65, 70, 75, 80, 85, 90];
+    const classes = [
+        { id: 'guardian', baseHp: 185, baseMp: 90, hpPerLevel: 15, mpPerLevel: 5 },
+        { id: 'scout', baseHp: 185, baseMp: 90, hpPerLevel: 10, mpPerLevel: 15 },
+        { id: 'mystic', baseHp: 185, baseMp: 90, hpPerLevel: 10, mpPerLevel: 10 },
+        { id: 'adept', baseHp: 185, baseMp: 90, hpPerLevel: 5, mpPerLevel: 30 },
+        { id: 'warden', baseHp: 185, baseMp: 90, hpPerLevel: 5, mpPerLevel: 30 },
+        { id: 'adventurer', baseHp: 185, baseMp: 90, hpPerLevel: 5, mpPerLevel: 5 }
+    ];
+    const l9 = {
+        guardian: { hp: 200, mp: 95 },
+        scout: { hp: 195, mp: 105 },
+        mystic: { hp: 195, mp: 100 },
+        adept: { hp: 190, mp: 120 },
+        warden: { hp: 190, mp: 120 },
+        adventurer: { hp: 190, mp: 95 }
+    };
+    for (let i = 0; i < classes.length; i++) {
+        const cls = classes[i];
+        for (let lv = 1; lv <= 8; lv++) {
+            const pooled = poolMaxForLevel(lv, cls);
+            assert.strictEqual(pooled.hpMax, hp1to8[lv - 1], cls.id + ' L' + lv + ' hp');
+            assert.strictEqual(pooled.mpMax, mp1to8[lv - 1], cls.id + ' L' + lv + ' mp');
+        }
+        const at9 = poolMaxForLevel(9, cls);
+        assert.strictEqual(at9.hpMax, l9[cls.id].hp, cls.id + ' L9 hp');
+        assert.strictEqual(at9.mpMax, l9[cls.id].mp, cls.id + ' L9 mp');
+    }
+    const l1 = { hp: 50, hpMax: 150, mp: 10, mpMax: 55 };
+    assert.strictEqual(applyLevelPoolDelta(l1, 1, 2, classes[1]), true);
+    assert.strictEqual(l1.hpMax, 155);
+    assert.strictEqual(l1.mpMax, 60);
+    assert.strictEqual(l1.hp, 55, 'wounded L1→L2 heals the +5 gain');
+    assert.strictEqual(l1.mp, 15);
+    const jump = { hp: 150, hpMax: 150, mp: 55, mpMax: 55 };
+    assert.strictEqual(applyLevelPoolDelta(jump, 1, 9, classes[0]), true);
+    assert.strictEqual(jump.hpMax, 200);
+    assert.strictEqual(jump.mpMax, 95);
+    assert.strictEqual(jump.hp, 200);
+    const wrongSeed = { hp: 185, hpMax: 185, mp: 90, mpMax: 90 };
+    assert.strictEqual(applyLevelPoolDelta(wrongSeed, 1, 2, classes[0]), true);
+    assert.strictEqual(wrongSeed.hpMax, 155);
+    assert.strictEqual(wrongSeed.hp, 155, 'wrong L1 185 seed clamps on first level-up');
 
     const fist = applySkillTries(p, 'fist', 50, { skillProgression: true, vocationRates: guardian });
     assert.strictEqual(fist.levelsGained, 1);

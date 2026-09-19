@@ -226,7 +226,7 @@ function main() {
     // 4. World Integration: 3 Creature Attackers vs 1 Shielded Player
     // -------------------------------------------------------------------------
     const w = makeWorld({ autoIntervalTicks: 40 });
-    const session = makeSession(w, warrior(1, { level: 10 }));
+    const session = makeSession(w, warrior(1, { level: 10 }), { x: 77, y: 99, z: 6 });
     const itemDb = w.itemDb();
 
     // Equip a wooden shield in leftHand

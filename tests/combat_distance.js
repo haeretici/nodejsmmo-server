@@ -12,13 +12,14 @@ const { C2S, S2C, SWING_FLAG } = require('../src/protocol/opcodes');
 const { decodeFrame } = require('../src/protocol/frame');
 const { decodeSwing, decodeStats, decodeSay } = require('../src/protocol/messages');
 const { resolveDistanceAuto, meleeAutoBounds, levelBonus } = require('../src/world/combat');
-const { hasLineOfSight } = require('../src/world/shapes');
+const { hasLineOfSight, getAffectedTiles } = require('../src/world/shapes');
 const {
     applyPlayerLoadout,
     createItemInstance,
     placeInEquipment,
     placeInContainer,
-    getStackCount
+    getStackCount,
+    equippedRightHandCount
 } = require('../src/world/inventory');
 const { findItem } = require('../src/world/items');
 
@@ -74,6 +75,11 @@ function makeSession(world, ch, pos) {
     world.sendEnterWorld(session);
     world.syncAppears(session);
     return session;
+}
+
+function readyAuto(session) {
+    session.attackReadyTick = 0;
+    session.moveReadyTick = 0;
 }
 
 function scout(id, opts) {
@@ -263,14 +269,14 @@ function main() {
     for (const dist of [1, 2, 3, 4, 5, 6]) {
         dummy.x = 77 + dist;
         dummy.y = 99;
-        session.attackReadyTick = 0;
+        readyAuto(session);
         const swung = w.trySwing(session, dummy, 1);
         assert.ok(swung, `distance auto should succeed at distance ${dist}`);
     }
 
     dummy.x = 77 + 7;
     dummy.y = 99;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     const swungDist7 = w.trySwing(session, dummy, 2);
     assert.strictEqual(swungDist7, false, 'distance auto must fail at Chebyshev 7');
 
@@ -282,14 +288,14 @@ function main() {
     const wallIdx = w.tileMap.index(78, 99, layer.cols);
     const origSight = layer.sight[wallIdx];
     layer.sight[wallIdx] = 255;
-    session.attackReadyTick = 0;
+    readyAuto(session);
 
     const swungBlocked = w.trySwing(session, dummy, 3);
     assert.strictEqual(swungBlocked, false, 'distance attack must be blocked by solid wall');
 
     // Clear wall
     layer.sight[wallIdx] = origSight;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     const swungCleared = w.trySwing(session, dummy, 4);
     assert.ok(swungCleared, 'distance attack must succeed once sight blocker is cleared');
 
@@ -318,7 +324,8 @@ function main() {
     const sayFrame = lastOf(session2.socket, S2C.SAY);
     assert.ok(sayFrame, 'must send SAY packet when ammunition is missing');
     const sayMsg = decodeSay(sayFrame.payload);
-    assert.strictEqual(sayMsg, 'You need ammunition.');
+    assert.strictEqual(sayMsg.text, 'You need ammunition.');
+    assert.strictEqual(sayMsg.speakerId, 0);
 
     session2.socket.sent.length = 0;
     const noAmmoRetry = w.trySwing(session2, dummy, 10);
@@ -326,7 +333,7 @@ function main() {
     assert.strictEqual(session2.attackReadyTick, 0, 'retry must still leave attackReadyTick unarmed');
     const sayRetry = lastOf(session2.socket, S2C.SAY);
     assert.ok(sayRetry, 'retry without ammo must still SAY');
-    assert.strictEqual(decodeSay(sayRetry.payload), 'You need ammunition.');
+    assert.strictEqual(decodeSay(sayRetry.payload).text, 'You need ammunition.');
 
     // Now give session2 exactly 2 arrows in a quiver
     const quiver2Uid = createItemInstance(session2.inventory, 'quiver', itemDb);
@@ -363,7 +370,7 @@ function main() {
     assert.strictEqual(session2.attackReadyTick, 0, 'exhausted quiver must not bump attackReadyTick');
     const sayFrame3 = lastOf(session2.socket, S2C.SAY);
     assert.ok(sayFrame3);
-    assert.strictEqual(decodeSay(sayFrame3.payload), 'You need ammunition.');
+    assert.strictEqual(decodeSay(sayFrame3.payload).text, 'You need ammunition.');
 
     // -------------------------------------------------------------------------
     // 5. Distance Skill Progression Advances Correctly (+2 blood hit / +1 mitigated)
@@ -415,7 +422,7 @@ function main() {
     assert.strictEqual(starItem.range, 4);
     assert.strictEqual(starItem.maxHitChance, 96);
 
-    const starUid = createItemInstance(session4.inventory, 'nightshade_star', itemDb);
+    const starUid = createItemInstance(session4.inventory, 'nightshade_star', itemDb, { count: 5 });
     placeInEquipment(session4.inventory, starUid, 'rightHand', itemDb);
     applyPlayerLoadout(session4, itemDb);
 
@@ -424,13 +431,34 @@ function main() {
     assert.strictEqual(session4.atk, 65, 'throwing weapon atk is weapon atk');
     assert.strictEqual(session4.hitChance, 96, 'throwing weapon hitChance is weapon maxHitChance');
     assert.strictEqual(session4.weaponRange, 4);
+    assert.strictEqual(starItem.breakChance, 33);
+    assert.strictEqual(equippedRightHandCount(session4.inventory), 5);
 
     // Throwing attack does NOT require or consume quiver ammo
     dummy.x = 80; // distance 3 (within range 4)
     dummy.armor = 0;
+    dummy.hp = 1000;
+    w.rng = () => 0.5;
     session4.attackReadyTick = 0;
     const starSwung = w.trySwing(session4, dummy, 30);
     assert.ok(starSwung, 'throwing weapon auto should succeed without quiver ammo');
+    assert.strictEqual(equippedRightHandCount(session4.inventory), 5, 'rng 50 vs 33% does not break');
+
+    w.rng = () => 0;
+    session4.attackReadyTick = 0;
+    dummy.hp = 1000;
+    const missBefore = dummy.hp;
+    session4.hitChance = 0;
+    applyPlayerLoadout(session4, itemDb);
+    session4.hitChance = 0;
+    const missThrow = w.trySwing(session4, dummy, 31);
+    assert.ok(missThrow, 'missed throw still resolves');
+    assert.strictEqual(dummy.hp, missBefore, 'miss deals no damage');
+    assert.strictEqual(equippedRightHandCount(session4.inventory), 4, 'breakChance rolls on miss');
+
+    session4.hitChance = 96;
+    applyPlayerLoadout(session4, itemDb);
+    w.rng = () => 0.5;
 
     // -------------------------------------------------------------------------
     // 7. World: shielded dummy does not block player arrows
@@ -452,6 +480,106 @@ function main() {
     assert.ok(shieldedSwing, 'bow shot vs shielded dummy must swing');
     assert.ok(dummy.hp < hpBeforeShield, 'arrows must land through wooden_shield (isMelee: false)');
     assert.strictEqual(dummy.shieldBlocksThisWindow, 0, 'player distance auto must not spend a shield charge');
+
+    // -------------------------------------------------------------------------
+    // 8. Weapon auto moveLock 0.05s
+    // -------------------------------------------------------------------------
+    const lockBefore = session.moveReadyTick | 0;
+    session.attackReadyTick = 0;
+    dummy.hp = 1000;
+    dummy.x = 79;
+    dummy.y = 99;
+    const lockTick = 50;
+    assert.ok(w.trySwing(session, dummy, lockTick));
+    assert.ok(
+        (session.moveReadyTick | 0) > lockTick,
+        'accepted auto plants moveLock'
+    );
+    assert.ok((session.moveReadyTick | 0) >= lockBefore);
+    session.attackReadyTick = 0;
+    assert.strictEqual(
+        w.trySwing(session, dummy, lockTick),
+        false,
+        'same-tick auto yields while move-locked'
+    );
+    const emptyLock = session.moveReadyTick | 0;
+    session.attackReadyTick = 0;
+    dummy.x = 90;
+    dummy.y = 99;
+    const oor = w.trySwing(session, dummy, 51);
+    assert.strictEqual(oor, false, 'OOR does not swing');
+    assert.strictEqual(session.moveReadyTick | 0, emptyLock, 'OOR does not extend moveLock');
+    dummy.x = 79;
+    dummy.y = 99;
+
+    // -------------------------------------------------------------------------
+    // 9. Ammo autoShape burst 3×3
+    // -------------------------------------------------------------------------
+    const burst = findItem(itemDb, 'burst_arrow');
+    const diamond = findItem(itemDb, 'diamond_arrow');
+    assert.ok(burst && diamond);
+    assert.deepStrictEqual(burst.autoShape, { type: 'area', code: 3 });
+    assert.deepStrictEqual(diamond.autoShape, { type: 'area', code: 4 });
+    const burstTiles = getAffectedTiles({
+        caster: { x: 77, y: 99, z: 6 },
+        center: { x: 79, y: 99, z: 6 },
+        shape: burst.autoShape
+    });
+    const diamondTiles = getAffectedTiles({
+        caster: { x: 77, y: 99, z: 6 },
+        center: { x: 79, y: 99, z: 6 },
+        shape: diamond.autoShape
+    });
+    assert.strictEqual(burstTiles.length, 9, 'burst 3×3');
+    assert.strictEqual(diamondTiles.length, 21, 'diamond 5×5 circle');
+    const dKeys = new Set(diamondTiles.map((t) => t.x + ',' + t.y));
+    assert.ok(!dKeys.has('77,97'), 'diamond corner empty');
+    assert.ok(dKeys.has('79,97'), 'diamond mid-edge present');
+
+    const session5 = makeSession(w, scout(5, { level: 10, distanceSkill: 30 }), { x: 77, y: 99, z: 6 });
+    const bow5 = createItemInstance(session5.inventory, 'hunter_bow', itemDb);
+    placeInEquipment(session5.inventory, bow5, 'rightHand', itemDb);
+    const quiver5 = createItemInstance(session5.inventory, 'quiver', itemDb);
+    placeInEquipment(session5.inventory, quiver5, 'leftHand', itemDb);
+    const burstUid = createItemInstance(session5.inventory, 'burst_arrow', itemDb, { count: 3 });
+    const addBurst = placeInContainer(session5.inventory, burstUid, quiver5, null, itemDb);
+    assert.ok(addBurst.ok, 'burst arrows go in quiver');
+    applyPlayerLoadout(session5, itemDb);
+    assert.strictEqual(getStackCount(session5.inventory.items[burstUid]), 3);
+
+    const primary = w.spawnCreature('rat', 79, 99, 6);
+    const adj = w.spawnCreature('rat', 79, 100, 6);
+    const far = w.spawnCreature('rat', 85, 99, 6);
+    assert.ok(primary && adj && far, 'burst targets spawn');
+    primary.hp = 500;
+    primary.hpMax = 500;
+    primary.armor = 0;
+    primary.mitigation = 0;
+    adj.hp = 500;
+    adj.hpMax = 500;
+    adj.armor = 0;
+    adj.mitigation = 0;
+    far.hp = 500;
+    far.hpMax = 500;
+    const hpFar = far.hp;
+    w.rng = () => 0.5;
+    session5.attackReadyTick = 0;
+    const burstSwing = w.trySwing(session5, primary, 60);
+    assert.ok(burstSwing, 'burst auto swings');
+    assert.ok(primary.hp < 500, 'burst hits sticky target');
+    assert.ok(adj.hp < 500, 'burst hits 3×3 neighbor');
+    assert.strictEqual(far.hp, hpFar, 'burst does not hit outside footprint');
+    assert.strictEqual(getStackCount(session5.inventory.items[burstUid]), 2, 'one ammo per swing');
+
+    session5.hitChance = 0;
+    session5.attackReadyTick = 0;
+    const hpP = primary.hp;
+    const hpA = adj.hp;
+    const missBurst = w.trySwing(session5, primary, 61);
+    assert.ok(missBurst, 'shaped miss still resolves');
+    assert.strictEqual(primary.hp, hpP);
+    assert.strictEqual(adj.hp, hpA, 'miss has no footprint');
+    assert.strictEqual(getStackCount(session5.inventory.items[burstUid]), 1, 'miss spends ammo');
 
     w.stop();
     console.log('ok combat_distance');

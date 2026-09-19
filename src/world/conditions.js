@@ -507,15 +507,25 @@ function removeConditions(entity, kinds) {
     return n;
 }
 
+function entityHasCondition(entity, kind) {
+    if (!entity || !kind) return false;
+    const list = entity.conditions;
+    if (!Array.isArray(list)) return false;
+    const want = String(kind);
+    for (let i = 0; i < list.length; i++) {
+        if (list[i] && list[i].kind === want) return true;
+    }
+    return false;
+}
+
 function isInvisible(entity) {
     if (!entity) return false;
     if (entity.invisible === true) return true;
-    const list = entity.conditions;
-    if (!Array.isArray(list)) return false;
-    for (let i = 0; i < list.length; i++) {
-        if (list[i] && list[i].kind === 'invisible') return true;
-    }
-    return false;
+    return entityHasCondition(entity, 'invisible');
+}
+
+function hasHaste(entity) {
+    return entityHasCondition(entity, 'haste');
 }
 
 function isCannotAttack(entity) {
@@ -706,9 +716,12 @@ module.exports = {
     removeConditions,
     tickConditions,
     isInvisible,
+    hasHaste,
+    entityHasCondition,
     isCannotAttack,
     getAttributeMods,
     absorbWithManaShield,
+    recomputeDerived,
     applyHpDeltaLocal,
     isImmuneToCondition,
     hasteSpeedChangeFromFormula,

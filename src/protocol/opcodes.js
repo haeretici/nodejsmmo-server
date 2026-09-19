@@ -9,11 +9,13 @@ const C2S = Object.freeze({
     LOGOUT: 3,
     MOVE_STEP: 10,
     SET_TARGET: 11,
-    SET_AUTO_CHASE: 12,
+    // 12 unused (was SET_AUTO_CHASE; chase is client MOVE_PATH)
     USE_STAIR: 13,
     USE: 14,
     USE_ITEM_WITH: 15,
     CAST: 16,
+    // 17 unused (was SET_HOTKEYS; bars are client IndexedDB)
+    MOVE_PATH: 18,
     OPEN_CORPSE: 20,
     LOOT_TAKE: 21,
     LOOT_CLOSE: 22,
@@ -60,6 +62,7 @@ const S2C = Object.freeze({
     SHOP: 132,
     FIELD: 133,
     FIELD_GONE: 134
+    // 135 unused (was HOTKEYS; bars are client IndexedDB)
 });
 
 const REASON = Object.freeze({
@@ -109,6 +112,50 @@ const SWING_FLAG = Object.freeze({
     FATAL: 8
 });
 
+/** Wire `SWING` extra `element u8`. Unknown names → PHYSICAL. */
+const SWING_ELEMENT = Object.freeze({
+    PHYSICAL: 0,
+    FIRE: 1,
+    ICE: 2,
+    ENERGY: 3,
+    EARTH: 4,
+    DEATH: 5,
+    HOLY: 6,
+    HEALING: 7,
+    POISON: 8,
+    LIFEDRAIN: 9,
+    MANADRAIN: 10
+});
+
+const SWING_ELEMENT_NAMES = Object.freeze([
+    'physical',
+    'fire',
+    'ice',
+    'energy',
+    'earth',
+    'death',
+    'holy',
+    'healing',
+    'poison',
+    'lifedrain',
+    'manadrain'
+]);
+
+function swingElementId(name) {
+    if (typeof name === 'number' && Number.isFinite(name)) {
+        const n = name | 0;
+        return n >= 0 && n < SWING_ELEMENT_NAMES.length ? n : SWING_ELEMENT.PHYSICAL;
+    }
+    if (name == null || name === '') return SWING_ELEMENT.PHYSICAL;
+    const s = String(name).toLowerCase();
+    const i = SWING_ELEMENT_NAMES.indexOf(s);
+    return i >= 0 ? i : SWING_ELEMENT.PHYSICAL;
+}
+
+function swingElementName(id) {
+    return SWING_ELEMENT_NAMES[id | 0] || 'physical';
+}
+
 const DIR = Object.freeze({
     N: 0,
     E: 1,
@@ -128,8 +175,8 @@ const C2S_ENTERED = new Set([
     C2S.LOGOUT,
     C2S.MOVE_STEP,
     C2S.SET_TARGET,
-    C2S.SET_AUTO_CHASE,
     C2S.USE_STAIR,
+    C2S.MOVE_PATH,
     C2S.USE,
     C2S.USE_ITEM_WITH,
     C2S.CAST,
@@ -166,6 +213,10 @@ module.exports = {
     LOC_KIND,
     SKILL_ORDER,
     SWING_FLAG,
+    SWING_ELEMENT,
+    SWING_ELEMENT_NAMES,
+    swingElementId,
+    swingElementName,
     DIR,
     DIR_DELTA,
     C2S_ENTERED,

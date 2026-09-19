@@ -8,10 +8,10 @@ const { GameSession } = require('../src/world/session');
 const { MemoryStore } = require('../src/persist/memory_store');
 const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
-const { C2S, S2C, SWING_FLAG } = require('../src/protocol/opcodes');
+const { C2S, S2C, SWING_FLAG, SWING_ELEMENT } = require('../src/protocol/opcodes');
 const { decodeFrame } = require('../src/protocol/frame');
 const { decodeSwing, decodeStats } = require('../src/protocol/messages');
-const { resolveWandAuto } = require('../src/world/combat');
+const { resolveWandAuto, computeMagicStrikeRange, WAND_AUTO_FALLBACK_BASE_POWER } = require('../src/world/combat');
 const { hasLineOfSight } = require('../src/world/shapes');
 const {
     applyPlayerLoadout,
@@ -73,6 +73,11 @@ function makeSession(world, ch, pos) {
     world.sendEnterWorld(session);
     world.syncAppears(session);
     return session;
+}
+
+function readyAuto(session) {
+    session.attackReadyTick = 0;
+    session.moveReadyTick = 0;
 }
 
 function adept(id, opts) {
@@ -253,15 +258,19 @@ function main() {
     for (const dist of [2, 3, 4]) {
         dummy.x = 77 + dist;
         dummy.y = 99;
-        session.attackReadyTick = 0;
+        readyAuto(session);
         const swung = w.trySwing(session, dummy, 1);
         assert.ok(swung, `wand auto should succeed at distance ${dist}`);
     }
+    const wandWire = w.swingWire(session, dummy, 4, 0, { element: 'fire' });
+    assert.strictEqual(wandWire.element, 'fire');
+    assert.strictEqual(wandWire.weaponId, 'ember_wand');
+    assert.strictEqual(SWING_ELEMENT.FIRE, 1);
 
     // Attacks fail at distance 5 (Ember Wand range is 4)
     dummy.x = 77 + 5;
     dummy.y = 99;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     const swungDist5 = w.trySwing(session, dummy, 2);
     assert.strictEqual(swungDist5, false, 'wand auto must fail at distance 5');
 
@@ -275,14 +284,14 @@ function main() {
     const wallIdx = w.tileMap.index(78, 99, layer.cols);
     const origSight = layer.sight[wallIdx];
     layer.sight[wallIdx] = 255;
-    session.attackReadyTick = 0;
+    readyAuto(session);
 
     const swungBlocked = w.trySwing(session, dummy, 3);
     assert.strictEqual(swungBlocked, false, 'attacks must be blocked by solid sight blocker');
 
     // Clear wall blocker
     layer.sight[wallIdx] = origSight;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     const swungCleared = w.trySwing(session, dummy, 4);
     assert.ok(swungCleared, 'attacks must succeed after sight blocker is cleared');
 
@@ -292,7 +301,7 @@ function main() {
     dummy.hp = 100;
     dummy.x = 79;
     dummy.y = 99; // distance 2, clear line of sight
-    session.attackReadyTick = 0;
+    readyAuto(session);
 
     const beforeMp = session.mp;
     const mpSwung = w.trySwing(session, dummy, 5);
@@ -301,16 +310,33 @@ function main() {
 
     // Test MP does not exceed mpMax
     session.mp = 99;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     w.trySwing(session, dummy, 6);
     assert.strictEqual(session.mp, 100, 'player MP must cap at mpMax');
 
     // Verify no weapon skill tries are awarded on wand auto
     const magicTriesBefore = (session._skillCounters && session._skillCounters.magic) || 0;
-    session.attackReadyTick = 0;
+    readyAuto(session);
     w.trySwing(session, dummy, 7);
     const magicTriesAfter = (session._skillCounters && session._skillCounters.magic) || 0;
     assert.strictEqual(magicTriesAfter, magicTriesBefore, 'no weapon skill tries should be awarded for wand auto');
+
+    // Omit both min/max → magic_strike fallback (not 0 damage)
+    session.weaponMin = null;
+    session.weaponMax = null;
+    const curve = computeMagicStrikeRange(session, WAND_AUTO_FALLBACK_BASE_POWER, 0);
+    assert.ok(curve.max > 0);
+    dummy.hp = 1000;
+    dummy.hpMax = 1000;
+    dummy.armor = 0;
+    dummy.mitigation = 0;
+    dummy.resists = { fire: 0 };
+    readyAuto(session);
+    const omitSwung = w.trySwing(session, dummy, 8);
+    assert.ok(omitSwung, 'wand without min/max still swings');
+    assert.ok(dummy.hp < 1000, 'magic_strike fallback deals damage');
+    const omitUnit = resolveWandAuto(session, dummy, () => 0);
+    assert.strictEqual(omitUnit.raw, curve.min);
 
     w.stop();
     console.log('ok combat_wands');

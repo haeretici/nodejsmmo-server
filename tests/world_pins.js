@@ -215,7 +215,7 @@ function main() {
     }));
     harvestWorld.step(2);
     const emptySay = decodeSay(lastOf(herbSession.socket, S2C.SAY).payload);
-    assert.strictEqual(emptySay, 'You find nothing.');
+    assert.strictEqual(emptySay.text, 'You find nothing.');
     harvestWorld.stop();
 
     const amuletWorld = makeWorld({

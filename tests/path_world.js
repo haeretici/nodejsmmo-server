@@ -152,6 +152,23 @@ function main() {
     budget.begin(2);
     assert.strictEqual(budget.take({ critical: false }), true);
 
+    const wChase = makeWorld({
+        stepDelayTicks: 1,
+        creatureStepDelayTicks: 100,
+        spawns: [{ kind: 'dummy', x: 0, y: 0, z: 0 }]
+    }, gridMap(8, 3, []));
+    const chaser = makeSession(wChase, ash(20), { x: 7, y: 0, z: 0 });
+    const dummy = Array.from(wChase.creatures.values())[0];
+    assert.ok(dummy);
+    chaser.targetId = dummy.id;
+    const hx = chaser.x;
+    const hy = chaser.y;
+    for (let t = 1; t <= 8; t++) wChase.step(t);
+    assert.strictEqual(chaser.x, hx, 'server does not A* player chase');
+    assert.strictEqual(chaser.y, hy, 'server does not A* player chase');
+    chaser.kick(REASON.LOGOUT);
+    wChase.stop();
+
     console.log('ok path_world');
 }
 

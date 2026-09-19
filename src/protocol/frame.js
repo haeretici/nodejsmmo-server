@@ -293,12 +293,22 @@ function measureFramePayload(opcode, buf, off = 0) {
             return rem >= 4 ? 4 : -1;
         case S2C.DEATH: return rem >= 8 ? 8 : -1;
         case S2C.MOVE: return rem >= 10 ? 10 : -1;
-        case S2C.SWING: return rem >= 11 ? 11 : -1;
+        case S2C.SWING: {
+            if (!need(11)) return -1;
+            o += 11;
+            if (!need(1)) return o - off;
+            o += 1;
+            if (readStr() == null) return o - off;
+            if (readStr() == null) return o - off;
+            return o - off;
+        }
         case S2C.STATS: return rem >= 12 ? 12 : -1;
         case S2C.SKILLS: return rem >= 16 ? 16 : -1;
         case S2C.FIELD_GONE: return rem >= 5 ? 5 : -1;
         case S2C.SAY: {
             if (readStr() == null) return -1;
+            if (need(4)) o += 4;
+            if (need(1)) o += 1;
             return o - off;
         }
         case S2C.ITEM_GAIN: {
@@ -318,6 +328,7 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (readStr() == null) return -1;
             if (!need(10)) return -1; o += 10;
             if (readStr() == null) return -1;
+            if (need(1)) o += 1;
             return o - off;
         }
         case S2C.CORPSE: {
@@ -396,6 +407,7 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (!need(5)) return -1; o += 5;
             if (readStr() == null) return -1;
             if (need(1)) o += 1;
+            if (need(4)) o += 4;
             return o - off;
         }
         case S2C.EXP: {

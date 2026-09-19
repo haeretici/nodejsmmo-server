@@ -33,7 +33,7 @@ Required secret: `GAME_MYSQL_PASSWORD` or `mysql.password` in the **local** over
 | `account_sessions` | `token_hash` BINARY(32) — raw cookie never stored |
 | `characters` | name UNIQUE, voc, level, exp, pos, hp/mp |
 | `character_skills` | levels + `*_tries` toward next (skill try progress / ML mana) |
-| `character_state` | `inventory` `storage` `conditions` `hotkeys` `appearance` JSON |
+| `character_state` | `inventory` `storage` `conditions` `hotkeys` `appearance` JSON. `hotkeys` leftover column — always `{}` (no session field). Bars live in the browser (`engine.prefs` IndexedDB). Game process does not seed or admit bar JSON |
 | `play_tokens` | one-time game token, hashed |
 | `ip_bans` `account_bans` | expiry + reason |
 

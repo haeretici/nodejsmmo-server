@@ -54,7 +54,7 @@ function mysticPack() {
                 mpPerLevel: 10,
                 critChance: 5,
                 critDamage: 10,
-                spells: ['snap_jab', 'blaze_field_rune', 'quick_strike'],
+                spells: ['snap_jab', 'blaze_field_rune', 'quick_strike', 'magic_patch'],
                 skillRates: { melee: 1.4, fist: 1.1, magic: 1.25 }
             }]
         },
@@ -91,6 +91,22 @@ function mysticPack() {
                     level: 1,
                     damageAmplitude: 0.1,
                     cooldowns: { primary: { attack: 0.10 } }
+                },
+                {
+                    id: 'magic_patch',
+                    kind: 'heal',
+                    element: 'healing',
+                    powerCurve: 'magic_strike',
+                    basePower: 20,
+                    range: 1,
+                    mana: 6,
+                    hitChance: 100,
+                    requiresTarget: false,
+                    selfTarget: true,
+                    vocations: ['mystic'],
+                    level: 1,
+                    damageAmplitude: 0.1702,
+                    cooldowns: { primary: { healing: 1 } }
                 },
                 {
                     id: 'blaze_field_rune',
@@ -159,8 +175,8 @@ function makeSession(world, ch, pos) {
     return session;
 }
 
-function ash(id) {
-    return {
+function ash(id, extra) {
+    return Object.assign({
         id: id || 1,
         accountId: id || 1,
         name: 'Ash',
@@ -172,7 +188,7 @@ function ash(id) {
         mp: 90,
         mpMax: 90,
         townId: 1
-    };
+    }, extra || {});
 }
 
 function main() {
@@ -218,7 +234,7 @@ function main() {
     }));
     w.step(2);
     const tired = decodeSay(lastOf(session.socket, S2C.SAY).payload);
-    assert.strictEqual(tired, 'You are exhausted.');
+    assert.strictEqual(tired.text, 'You are exhausted.');
     session.kick(REASON.LOGOUT);
     w.stop();
 
@@ -241,6 +257,37 @@ function main() {
     assert.strictEqual(dummy2.hp, dummy2.hpMax);
     caster.kick(REASON.LOGOUT);
     w2.stop();
+
+    const wHeal = makeWorld({
+        autoIntervalTicks: 40,
+        spawns: [{ kind: 'dummy', x: 12, y: 11, z: 0 }]
+    });
+    const healer = makeSession(wHeal, ash(21, { hp: 50, hpMax: 185, mp: 90 }));
+    wHeal.tileMap.setTileFlags(healer.x, healer.y, healer.z, TILE_FLAG_NO_CAST);
+    const dummyHeal = Array.from(wHeal.creatures.values())[0];
+    dummyHeal.hp = 10;
+    dummyHeal.hpMax = 100;
+    const hpBefore = healer.hp | 0;
+    assert.ok(wHeal.enqueueIntent(healer, {
+        opcode: C2S.CAST,
+        seq: 1,
+        payload: encodeCast({
+            spellId: 'magic_patch',
+            targetId: dummyHeal.id,
+            x: dummyHeal.x,
+            y: dummyHeal.y,
+            z: dummyHeal.z
+        })
+    }));
+    wHeal.step(1);
+    assert.ok(!lastOf(healer.socket, S2C.REJECT), 'self heal must not REJECT in PZ');
+    const healFx = decodeCastFx(lastOf(healer.socket, S2C.CAST).payload);
+    assert.ok(healFx);
+    assert.strictEqual(healFx.spellId, 'magic_patch');
+    assert.ok((healer.hp | 0) > hpBefore);
+    assert.strictEqual(dummyHeal.hp, 10, 'self-only heal ignores selected target');
+    healer.kick(REASON.LOGOUT);
+    wHeal.stop();
 
     const w3 = makeWorld({
         autoIntervalTicks: 40,
@@ -271,6 +318,7 @@ function main() {
     assert.strictEqual(countItem(fieldCaster.inventory, 'blaze_field_rune'), 1);
     const fieldMsg = decodeField(lastOf(fieldCaster.socket, S2C.FIELD).payload);
     assert.strictEqual(fieldMsg.kind, 'fire');
+    assert.strictEqual(fieldMsg.createdTick, 1);
     fieldCaster.kick(REASON.LOGOUT);
     w3.stop();
 
@@ -318,7 +366,7 @@ function main() {
     }));
     w4.step(11);
     const tiredQuick = decodeSay(lastOf(quickCaster.socket, S2C.SAY).payload);
-    assert.strictEqual(tiredQuick, 'You are exhausted.');
+    assert.strictEqual(tiredQuick.text, 'You are exhausted.');
 
     // At tick 12 (+2 ticks = exact 0.10s): cast quick_strike -> SUCCEEDS without +1 tick float delay!
     assert.ok(w4.enqueueIntent(quickCaster, {
@@ -379,6 +427,7 @@ function main() {
     assert.strictEqual(fieldPlantedMsg.kind, 'fire');
     assert.strictEqual(fieldPlantedMsg.x, 12);
     assert.strictEqual(fieldPlantedMsg.y, 13);
+    assert.strictEqual(fieldPlantedMsg.createdTick, 10);
 
     // Advance 30 ticks (1.5s > 1.0s duration): field expires and S2C.FIELD_GONE is broadcast
     for (let t = 11; t <= 35; t++) {

@@ -192,7 +192,10 @@ function main() {
     );
     const say = lastOf(near.socket, S2C.SAY);
     assert.ok(say, 'idle voice SAY to viewers');
-    assert.strictEqual(decodeSay(say.payload), 'Need directions?');
+    const voice = decodeSay(say.payload);
+    assert.strictEqual(voice.text, 'Need directions?');
+    assert.strictEqual(voice.speakerId, npc.id);
+    assert.strictEqual(voice.yell, false);
     near.kick(REASON.LOGOUT);
     wNear.stop();
 

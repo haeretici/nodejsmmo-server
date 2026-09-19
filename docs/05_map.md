@@ -7,7 +7,7 @@ Town tile is pack `bounds.json` `town` / `spawn` (`map.spawn` / `spawnX,Y,Z`). *
 ## Do not
 
 - Dungeon generator as world gen.
-- Client-authoritative walk (client may interpolate only).
+- Client-authoritative landing tile (`I am at x,y`). Player A* / chase on this process (client BFS → `MOVE_PATH` dirs; this process validates occupancy + step delay).
 - Nested `data[z][y][x]` tile objects. Player ids in ground-item lists.
 - Creature–creature stack. Creature enter player/mixed on normal move. Swap/yield/hold.
 - SQL on the tick. Position persists on logout / interval / wall-clock, not on each step.
@@ -34,17 +34,20 @@ Hybrid like the lab TileMap: `occupancy` is **0** or **first** combatant id (`In
 | Knob | Default |
 | ---: | ---: |
 | `playerTileMaxStack` | **10** (0 = unlimited) |
-| `playerBaseSpeed` | **110** (+ `level−1`). Kit `speed` on creatures |
+| `playerBaseSpeed` | **110** fallback. Live player speed is class `baseSpeed` + (level−1) + gear.speed + class `speedBonus` (`applyPlayerLoadout`). Kit `speed` on creatures |
 | `stepDelayTicks` | **4** — tests only when `fixedStepDelay` |
 | `creatureStepDelayTicks` | **5** — tests only when `fixedStepDelay` |
-| Live delay | friction×speed tables (`movement.js`). Friction 100 + speed 110 → **0.4 s** = **8** ticks at 20 UPS. Diagonal `×2`. Extra `MOVE_STEP` / `USE_STAIR` before ready → `REJECT BUSY`. `/play` and `/debug` ignore OS key-repeat (200 ms auto-repeat) |
-| `pathMaxDistance` | **100** (player chase / return-home) |
+| Live delay | friction×speed tables (`movement.js`). Friction 100 + speed 110 → **0.4 s** = **8** ticks at 20 UPS. Diagonal `×2`. Extra `MOVE_STEP` / `USE_STAIR` before ready → `REJECT BUSY`. `MOVE_PATH` replaces the dir queue and waits. `/play` and `/debug` ignore OS key-repeat (200 ms auto-repeat) |
+| `movePathMaxSteps` | **165** (`MOVE_PATH` n cap; viewport 15×11) |
+| `pathMaxDistance` | **100** (creature return-home) |
 | `pathMaxIterations` | **512** |
 | `aiCreaturePathMaxDistance` | **12** (creature chase) |
 | `aiRepathIntervalSec` | **2.0** optional moving-goal A* |
 | `aiRepathFailBackoffSec` | **0.25** after failed critical |
 | `aiPathBudgetPerFrame` | **0** unlimited (stress **48**) — optional repaths only |
 | `aiCreatureThinkIntervalSec` | **1.0** (≤0 = every tick) |
+| `aiCreatureThreatDecayHalflifeSec` | **10** (`damageTakenBy` half-life; 0 = no decay; per-kit `flags.threatDecayHalflifeSec`) |
+| `aiCreatureRetargetIntervalSec` | **0** (sticky until lose; per-kit `changeTarget.interval` ms + `chance` % override) |
 | `aiOccupantStepPenalty` | **4** soft cost on push-enterable tiles |
 | `creaturePushCrush` | **true** |
 | `noPlayerStack` | off everywhere |
@@ -61,7 +64,7 @@ Join order. Index 0 = first. Players stack with players. `enterTile` / `leaveTil
 | `src/world/pathfinder.js` | binary-friction A* (`findPath`) |
 | `src/world/movement.js` | friction×speed delay tables |
 | `src/world/path_budget.js` | Option B optional-repath budget |
-| `src/world/world.js` | apply `MOVE_STEP` / `USE_STAIR`, AOI appear/move, on_demand pins, `followPath` chase |
+| `src/world/world.js` | apply `MOVE_STEP` / `MOVE_PATH` / `USE_STAIR`, AOI appear/move, on_demand pins, creature `followPath`. Player `session.path` is queued dirs, not A* tiles |
 | `src/world/spawn_pins.js` | pin catalog, AOI margin, respawn seconds → ticks |
 | `src/world/world_pins.js` | `world[]` seed at boot (not SQL). Blocking pins patch friction 255 |
 | `src/world/world_pin_actions.js` | USE / rope-shovel hop / trap step |

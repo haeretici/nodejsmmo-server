@@ -43,12 +43,25 @@ function stubPack() {
         classes: {
             classes: [{
                 id: 'scout',
+                baseHp: 185,
+                baseMp: 90,
                 hpPerLevel: 10,
                 mpPerLevel: 15,
                 critChance: 5,
                 critDamage: 10,
                 skillRates: {
                     melee: 1.2, fist: 1.2, distance: 1.1, shielding: 1.1, magic: 1.4
+                }
+            }, {
+                id: 'guardian',
+                baseHp: 185,
+                baseMp: 90,
+                hpPerLevel: 15,
+                mpPerLevel: 5,
+                critChance: 5,
+                critDamage: 10,
+                skillRates: {
+                    melee: 1.1, fist: 1.1, distance: 1.4, shielding: 1.1, magic: 3.0
                 }
             }]
         }
@@ -81,10 +94,10 @@ function ash(id) {
         vocation: 'scout',
         level: 1,
         experience: 0,
-        hp: 185,
-        hpMax: 185,
-        mp: 90,
-        mpMax: 90,
+        hp: 150,
+        hpMax: 150,
+        mp: 55,
+        mpMax: 55,
         townId: 1
     };
 }
@@ -119,7 +132,8 @@ async function main() {
     });
     const session = makeSession(w, ash(1));
     assert.strictEqual(session.level, 1);
-    assert.strictEqual(session.hpMax, 185);
+    assert.strictEqual(session.hpMax, 150);
+    assert.strictEqual(session.mpMax, 55);
     const dummy = Array.from(w.creatures.values())[0];
     dummy.hp = 1;
     assert.ok(w.enqueueIntent(session, {
@@ -128,15 +142,34 @@ async function main() {
     w.step(1);
     assert.strictEqual(session.experience, 100);
     assert.strictEqual(session.level, 2);
-    assert.strictEqual(session.hpMax, 195);
+    assert.strictEqual(session.hpMax, 155);
+    assert.strictEqual(session.mpMax, 60);
     const exp = decodeExp(lastOf(session.socket, S2C.EXP).payload);
     assert.strictEqual(exp.gained, 100);
     assert.strictEqual(exp.experience, 100);
     assert.strictEqual(exp.level, 2);
     const say = decodeSay(lastOf(session.socket, S2C.SAY).payload);
-    assert.ok(String(say).indexOf('level 2') >= 0);
+    assert.ok(String(say.text).indexOf('level 2') >= 0);
     session.kick(REASON.LOGOUT);
     w.stop();
+
+    const gWorld = makeWorld({ pack: stubPack(), map: createStaticMap(), spawns: [] });
+    const tank = makeSession(gWorld, Object.assign(ash(3), {
+        vocation: 'guardian',
+        level: 8,
+        experience: 4200,
+        hp: 185,
+        hpMax: 185,
+        mp: 90,
+        mpMax: 90
+    }));
+    tank.level = 9;
+    assert.ok(gWorld.applyLevelPools(tank, 8, 9));
+    assert.strictEqual(tank.hpMax, 200, 'guardian L8→L9 +15');
+    assert.strictEqual(tank.mpMax, 95, 'guardian L8→L9 +5');
+    assert.strictEqual(tank.hp, 200);
+    tank.kick(REASON.LOGOUT);
+    gWorld.stop();
 
     const store = new MemoryStore();
     const acc = await store.createAccount({ email: 'prog@example.com', passwordHash: 'phc' });
@@ -147,7 +180,7 @@ async function main() {
         level: 1,
         experience: 0,
         posX: 12, posY: 12, posZ: 0,
-        hp: 185, hpMax: 185, mp: 90, mpMax: 90,
+        hp: 150, hpMax: 150, mp: 55, mpMax: 55,
         townId: 1,
         skills: {
             fist: 10, club: 10, sword: 10, axe: 10,

@@ -16,10 +16,20 @@ const {
     rollFatal,
     applyFatalBonus,
     resolveMelee,
+    resolveWandAuto,
+    computeMagicStrikeRange,
+    WAND_AUTO_FALLBACK_BASE_POWER,
+    usesGaussianAutoRaw,
     meleeRangeOk,
     chebyshev,
     classRow,
     playerCombatFromClass,
+    rollLeechAmount,
+    computeAttackLeech,
+    kitAttackToSpell,
+    isKitShapedAttack,
+    isKitStatusAttack,
+    kitAttackReach,
     MELEE_AUTO_FACTOR,
     UNARMED_ATK,
     FATAL_DAMAGE_BONUS
@@ -50,6 +60,43 @@ function main() {
     assert.strictEqual(rollArmorReduction(5, () => 0), 3);
 
     const player = { type: 'player', level: 1, skills: { fist: 10 } };
+    assert.strictEqual(rollLeechAmount(100, 18, 100, () => 0), 18);
+    assert.strictEqual(rollLeechAmount(0, 18, 100, () => 0), 0);
+    assert.strictEqual(rollLeechAmount(50, 18, 100, () => 0.6), 0);
+    assert.strictEqual(rollLeechAmount(50, 18, 100, () => 0), 18);
+    const leechBag = computeAttackLeech(
+        { lifeLeechChance: 100, lifeLeechAmount: 22, manaLeechChance: 100, manaLeechAmount: 4 },
+        50,
+        () => 0
+    );
+    assert.strictEqual(leechBag.life, 11);
+    assert.strictEqual(leechBag.mana, 2);
+
+    assert.strictEqual(usesGaussianAutoRaw('melee_auto'), true);
+    assert.strictEqual(usesGaussianAutoRaw('distance_auto'), true);
+    assert.strictEqual(usesGaussianAutoRaw('magic_strike'), false);
+    assert.strictEqual(WAND_AUTO_FALLBACK_BASE_POWER, 18);
+
+    const wandOmitAtk = {
+        type: 'player',
+        level: 8,
+        skills: { magic: 20 },
+        weaponElement: 'energy'
+    };
+    const wandDummy = { type: 'creature', armor: 0, mitigation: 0, resists: { energy: 0 } };
+    const wandCurve = computeMagicStrikeRange(wandOmitAtk, WAND_AUTO_FALLBACK_BASE_POWER, 0);
+    assert.ok(wandCurve.max > 0, 'magic_strike fallback range is live');
+    const omitMin = resolveWandAuto(wandOmitAtk, wandDummy, () => 0);
+    const omitMax = resolveWandAuto(wandOmitAtk, wandDummy, () => 0.999999);
+    assert.strictEqual(omitMin.raw, wandCurve.min, 'omit min/max uses magic_strike min');
+    assert.strictEqual(omitMax.raw, wandCurve.max, 'omit min/max uses magic_strike max');
+    const authoredWand = resolveWandAuto(
+        Object.assign({}, wandOmitAtk, { weaponMin: 1, weaponMax: 10 }),
+        wandDummy,
+        () => 0
+    );
+    assert.strictEqual(authoredWand.raw, 1, 'authored min/max still wins');
+
     const dummy = { type: 'creature', armor: 0, mitigation: 0, resists: { physical: 0 } };
     const hit = resolveMelee(player, dummy, () => 0.5);
     assert.strictEqual(hit.miss, false);
@@ -241,6 +288,34 @@ function main() {
     const bag = playerCombatFromClass(scout);
     assert.strictEqual(bag.critChance, 5);
     assert.strictEqual(bag.critDamage, 10);
+
+    const areaSpell = kitAttackToSpell({
+        id: 'area_2',
+        kind: 'area',
+        range: 7,
+        radius: 7,
+        element: 'fire',
+        min: 116,
+        max: 193
+    });
+    assert.ok(isKitShapedAttack({ kind: 'area', radius: 7 }));
+    assert.deepStrictEqual(areaSpell.shape, { type: 'area', code: 7 });
+    assert.strictEqual(areaSpell.min, 116);
+    assert.strictEqual(areaSpell.max, 193);
+    const waveSpell = kitAttackToSpell({
+        id: 'wave_4',
+        kind: 'wave',
+        range: 4,
+        length: 8,
+        spread: 0,
+        element: 'lifedrain',
+        min: 232,
+        max: 379
+    });
+    assert.deepStrictEqual(waveSpell.shape, { type: 'wave', length: 8, spread: 0 });
+    assert.strictEqual(kitAttackReach({ kind: 'wave', range: 4, length: 8 }), 8);
+    assert.ok(isKitStatusAttack({ kind: 'status', statusOnly: true, condition: { type: 'slow' } }));
+    assert.ok(!isKitShapedAttack({ kind: 'melee', range: 1 }));
 
     console.log('ok combat');
 }

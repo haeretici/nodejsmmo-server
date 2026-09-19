@@ -29,7 +29,8 @@ Authoritative settings contract, environment overrides, multi-core compute worke
 | `computeApplyDelayTicks` | `0` | `0` | Completion pipeline delay. `0` = same-tick / immediate drain. `1` = staged next-tick drain (used for 100% deterministic parity testing). |
 | `aiPathBudgetPerFrame` | `0` | `0` (stress `48`) | Limit for optional moving-goal repaths per tick; `0` = unlimited. Critical repaths (empty path / recovery) bypass budget. |
 | `aiCreaturePathMaxDistance` | `12` | `12` | Maximum chase distance from creature to target before giving up. |
-| `pathMaxDistance` | `100` | `100` | Maximum distance for return-to-spawn or long routes. |
+| `pathMaxDistance` | `100` | `100` | Creature return-home / long routes. Not player chase. |
+| `movePathMaxSteps` | `165` | `165` | Max dirs in one `MOVE_PATH`. Player BFS is client-side. |
 | `aiRepathIntervalSec` | `2.0` | `2.0` | Interval between optional moving-goal repaths for a chasing entity. |
 | `aiRepathFailBackoffSec` | `0.25` | `0.25` | Cooldown penalty before attempting another search after an A* failure. |
 | `aiOccupantStepPenalty` | `4` | `4` | Soft step cost penalty for pathing through push-enterable creatures. |

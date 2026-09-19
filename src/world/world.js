@@ -32,11 +32,11 @@ const {
     decodeCast,
     decodePing,
     decodeMoveStep,
+    decodeMovePath,
     decodeUseStair,
     decodeUseTile,
     decodeUseItemWith,
     decodeSetTarget,
-    decodeSetAutoChase,
     decodeOpenCorpse,
     decodeLootTake,
     decodeLootClose,
@@ -59,18 +59,33 @@ const {
     resolveWandAuto,
     resolveDistanceAuto,
     resolveCreatureAttack,
+    resolveSpellHit,
     meleeRangeOk,
     chebyshev,
     classRow,
     playerCombatFromClass,
+    applyClassCombatExtras,
+    computeAttackLeech,
+    spellCanCritOrLeech,
+    isKitStatusAttack,
+    isKitShapedAttack,
+    kitAttackNeedsTarget,
+    kitAttackReach,
+    kitAttackToSpell,
+    rollHit,
+    rollCritical,
+    rollFatal,
+    fatalChanceFromTier,
     SWING_MISS,
     SWING_DEATH,
     SWING_CRIT,
-    SWING_FATAL
+    SWING_FATAL,
+    CRIT_BAND_MULTIPLY
 } = require('./combat');
-const { hasLineOfSight } = require('./shapes');
+const { hasLineOfSight, getAffectedTiles, cardinalDirection } = require('./shapes');
 const { rollLoot } = require('./loot');
-const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, asHealRange, asManaRange, designerSlotToEngine } = require('./items');
+const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, itemIsUsable, designerSlotToEngine } = require('./items');
+const { resolveItemUseEffect, applyItemUseEffect } = require('./item_use');
 const {
     takeItem,
     addItemToInventory,
@@ -91,7 +106,11 @@ const {
     moveItem,
     consumeAmmoForShot,
     peekAmmoForShot,
+    equippedRightHandItem,
     equippedWeaponAmmoKind,
+    equippedIsThrowingWeapon,
+    tryBreakEquippedThrowingWeapon,
+    resolveDistanceAutoShape,
     consumeItemIdFromInventory,
     countItem,
     destroyItem,
@@ -109,6 +128,21 @@ const {
     creatureStandDistance,
     creatureLoseTargetDistance
 } = require('./creature');
+const {
+    isSummon,
+    livingSummonsOf,
+    ensureSummonRuntime,
+    summonMatchesEntry,
+    findSummonSpawnTile
+} = require('./summons');
+const {
+    applyThreatDecay,
+    recordDamageTakenBy,
+    pickCreatureTarget: pickCreatureTargetFromKit,
+    armStrategyRetarget,
+    clearStrategyRetarget,
+    strategyRetargetDue
+} = require('./threat');
 const {
     DEFAULT_ACTIVATE_MARGIN,
     DEFAULT_DESPAWN_IDLE_TICKS,
@@ -132,7 +166,8 @@ const {
     partySharePerMember,
     processAttackSkillProgression,
     applyManaTowardMagic,
-    skillLabel
+    skillLabel,
+    applyLevelPoolDelta
 } = require('./progression');
 const { parseClock, msUntilClock, globalSaveMessage } = require('./clock_save');
 const { PersistGate } = require('../persist/persist_gate');
@@ -178,8 +213,20 @@ const Cooldowns = require('./cooldowns');
 const {
     tickConditions,
     absorbWithManaShield,
-    isCombatantAlive
+    isCombatantAlive,
+    applyCondition,
+    isInvisible,
+    hasHaste,
+    recomputeDerived
 } = require('./conditions');
+const {
+    nativeRegenRates,
+    regenIntervalTicks,
+    tickNativeRegen,
+    tickEquippedDurations,
+    tickEquippedItemRegen,
+    playerInEngage
+} = require('./regen');
 const {
     createFieldStore,
     seedMapFieldsFromTileMap,
@@ -198,7 +245,10 @@ const {
     findSpellByRuneItem,
     isRuneSpell,
     resolveCast,
-    sayForReason
+    sayForReason,
+    spellHasShape,
+    isSelfTargetSpell,
+    SPELL_MOVE_LOCK_DEFAULT
 } = require('./spells');
 const { SpatialIndex } = require('./spatial_index');
 
@@ -490,6 +540,9 @@ class World {
             return Number(entity.speed);
         }
         if (entity.type === 'player') {
+            if (entity.baseSpeed != null && Number.isFinite(Number(entity.baseSpeed))) {
+                return Number(entity.baseSpeed);
+            }
             const base = (this.settings.playerBaseSpeed | 0) || 110;
             const level = (entity.level | 0) || 1;
             return base + Math.max(0, level - 1);
@@ -672,6 +725,7 @@ class World {
             ? this.creaturePool.obtain(id, template, { x: x | 0, y: y | 0, z: z | 0 })
             : createCreature(id, template, { x: x | 0, y: y | 0, z: z | 0 });
         if (opts && opts.pinIndex != null) creature.pinIndex = opts.pinIndex | 0;
+        if (opts && opts.masterId) creature.masterId = opts.masterId | 0;
         if (!this.tileMap.enterTile(creature.x, creature.y, creature.z, creature)) {
             const alt = this.tileMap.findNearestEnterable(
                 creature.x, creature.y, creature.z, creature
@@ -701,6 +755,77 @@ class World {
         );
         if (!opts || opts.appear !== false) this.broadcastAppear(creature);
         return creature;
+    }
+
+    summonIntervalTicks(entry) {
+        const ms = entry && entry.intervalMs != null ? Number(entry.intervalMs) : 2000;
+        const ticks = intervalMsToTicks(ms, (this.settings.logicUps | 0) || 20);
+        return Math.max(1, ticks | 0);
+    }
+
+    /**
+     * Spawn a kit summon on an empty adjacent tile. No pin / no respawn slot.
+     * @param {{ creatureId?: string, id?: string, master: object, x?: number, y?: number, z?: number }} opts
+     * @returns {object|null}
+     */
+    spawnSummon(opts) {
+        const o = opts || {};
+        const master = o.master;
+        if (!master || (master.hp | 0) <= 0) return null;
+        if (isSummon(master)) return null;
+        const creatureId = o.creatureId || o.id;
+        if (!creatureId) return null;
+        const mx = o.x != null ? o.x | 0 : master.x | 0;
+        const my = o.y != null ? o.y | 0 : master.y | 0;
+        const z = o.z != null ? o.z | 0 : master.z | 0;
+        if (!getTemplate(creatureId, this.templates)) return null;
+        const tile = findSummonSpawnTile(this.tileMap, mx, my, z, {
+            type: 'creature',
+            canPushCreatures: false
+        });
+        if (!tile) return null;
+        const creature = this.spawnCreature(creatureId, tile.x, tile.y, tile.z, {
+            masterId: master.id,
+            appear: true
+        });
+        if (!creature) return null;
+        creature.masterId = master.id | 0;
+        creature.spawnX = master.spawnX | 0;
+        creature.spawnY = master.spawnY | 0;
+        creature.spawnZ = master.spawnZ | 0;
+        creature.pinIndex = null;
+        const sticky = o.target && o.target.id ? o.target : this.getEntity(master.targetId);
+        if (sticky && sticky.id) creature.targetId = sticky.id | 0;
+        if (!Array.isArray(master.summonIds)) master.summonIds = [];
+        master.summonIds.push(creature.id);
+        return creature;
+    }
+
+    unlinkSummon(summon) {
+        if (!summon || summon.masterId == null || !(summon.masterId > 0)) return;
+        const master = this.getEntity(summon.masterId);
+        if (master && Array.isArray(master.summonIds)) {
+            master.summonIds = master.summonIds.filter((id) => id !== summon.id);
+        }
+        summon.masterId = 0;
+    }
+
+    /**
+     * Master gone → dismiss living adds (no corpse, no exp, no respawn).
+     * @param {object} master
+     * @param {number} tickIndex
+     */
+    dismissSummonsOf(master, tickIndex) {
+        if (!master || !Array.isArray(master.summonIds) || !master.summonIds.length) return;
+        const ids = master.summonIds.slice();
+        master.summonIds = [];
+        const tick = tickIndex != null ? tickIndex : this._tickIndex;
+        for (let i = 0; i < ids.length; i++) {
+            const s = this.creatures.get(ids[i]);
+            if (!s || (s.hp | 0) <= 0) continue;
+            s.masterId = 0;
+            this.killCreature(s, null, tick, { dismiss: true });
+        }
     }
 
     activatePin(pin, tickIndex, opts) {
@@ -775,6 +900,7 @@ class World {
         const creature = this.creatures.get(pin.entityId);
         const park = (reason === 'idle_aoi' || reason === 'budget') && creature && (creature.hp | 0) > 0;
         if (creature) {
+            this.dismissSummonsOf(creature, tickIndex);
             if (this.computeService) {
                 this.computeService.cancelEntityJobs(creature.id);
             }
@@ -1105,10 +1231,10 @@ class World {
             : null;
         session.knownSpells = cls && Array.isArray(cls.spells) ? cls.spells.slice() : [];
         session.vocation = ch.vocation || '';
-        session.baseSpeed = ((this.settings.playerBaseSpeed | 0) || 110)
-            + Math.max(0, ((session.level | 0) || 1) - 1);
+        applyClassCombatExtras(session, cls, this.settings);
         Cooldowns.ensureCooldowns(session);
         applyPlayerLoadout(session, this.itemDb());
+        recomputeDerived(session);
         this.players.set(ch.id, session);
         this.byAccount.set(ch.accountId, session);
         if (this.playerSpatial) this.playerSpatial.insert(session);
@@ -1333,6 +1459,10 @@ class World {
             }
             for (const session of this.players.values()) {
                 if (session.dead || session.downed) continue;
+                this.consumeWalkQueue(session, tickIndex);
+            }
+            for (const session of this.players.values()) {
+                if (session.dead || session.downed) continue;
                 this.tickPlayerCombat(session, tickIndex);
                 this.tickTalkRange(session);
             }
@@ -1379,6 +1509,9 @@ class World {
             case C2S.MOVE_STEP:
                 this.applyMoveStep(session, intent, tickIndex);
                 return;
+            case C2S.MOVE_PATH:
+                this.applyMovePath(session, intent, tickIndex);
+                return;
             case C2S.USE_STAIR:
                 this.applyUseStair(session, intent, tickIndex);
                 return;
@@ -1390,9 +1523,6 @@ class World {
                 return;
             case C2S.SET_TARGET:
                 this.applySetTarget(session, intent);
-                return;
-            case C2S.SET_AUTO_CHASE:
-                this.applySetAutoChase(session, intent);
                 return;
             case C2S.OPEN_CORPSE:
                 this.applyOpenCorpse(session, intent);
@@ -1441,12 +1571,19 @@ class World {
         }
     }
 
+    clearPlayerWalk(session) {
+        if (!session) return;
+        session.path = [];
+        session.walkSeq = 0;
+    }
+
     applyMoveStep(session, intent, tickIndex) {
         const dir = decodeMoveStep(intent.payload);
         if (dir == null) {
             session.malformed();
             return;
         }
+        this.clearPlayerWalk(session);
         const delta = DIR_DELTA[dir];
         if (!delta) {
             session.reject(intent.seq, REASON.BLOCKED);
@@ -1456,18 +1593,58 @@ class World {
             session.reject(intent.seq, REASON.BUSY);
             return;
         }
+        if (!this.tryPlayerWalkDir(session, dir, tickIndex)) {
+            session.reject(intent.seq, REASON.BLOCKED);
+        }
+    }
+
+    applyMovePath(session, intent, _tickIndex) {
+        const dirs = decodeMovePath(intent.payload);
+        if (dirs == null) {
+            session.malformed();
+            return;
+        }
+        const cap = Math.max(0, (this.settings.movePathMaxSteps | 0) || 165);
+        if (dirs.length > cap) {
+            session.reject(intent.seq, REASON.BLOCKED);
+            this.clearPlayerWalk(session);
+            return;
+        }
+        session.path = dirs.slice();
+        session.walkSeq = dirs.length ? (intent.seq | 0) : 0;
+    }
+
+    consumeWalkQueue(session, tickIndex) {
+        if (!session || session.dead || session.downed) return;
+        if (!Array.isArray(session.path) || session.path.length === 0) return;
+        if (session.movedThisTick) return;
+        if (tickIndex < session.moveReadyTick) return;
+        const dir = session.path[0];
+        const fromZ = session.z | 0;
+        if (!this.tryPlayerWalkDir(session, dir, tickIndex)) {
+            const seq = session.walkSeq | 0;
+            this.clearPlayerWalk(session);
+            if (seq) session.reject(seq, REASON.BLOCKED);
+            return;
+        }
+        session.path.shift();
+        if ((session.z | 0) !== fromZ) {
+            this.clearPlayerWalk(session);
+            return;
+        }
+        if (session.path.length === 0) session.walkSeq = 0;
+    }
+
+    tryPlayerWalkDir(session, dir, tickIndex) {
+        const delta = DIR_DELTA[dir];
+        if (!delta) return false;
+        if (tickIndex < session.moveReadyTick) return false;
         const nx = session.x + delta.dx;
         const ny = session.y + delta.dy;
         const nz = session.z;
-        if (!this.tileMap.canEnter(nx, ny, nz, session)) {
-            session.reject(intent.seq, REASON.BLOCKED);
-            return;
-        }
+        if (!this.tileMap.canEnter(nx, ny, nz, session)) return false;
         const from = { x: session.x, y: session.y, z: session.z };
-        if (!this.tileMap.moveEntityToTile(nx, ny, nz, session)) {
-            session.reject(intent.seq, REASON.BLOCKED);
-            return;
-        }
+        if (!this.tileMap.moveEntityToTile(nx, ny, nz, session)) return false;
         session.dir = dir;
         session.moveReadyTick = tickIndex + this.stepDelay(
             session,
@@ -1477,6 +1654,7 @@ class World {
         session.movedThisTick = true;
         this.broadcastMove(session, from, dir);
         this.applyWorldPinStep(session, from, tickIndex);
+        return true;
     }
 
     applyUseStair(session, intent, tickIndex) {
@@ -1485,6 +1663,7 @@ class World {
             session.malformed();
             return;
         }
+        this.clearPlayerWalk(session);
         if (tickIndex < session.moveReadyTick) {
             session.reject(intent.seq, REASON.BUSY);
             return;
@@ -1645,7 +1824,7 @@ class World {
                         to.x,
                         to.y,
                         to.z,
-                        { kind, source, createdAt: now },
+                        { kind, source, createdAt: now, createdTick: tickIndex },
                         this.tileMap.getCombatantEntities(to.x, to.y, to.z),
                         now
                     );
@@ -1733,7 +1912,6 @@ class World {
         }
         if (id === 0) {
             session.targetId = 0;
-            session.autoChase = false;
             return;
         }
         if (id === session.id) {
@@ -1754,19 +1932,6 @@ class World {
             return;
         }
         session.targetId = id;
-    }
-
-    applySetAutoChase(session, intent) {
-        const v = decodeSetAutoChase(intent.payload);
-        if (v == null) {
-            session.malformed();
-            return;
-        }
-        session.autoChase = v === 1;
-        if (session.autoChase && !session.targetId) {
-            session.autoChase = false;
-            session.reject(intent.seq, REASON.NO_TARGET);
-        }
     }
 
     containerById(id) {
@@ -1861,15 +2026,8 @@ class World {
         if (!target || target.downed) {
             if (session.targetId) {
                 session.targetId = 0;
-                session.autoChase = false;
             }
             return;
-        }
-        const canAttack = this.playerCanAttackTarget(session, target);
-        if (session.autoChase && !session.movedThisTick && !canAttack) {
-            this.tryStepToward(session, target.x, target.y, tickIndex, {
-                maxDistance: this.pathCap(session)
-            });
         }
         if (this.playerCanAttackTarget(session, target)) {
             this.trySwing(session, target, tickIndex);
@@ -1959,26 +2117,33 @@ class World {
         if (isNpcEntity(cr)) return;
         if ((cr.hp | 0) <= 0) return;
         if (cr.simSleeping) return;
+        const now = this.logicNow(tickIndex);
+        applyThreatDecay(cr, now, this.settings);
         let target = this.getEntity(cr.targetId);
         if (target && (target.downed || target.type !== 'player')) target = null;
         if (target) {
             const dist = chebyshev(cr.x, cr.y, target.x, target.y);
             const sameZ = (cr.z | 0) === (target.z | 0);
-            if (!sameZ || dist > creatureLoseTargetDistance(cr)) {
+            if (!sameZ || dist > creatureLoseTargetDistance(cr) || this.isProtectedCombatant(target)) {
                 target = null;
                 cr.path = [];
             }
         }
         const thinkSec = this.settings.aiCreatureThinkIntervalSec;
         const thinkDue = isLogicIntervalDue(
-            cr, '_creatureThinkNextAt', thinkSec, this.logicNow(tickIndex)
+            cr, '_creatureThinkNextAt', thinkSec, now
         );
-        if (!target && cr.aggro && thinkDue) {
-            target = this.nearestPlayer(cr, cr.aggroRange);
+        if (!target && (cr.aggro || isSummon(cr)) && thinkDue) {
+            target = this.pickCreatureTarget(cr, now);
+            if (target) armStrategyRetarget(cr, now, this.settings);
+        } else if (target && strategyRetargetDue(cr, now, this.rng, this.settings)) {
+            const next = this.pickCreatureTarget(cr, now);
+            if (next) target = next;
         }
         if (cr.targetId && target && cr.targetId !== target.id) {
             cr.path = [];
         }
+        if (!target) clearStrategyRetarget(cr);
         cr.targetId = target ? target.id : 0;
 
         if (target) {
@@ -2182,7 +2347,10 @@ class World {
 
         const pick = voices[Math.floor(rng() * voices.length)] || voices[0];
         if (!pick || !pick.text) return false;
-        const payload = encodeSay(pick.text);
+        const payload = encodeSay(pick.text, {
+            speakerId: npc.id,
+            yell: !!pick.yell
+        });
         this.broadcastToViewers(npc.x, npc.y, npc.z, (p) => {
             p.send(S2C.SAY, payload);
         });
@@ -2216,7 +2384,9 @@ class World {
         const hasLos = hasLineOfSight(cr.x, cr.y, cr.z, target.x, target.y, target.z, this.tileMap || this.map);
 
         if (dist > want || !hasLos) {
-            this.tryStepToward(cr, target.x, target.y, tick);
+            if (!this.tryStepToward(cr, target.x, target.y, tick)) {
+                this.tryIdleWander(cr, tick);
+            }
         } else if (dist < want) {
             cr.path = [];
             this.tryStepAwayFrom(cr, target.x, target.y, tick);
@@ -2226,10 +2396,29 @@ class World {
         }
     }
 
-    nearestPlayer(from, range) {
+    isProtectedCombatant(entity) {
+        if (!entity || !this.tileMap || typeof this.tileMap.attackMayAffectTile !== 'function') {
+            return false;
+        }
+        return !this.tileMap.attackMayAffectTile(entity.x | 0, entity.y | 0, entity.z | 0);
+    }
+
+    harmfulCombatAllowed(attacker, defender) {
+        const tm = this.tileMap;
+        if (!tm || typeof tm.attackMayAffectTile !== 'function') return true;
+        if (attacker && !tm.attackMayAffectTile(attacker.x | 0, attacker.y | 0, attacker.z | 0)) {
+            return false;
+        }
+        if (defender && !tm.attackMayAffectTile(defender.x | 0, defender.y | 0, defender.z | 0)) {
+            return false;
+        }
+        return true;
+    }
+
+    playersInRange(from, range, opts) {
         const r = Math.max(0, Number(range) || 0);
-        let best = null;
-        let bestD = r + 1;
+        const attackable = !!(opts && opts.attackable);
+        const out = [];
         const frame = this._aoiFrame;
         const candidates = (frame && frame.observers)
             ? frame.observers
@@ -2239,10 +2428,70 @@ class World {
         for (const p of candidates) {
             if (!p || p.downed || p.dead) continue;
             if ((p.z | 0) !== (from.z | 0)) continue;
+            if (attackable && this.isProtectedCombatant(p)) continue;
             const d = chebyshev(from.x, from.y, p.x, p.y);
-            if (d <= r && d < bestD) {
+            if (d <= r) out.push(p);
+        }
+        return out;
+    }
+
+    pickCreatureTarget(cr, now) {
+        if (!cr) return null;
+        const range = cr.aggroRange == null ? 7 : cr.aggroRange | 0;
+        const list = this.playersInRange(cr, range, { attackable: true });
+        return pickCreatureTargetFromKit(cr, list, this.rng, {
+            now,
+            settings: this.settings
+        });
+    }
+
+    nearestPlayer(from, range, opts) {
+        const r = Math.max(0, Number(range) || 0);
+        const list = this.playersInRange(from, range, opts);
+        let best = null;
+        let bestD = r + 1;
+        for (let i = 0; i < list.length; i++) {
+            const p = list[i];
+            const d = chebyshev(from.x, from.y, p.x, p.y);
+            if (d < bestD) {
                 best = p;
                 bestD = d;
+            }
+        }
+        return best;
+    }
+
+    noteCreatureThreat(attacker, defender, amount, tickIndex) {
+        if (!defender || defender.type !== 'creature') return;
+        if (!attacker || attacker.type !== 'player') return;
+        if (!(amount > 0)) return;
+        recordDamageTakenBy(
+            defender,
+            attacker,
+            amount,
+            this.logicNow(tickIndex),
+            this.settings
+        );
+    }
+
+    pickEngageTile(entity, tx, ty, tz) {
+        if (!entity || !this.tileMap) return null;
+        const z = tz != null ? tz | 0 : entity.z | 0;
+        const gx = tx | 0;
+        const gy = ty | 0;
+        let best = null;
+        let bestD = Infinity;
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = gx + dx;
+                const ny = gy + dy;
+                if (!this.tileMap.canEnter(nx, ny, z, entity)) continue;
+                const d = chebyshev(entity.x | 0, entity.y | 0, nx, ny);
+                if (d < bestD) {
+                    bestD = d;
+                    best = { x: nx, y: ny, z };
+                }
             }
         }
         return best;
@@ -2263,13 +2512,27 @@ class World {
             entity.path = [];
             return false;
         }
+        let gx = tx | 0;
+        let gy = ty | 0;
+        const gz = entity.z | 0;
+        if (
+            this.tileMap
+            && typeof this.tileMap.creatureMayEnterTile === 'function'
+            && !this.tileMap.creatureMayEnterTile(gx, gy, gz, entity)
+        ) {
+            const dest = this.pickEngageTile(entity, gx, gy, gz);
+            if (dest) {
+                gx = dest.x;
+                gy = dest.y;
+            }
+        }
         const cap = this.pathCap(entity, opts);
         const priority = this.computePriorityFor(entity);
         this.tileMap.followPath(
             entity,
-            tx | 0,
-            ty | 0,
-            entity.z | 0,
+            gx,
+            gy,
+            gz,
             cap,
             0,
             {
@@ -2351,10 +2614,229 @@ class World {
         return Math.max(1, Math.round((ms / 2000) * baseAuto));
     }
 
+    tryDefenseSpells(cr, tickIndex) {
+        const list = cr && cr.defenseSpells;
+        if (!list || !Array.isArray(list) || list.length === 0) return false;
+        if (!cr._defenseReadyTicks) cr._defenseReadyTicks = {};
+        const rng = this.rng || Math.random;
+        const hp = cr.hp | 0;
+        const hpMax = cr.hpMax | 0;
+        const hpFrac = hpMax > 0 ? hp / hpMax : 1;
+
+        for (let i = 0; i < list.length; i++) {
+            const spell = list[i];
+            if (!spell) continue;
+            const kind = String(spell.kind || '').toLowerCase();
+            if (kind !== 'heal' && kind !== 'haste' && kind !== 'invisible') continue;
+            const key = spell.id || String(i);
+            const readyTick = cr._defenseReadyTicks[key];
+            if (readyTick != null && tickIndex < readyTick) continue;
+
+            const intervalTicks = this.creatureAttackIntervalTicks(spell);
+            cr._defenseReadyTicks[key] = tickIndex + intervalTicks;
+
+            const chance = spell.chance != null ? Number(spell.chance) : 100;
+            if (chance < 100 && rng() * 100 >= chance) continue;
+
+            if (kind === 'heal') {
+                const below = spell.hpBelow != null ? Number(spell.hpBelow) : 0.7;
+                if (!(hpFrac < below)) continue;
+                if (!(hpMax > 0) || hp >= hpMax) continue;
+                const min = Math.max(0, Number(spell.min) || 0);
+                let max = Math.max(0, Number(spell.max) || min);
+                if (max < min) max = min;
+                const roll = max <= min
+                    ? min
+                    : min + Math.floor(rng() * (max - min + 1));
+                if (!(roll > 0)) continue;
+                this.applyHp(cr, hp + roll);
+                this.broadcastStats(cr);
+                return true;
+            }
+
+            if (kind === 'haste') {
+                if (hasHaste(cr)) continue;
+                const sc = Number(spell.speedChange) || 0;
+                if (!(sc > 0)) continue;
+                const durationSec = spell.durationSec != null
+                    ? Math.max(0.1, Number(spell.durationSec) || 5)
+                    : 5;
+                applyCondition(cr, {
+                    type: 'haste',
+                    speedChange: sc,
+                    durationSec
+                }, { source: 'defense_spell' });
+                this.broadcastStats(cr);
+                return true;
+            }
+
+            if (kind === 'invisible') {
+                if (isInvisible(cr)) continue;
+                const durationSec = spell.durationSec != null
+                    ? Math.max(0.1, Number(spell.durationSec) || 2)
+                    : 2;
+                applyCondition(cr, {
+                    type: 'invisible',
+                    durationSec
+                }, { source: 'defense_spell' });
+                this.broadcastStats(cr);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    playersOnTiles(tiles) {
+        const out = [];
+        const tileMap = this.tileMap;
+        if (!tileMap || !tiles || !tiles.length) return out;
+        const seen = new Set();
+        for (let i = 0; i < tiles.length; i++) {
+            const t = tiles[i];
+            if (!t) continue;
+            const ents = typeof tileMap.getCombatantEntities === 'function'
+                ? tileMap.getCombatantEntities(t.x, t.y, t.z)
+                : [];
+            for (let k = 0; k < ents.length; k++) {
+                const e = ents[k];
+                if (!e || e.type !== 'player') continue;
+                if (e.downed || e.dead || (e.hp | 0) <= 0) continue;
+                if (seen.has(e.id)) continue;
+                seen.add(e.id);
+                out.push(e);
+            }
+        }
+        return out;
+    }
+
+    applyCreatureKitHit(attacker, defender, hit, attack, tickIndex) {
+        if (!defender || !hit) return false;
+        let amount = 0;
+        let flags = 0;
+        if (hit.miss) {
+            flags |= SWING_MISS;
+        } else if (hit.element === 'healing') {
+            this.applyHp(defender, (defender.hp | 0) + (hit.final | 0));
+            amount = hit.final | 0;
+        } else {
+            amount = this.applyDamage(defender, hit.final, hit.element, tickIndex, attacker);
+            if (hit.critical) flags |= SWING_CRIT;
+            if (hit.fatal) flags |= SWING_FATAL;
+            if ((defender.hp | 0) <= 0) flags |= SWING_DEATH;
+        }
+        if (attack && attack.condition && !hit.miss && isCombatantAlive(defender)) {
+            applyCondition(defender, attack.condition, {
+                source: attacker.kind || attacker.name || null
+            });
+        }
+        this.applyAttackProgression(attacker, defender, hit);
+        this.broadcastSwing(attacker, defender, amount, flags, hit);
+        return true;
+    }
+
+    executeShapedKitAttack(attacker, primary, attack, spell, tickIndex) {
+        if (!attacker || !spell || !spellHasShape(spell)) return false;
+        const casterPos = { x: attacker.x | 0, y: attacker.y | 0, z: attacker.z | 0 };
+        const kind = String((attack && attack.kind) || spell.attackKind || '');
+        const tileMap = this.tileMap || this.map;
+        let direction = { x: 1, y: 0 };
+        let center = null;
+        if (kind === 'wave') {
+            if (primary) direction = cardinalDirection(casterPos, primary);
+            center = {
+                x: casterPos.x + (direction.x || 0),
+                y: casterPos.y + (direction.y || 0),
+                z: casterPos.z
+            };
+        } else if (primary) {
+            center = { x: primary.x | 0, y: primary.y | 0, z: primary.z | 0 };
+        } else {
+            center = casterPos;
+        }
+        const tiles = getAffectedTiles({
+            caster: casterPos,
+            center,
+            shape: spell.shape,
+            direction,
+            tileMap
+        });
+        const defenders = this.playersOnTiles(tiles);
+        let sharedCrit = null;
+        for (let i = 0; i < defenders.length; i++) {
+            const def = defenders[i];
+            const hitOpts = { critBand: CRIT_BAND_MULTIPLY, currentTick: tickIndex };
+            if (sharedCrit != null) hitOpts.critical = sharedCrit;
+            const hit = resolveSpellHit(attacker, def, spell, this.rng, hitOpts);
+            if (sharedCrit == null) sharedCrit = !!hit.critical;
+            this.applyCreatureKitHit(attacker, def, hit, attack, tickIndex);
+        }
+        return true;
+    }
+
+    executeCreatureStatus(attacker, defender, attack, tickIndex) {
+        if (!attacker || !defender) return false;
+        if (attack && attack.condition && isCombatantAlive(defender)) {
+            applyCondition(defender, attack.condition, {
+                source: attacker.kind || attacker.name || null
+            });
+        }
+        this.broadcastSwing(attacker, defender, 0, 0);
+        return true;
+    }
+
+    tryMonsterSummons(cr, target, tickIndex) {
+        if (!this.featureFlag('monsterSummons', true)) return false;
+        if (!cr || isSummon(cr) || (cr.hp | 0) <= 0) return false;
+        const cfg = cr.summon;
+        if (!cfg || !Array.isArray(cfg.summons) || !cfg.summons.length || !(cfg.maxSummons > 0)) {
+            return false;
+        }
+        const engaged = !!(target && !target.dead && !target.downed && (target.hp | 0) > 0)
+            || !!(cr.targetId);
+        if (!engaged) return false;
+
+        ensureSummonRuntime(cr);
+        const resolve = (id) => this.getEntity(id);
+        if (livingSummonsOf(cr, resolve).length >= cfg.maxSummons) return false;
+
+        const ready = cr._summonReadyTicks;
+        const rng = this.rng || Math.random;
+        for (let i = 0; i < cfg.summons.length; i++) {
+            const entry = cfg.summons[i];
+            if (!entry) continue;
+            if (livingSummonsOf(cr, resolve).length >= cfg.maxSummons) break;
+            if ((ready[i] | 0) > 0 && tickIndex < ready[i]) continue;
+            ready[i] = (tickIndex | 0) + this.summonIntervalTicks(entry);
+            const chance = entry.chance != null ? Number(entry.chance) : 100;
+            if (chance < 100 && rng() * 100 >= chance) continue;
+
+            const current = livingSummonsOf(cr, resolve);
+            let typeCount = 0;
+            for (let j = 0; j < current.length; j++) {
+                if (summonMatchesEntry(current[j], entry)) typeCount += 1;
+            }
+            if (typeCount >= entry.count) continue;
+
+            const spawned = this.spawnSummon({
+                creatureId: entry.id,
+                master: cr,
+                force: entry.force,
+                target
+            });
+            if (spawned) return true;
+        }
+        return false;
+    }
+
     tryCreatureAttacks(cr, target, tickIndex) {
         if (!cr || !target) return false;
         if ((cr.z | 0) !== (target.z | 0)) return false;
         if (target.dead || target.downed || (target.hp | 0) <= 0) return false;
+        if (!this.harmfulCombatAllowed(cr, target)) return false;
+
+        this.tryMonsterSummons(cr, target, tickIndex);
+
+        if (this.tryDefenseSpells(cr, tickIndex)) return true;
 
         const attacks = cr.attacks;
         if (!attacks || !Array.isArray(attacks) || attacks.length === 0) {
@@ -2392,11 +2874,22 @@ class World {
                 continue;
             }
 
-            const reach = atk.range != null
-                ? Math.max(1, Number(atk.range) || 1)
-                : (atk.kind === 'ranged' ? 5 : 1);
+            const reach = kitAttackReach(atk);
             const dist = chebyshev(cr.x, cr.y, target.x, target.y);
-            if (dist > reach) {
+            const needsTarget = kitAttackNeedsTarget(atk);
+            const shaped = isKitShapedAttack(atk);
+            const spell = shaped ? kitAttackToSpell(atk) : null;
+
+            if (shaped && spell && spellHasShape(spell)) {
+                if (needsTarget && dist > reach) {
+                    return false;
+                }
+                cr.attackReadyTick = tickIndex + Math.min(intervalTicks, this.autoInterval());
+                this.executeShapedKitAttack(cr, target, atk, spell, tickIndex);
+                return true;
+            }
+
+            if (needsTarget && dist > reach) {
                 return false;
             }
 
@@ -2407,7 +2900,11 @@ class World {
             }
 
             cr.attackReadyTick = tickIndex + Math.min(intervalTicks, this.autoInterval());
-            this.executeCreatureAttack(cr, target, atk, tickIndex);
+            if (isKitStatusAttack(atk)) {
+                this.executeCreatureStatus(cr, target, atk, tickIndex);
+            } else {
+                this.executeCreatureAttack(cr, target, atk, tickIndex);
+            }
             return true;
         }
 
@@ -2440,7 +2937,7 @@ class World {
         }
 
         this.applyAttackProgression(attacker, defender, hit);
-        this.broadcastSwing(attacker, defender, amount, flags);
+        this.broadcastSwing(attacker, defender, amount, flags, hit);
 
         if (flags & SWING_DEATH) {
             this.kill(defender, attacker, tickIndex);
@@ -2451,10 +2948,171 @@ class World {
         return true;
     }
 
+    playerMoveLocked(attacker, tickIndex) {
+        return !!(attacker && attacker.type === 'player' && tickIndex < (attacker.moveReadyTick | 0));
+    }
+
+    applyAutoMoveLock(attacker, tickIndex) {
+        if (!attacker || attacker.type !== 'player') return;
+        const extra = delayToTicks(SPELL_MOVE_LOCK_DEFAULT, this.settings.logicUps);
+        if (!(extra > 0)) return;
+        attacker.moveReadyTick = Math.max(attacker.moveReadyTick | 0, tickIndex + extra);
+    }
+
+    spendAutoConsumables(attacker) {
+        if (!attacker || attacker.type !== 'player') return;
+        const itemDb = this.itemDb();
+        if (!itemDb || !attacker.inventory) return;
+        let changed = false;
+        if (equippedIsThrowingWeapon(attacker.inventory, itemDb)) {
+            const br = tryBreakEquippedThrowingWeapon(attacker.inventory, itemDb, this.rng);
+            if (br.changed) changed = true;
+        } else if (equippedWeaponAmmoKind(attacker.inventory, itemDb)) {
+            const ammoOn = this.featureFlag('ammoConsumption', this.packFeature('ammoConsumption'));
+            if (ammoOn) {
+                const used = consumeAmmoForShot(attacker.inventory, itemDb, 1);
+                if (used.ok) changed = true;
+            }
+        }
+        if (changed) {
+            applyPlayerLoadout(attacker, itemDb);
+            this.sendInventory(attacker);
+        }
+    }
+
+    shapedAutoTargets(attacker, primary, tiles) {
+        const out = [];
+        const seen = new Set();
+        const push = (ent) => {
+            if (!ent || seen.has(ent.id)) return;
+            if (ent === attacker) return;
+            if (ent.type === 'player') return;
+            if (isNpcEntity(ent)) return;
+            if (ent.dead || ent.downed || (ent.hp | 0) <= 0) return;
+            seen.add(ent.id);
+            out.push(ent);
+        };
+        if (primary) push(primary);
+        const tileMap = this.tileMap;
+        const keys = new Set();
+        if (tiles) {
+            for (let i = 0; i < tiles.length; i++) {
+                const t = tiles[i];
+                if (!t) continue;
+                keys.add((t.z | 0) + ':' + (t.x | 0) + ':' + (t.y | 0));
+                const ents = tileMap && typeof tileMap.getCombatantEntities === 'function'
+                    ? tileMap.getCombatantEntities(t.x, t.y, t.z)
+                    : [];
+                for (let k = 0; k < ents.length; k++) push(ents[k]);
+            }
+        }
+        if (this.creatures) {
+            for (const cr of this.creatures.values()) {
+                const k = (cr.z | 0) + ':' + (cr.x | 0) + ':' + (cr.y | 0);
+                if (keys.has(k)) push(cr);
+            }
+        }
+        return out;
+    }
+
+    applyWeaponAutoHit(attacker, defender, hit, tickIndex) {
+        let amount = 0;
+        let flags = 0;
+        if (!hit || hit.miss) {
+            flags |= SWING_MISS;
+        } else {
+            amount = absorbWithManaShield(defender, Math.min(defender.hp | 0, hit.final)).leftoverHp;
+            this.applyHp(defender, (defender.hp | 0) - amount);
+            this.noteCreatureThreat(attacker, defender, amount, tickIndex);
+            if (amount > 0 && attacker.type === 'player') this.applyAttackLeech(attacker, amount);
+            if (hit.critical) flags |= SWING_CRIT;
+            if (hit.fatal) flags |= SWING_FATAL;
+            if ((defender.hp | 0) <= 0) flags |= SWING_DEATH;
+        }
+        this.broadcastSwing(attacker, defender, amount, flags, hit);
+        if (flags & SWING_DEATH) {
+            this.kill(defender, attacker, tickIndex);
+        } else if (hit && !hit.miss && defender.type === 'creature') {
+            if (!defender.targetId) defender.targetId = attacker.id;
+            this.wakeCreature(defender, tickIndex);
+        }
+        return flags;
+    }
+
+    executeShapedDistanceAuto(attacker, defender, shape, tickIndex) {
+        const hitChance = attacker && attacker.hitChance != null ? Number(attacker.hitChance) : 100;
+        if (!rollHit(hitChance, this.rng)) {
+            const miss = {
+                miss: true,
+                hit: false,
+                raw: 0,
+                final: 0,
+                critical: false,
+                fatal: false,
+                shieldBlock: 0,
+                armorReduction: 0,
+                blockChargeSpent: false
+            };
+            this.applyWeaponAutoHit(attacker, defender, miss, tickIndex);
+            this.applyAttackProgression(attacker, defender, miss);
+            return miss;
+        }
+        const spell = {
+            id: 'distance_auto',
+            kind: 'auto',
+            element: 'physical',
+            powerCurve: 'distance_auto',
+            isMelee: false,
+            hitChance: 100,
+            shape
+        };
+        const casterPos = { x: attacker.x | 0, y: attacker.y | 0, z: attacker.z | 0 };
+        const center = { x: defender.x | 0, y: defender.y | 0, z: defender.z | 0 };
+        const tiles = getAffectedTiles({
+            caster: casterPos,
+            center,
+            shape,
+            tileMap: this.tileMap || this.map
+        });
+        const targets = this.shapedAutoTargets(attacker, defender, tiles);
+        const swingCritical = rollCritical(Number(attacker.critChance) || 0, this.rng);
+        const swingFatal = attacker.type === 'creature'
+            ? false
+            : rollFatal(fatalChanceFromTier(attacker.weaponTier), this.rng);
+        let primaryHit = null;
+        for (let i = 0; i < targets.length; i++) {
+            const def = targets[i];
+            const hit = resolveSpellHit(attacker, def, spell, this.rng, {
+                hit: true,
+                critical: swingCritical,
+                fatal: swingFatal,
+                critBand: CRIT_BAND_MULTIPLY,
+                currentTick: tickIndex
+            });
+            if (def === defender) primaryHit = hit;
+            this.applyWeaponAutoHit(attacker, def, hit, tickIndex);
+        }
+        const used = primaryHit || {
+            miss: false,
+            hit: true,
+            raw: 0,
+            final: 0,
+            critical: swingCritical,
+            fatal: swingFatal,
+            shieldBlock: 0,
+            armorReduction: 0,
+            blockChargeSpent: false
+        };
+        this.applyAttackProgression(attacker, defender, used);
+        return used;
+    }
+
     trySwing(attacker, defender, tickIndex) {
         if (tickIndex < attacker.attackReadyTick) return false;
+        if (this.playerMoveLocked(attacker, tickIndex)) return false;
         if (!attacker || !defender) return false;
         if ((attacker.z | 0) !== (defender.z | 0)) return false;
+        if (!this.harmfulCombatAllowed(attacker, defender)) return false;
 
         const isMagic = attacker && attacker.weaponType === 'magic';
         const isDistance = attacker && attacker.weaponType === 'distance';
@@ -2480,6 +3138,17 @@ class World {
 
         attacker.attackReadyTick = tickIndex + this.autoInterval();
 
+        const autoShape = isDistance && attacker.type === 'player' && itemDb
+            ? resolveDistanceAutoShape(attacker.inventory, itemDb)
+            : null;
+
+        if (autoShape) {
+            this.executeShapedDistanceAuto(attacker, defender, autoShape, tickIndex);
+            this.spendAutoConsumables(attacker);
+            this.applyAutoMoveLock(attacker, tickIndex);
+            return true;
+        }
+
         let hit;
         if (isMagic) {
             hit = resolveWandAuto(attacker, defender, this.rng);
@@ -2498,28 +3167,7 @@ class World {
             hit = resolveMelee(attacker, defender, this.rng, meleeOpts);
         }
 
-        if (needsAmmo) {
-            const ammoOn = this.featureFlag('ammoConsumption', this.packFeature('ammoConsumption'));
-            if (ammoOn) {
-                const used = consumeAmmoForShot(attacker.inventory, itemDb, 1);
-                if (used.ok) {
-                    applyPlayerLoadout(attacker, itemDb);
-                    this.sendInventory(attacker);
-                }
-            }
-        }
-
-        let amount = 0;
-        let flags = 0;
-        if (hit.miss) {
-            flags |= SWING_MISS;
-        } else {
-            amount = absorbWithManaShield(defender, Math.min(defender.hp | 0, hit.final)).leftoverHp;
-            this.applyHp(defender, (defender.hp | 0) - amount);
-            if (hit.critical) flags |= SWING_CRIT;
-            if (hit.fatal) flags |= SWING_FATAL;
-            if ((defender.hp | 0) <= 0) flags |= SWING_DEATH;
-        }
+        this.applyWeaponAutoHit(attacker, defender, hit, tickIndex);
 
         if (isMagic) {
             if (hit.manaGain > 0) {
@@ -2530,12 +3178,9 @@ class World {
             this.applyAttackProgression(attacker, defender, hit);
         }
 
-        this.broadcastSwing(attacker, defender, amount, flags);
-        if (flags & SWING_DEATH) {
-            this.kill(defender, attacker, tickIndex);
-        } else if (!hit.miss && defender.type === 'creature') {
-            if (!defender.targetId) defender.targetId = attacker.id;
-            this.wakeCreature(defender, tickIndex);
+        if (attacker.type === 'player') {
+            this.spendAutoConsumables(attacker);
+            this.applyAutoMoveLock(attacker, tickIndex);
         }
         return true;
     }
@@ -2544,6 +3189,15 @@ class World {
         const next = Math.max(0, Math.min(entity.hpMax | 0, hp | 0));
         entity.hp = next;
         if (entity.character) entity.character.hp = next;
+    }
+
+    applyAttackLeech(attacker, realDamage) {
+        if (!attacker || !(realDamage > 0)) return { life: 0, mana: 0 };
+        const rolled = computeAttackLeech(attacker, realDamage, this.rng);
+        if (rolled.life > 0) this.applyHp(attacker, (attacker.hp | 0) + rolled.life);
+        if (rolled.mana > 0) this.applyMp(attacker, (attacker.mp | 0) + rolled.mana);
+        if (rolled.life > 0 || rolled.mana > 0) this.broadcastStats(attacker);
+        return rolled;
     }
 
     applyMp(entity, mp) {
@@ -2561,6 +3215,7 @@ class World {
         }
         if (incoming <= 0) return 0;
         this.applyHp(entity, (entity.hp | 0) - incoming);
+        this.noteCreatureThreat(killer, entity, incoming, tickIndex);
         if (entity.type === 'creature' && entity.simSleeping) {
             this.wakeCreature(entity, tickIndex);
         }
@@ -2590,14 +3245,7 @@ class World {
     applyLevelPools(session, oldLevel, newLevel) {
         if (!session || newLevel <= oldLevel) return false;
         const cls = classRow(this.pack, session.character && session.character.vocation);
-        const gained = newLevel - oldLevel;
-        const hpGain = Math.max(0, Math.floor(Number(cls && cls.hpPerLevel) || 0)) * gained;
-        const mpGain = Math.max(0, Math.floor(Number(cls && cls.mpPerLevel) || 0)) * gained;
-        if (!hpGain && !mpGain) return false;
-        session.hpMax = (session.hpMax | 0) + hpGain;
-        session.mpMax = (session.mpMax | 0) + mpGain;
-        session.hp = Math.min(session.hpMax, (session.hp | 0) + hpGain);
-        session.mp = Math.min(session.mpMax, (session.mp | 0) + mpGain);
+        if (!applyLevelPoolDelta(session, oldLevel, newLevel, cls)) return false;
         this.syncCharacterProgress(session);
         return true;
     }
@@ -2617,6 +3265,8 @@ class World {
         const newLevel = Math.max(1, killer.level | 0);
         if (newLevel > oldLevel) {
             this.applyLevelPools(killer, oldLevel, newLevel);
+            applyPlayerLoadout(killer, this.itemDb());
+            recomputeDerived(killer);
             this.say(killer, 'You advanced to level ' + newLevel + '.');
             this.broadcastStats(killer);
             this.sendInventory(killer);
@@ -2680,13 +3330,32 @@ class World {
         }
     }
 
-    broadcastSwing(attacker, defender, amount, flags) {
-        const swing = encodeSwing({
+    swingWire(attacker, defender, amount, flags, hit) {
+        const element = (hit && (hit.element || hit.extraAtkElement))
+            || (attacker && attacker.weaponElement)
+            || 'physical';
+        let weaponId = '';
+        let ammoId = '';
+        if (attacker && attacker.type === 'player' && attacker.inventory) {
+            const itemDb = this.itemDb();
+            const right = equippedRightHandItem(attacker.inventory, itemDb);
+            if (right && (right.id || right.itemId)) weaponId = String(right.id || right.itemId);
+            const ammo = peekAmmoForShot(attacker.inventory, itemDb);
+            if (ammo && (ammo.id || ammo.itemId)) ammoId = String(ammo.id || ammo.itemId);
+        }
+        return {
             sourceId: attacker.id,
             targetId: defender.id,
             amount,
-            flags
-        });
+            flags,
+            element,
+            weaponId,
+            ammoId
+        };
+    }
+
+    broadcastSwing(attacker, defender, amount, flags, hit) {
+        const swing = encodeSwing(this.swingWire(attacker, defender, amount, flags, hit));
         const stats = encodeStats(defender);
         const candidates = this.viewerCandidates(defender.x, defender.y, defender.z, 16);
         for (const p of candidates) {
@@ -2718,17 +3387,25 @@ class World {
         this.broadcastDisappear(session.id, session);
         session.downed = true;
         session.targetId = 0;
-        session.autoChase = false;
+        this.clearPlayerWalk(session);
         session.respawnTick = tickIndex + delay;
         session.openCorpseId = 0;
         this.closeTalk(session, true);
     }
 
-    killCreature(creature, killer, tickIndex) {
+    killCreature(creature, killer, tickIndex, opts) {
+        const dismiss = !!(opts && opts.dismiss);
+        const summoned = isSummon(creature);
         if (this.computeService) {
             this.computeService.cancelEntityJobs(creature.id);
         }
         creature._computeToken = null;
+        this.clearTarget(creature.id);
+        if (!dismiss && !summoned) {
+            this.dismissSummonsOf(creature, tickIndex);
+        } else if (summoned) {
+            this.unlinkSummon(creature);
+        }
         this.tileMap.leaveTile(creature.x, creature.y, creature.z, creature);
         this.creatures.delete(creature.id);
         this.activeCreatures.delete(creature);
@@ -2737,18 +3414,25 @@ class World {
             p.send(S2C.DEATH, encodeDeath(creature.id, killer && killer.id));
             p.send(S2C.DISAPPEAR, encodeDisappear(creature.id));
         });
-        const items = rollLoot(creature.loot, this.rng);
-        const corpse = createCorpse(this.nextCorpseId, creature, items, tickIndex);
-        this.nextCorpseId += 1;
-        this.corpses.set(corpse.id, corpse);
-        this.corpseQueue.push(corpse);
-        if (this.corpseSpatial) this.corpseSpatial.insert(corpse);
-        const corpseBuf = encodeCorpse(corpse);
-        this.broadcastToViewers(corpse.x, corpse.y, corpse.z, (p) => {
-            p.send(S2C.CORPSE, corpseBuf);
-        });
-        if (killer && killer.type === 'player') {
+        const skipCorpse = dismiss || summoned;
+        if (!skipCorpse) {
+            const items = rollLoot(creature.loot, this.rng);
+            const corpse = createCorpse(this.nextCorpseId, creature, items, tickIndex);
+            this.nextCorpseId += 1;
+            this.corpses.set(corpse.id, corpse);
+            this.corpseQueue.push(corpse);
+            if (this.corpseSpatial) this.corpseSpatial.insert(corpse);
+            const corpseBuf = encodeCorpse(corpse);
+            this.broadcastToViewers(corpse.x, corpse.y, corpse.z, (p) => {
+                p.send(S2C.CORPSE, corpseBuf);
+            });
+        }
+        if (!dismiss && killer && killer.type === 'player') {
             this.awardKillExp(killer, creature.exp | 0);
+        }
+        if (skipCorpse) {
+            if (this.creaturePool) this.creaturePool.release(creature);
+            return;
         }
         const pin = creature.pinIndex != null ? this.spawnPins[creature.pinIndex] : null;
         if (pin) {
@@ -2800,7 +3484,7 @@ class World {
         this.applyHp(session, session.hpMax);
         session.downed = false;
         session.targetId = 0;
-        session.autoChase = false;
+        this.clearPlayerWalk(session);
         session.moveReadyTick = tickIndex;
         session.attackReadyTick = tickIndex;
         session.send(S2C.STATS, encodeStats(session));
@@ -2873,7 +3557,6 @@ class World {
         for (const p of this.players.values()) {
             if (p.targetId === n) {
                 p.targetId = 0;
-                p.autoChase = false;
             }
         }
         for (const cr of this.activeCreatures) {
@@ -3530,6 +4213,7 @@ class World {
 
     refreshLoadout(session) {
         applyPlayerLoadout(session, this.itemDb());
+        recomputeDerived(session);
         this.sendInventory(session);
     }
 
@@ -3696,12 +4380,58 @@ class World {
         }
     }
 
+    applyRegenDeltas(entity, hpDelta, mpDelta) {
+        if (!entity) return false;
+        const hpAdd = Math.floor(Number(hpDelta) || 0);
+        const mpAdd = Math.floor(Number(mpDelta) || 0);
+        if (!(hpAdd > 0) && !(mpAdd > 0)) return false;
+        const beforeHp = entity.hp | 0;
+        const beforeMp = entity.mp | 0;
+        if (hpAdd > 0) this.applyHp(entity, beforeHp + hpAdd);
+        if (mpAdd > 0) this.applyMp(entity, beforeMp + mpAdd);
+        if ((entity.hp | 0) === beforeHp && (entity.mp | 0) === beforeMp) return false;
+        this.broadcastStats(entity);
+        return true;
+    }
+
+    tickPlayerRegen(session) {
+        if (!session || session.simSleeping) return;
+        if (session.dead || session.downed || (session.hp | 0) <= 0) return;
+        const cls = classRow(this.pack, session.vocation || (session.character && session.character.vocation));
+        const rates = nativeRegenRates(cls, !!(session.promoted || (session.character && session.character.promoted)));
+        const intervals = regenIntervalTicks(this.settings, playerInEngage(session, this));
+        const native = tickNativeRegen(session, rates, intervals);
+        const itemDb = this.itemDb();
+        const ups = (this.settings.logicUps | 0) || 20;
+        const gear = tickEquippedItemRegen(session.inventory, itemDb, ups);
+        this.applyRegenDeltas(session, native.hpDelta + gear.hpDelta, native.mpDelta + gear.mpDelta);
+    }
+
+    tickPlayerDurationItems(session) {
+        if (!session || session.dead || session.downed) return;
+        const itemDb = this.itemDb();
+        const ups = (this.settings.logicUps | 0) || 20;
+        const tick = tickEquippedDurations(session.inventory, itemDb, ups);
+        if (!tick.expiredUids.length) return;
+        for (let i = 0; i < tick.expiredUids.length; i++) {
+            const uid = tick.expiredUids[i];
+            const inst = session.inventory.items[uid];
+            const item = inst ? findItem(itemDb, inst.itemId) : null;
+            const label = item && item.label ? item.label : (inst && inst.itemId) || 'item';
+            destroyItem(session.inventory, uid, itemDb);
+            this.say(session, 'Your ' + label + ' has decayed.');
+        }
+        this.refreshLoadout(session);
+    }
+
     tickCombatStatus(tickIndex) {
         const dt = 1 / ((this.settings.logicUps | 0) || 20);
         const now = this.logicNow(tickIndex);
         for (const p of this.players.values()) {
             if (p.dead || p.downed || (p.hp | 0) <= 0) continue;
             this.tickCombatantConditions(p, dt);
+            this.tickPlayerRegen(p);
+            this.tickPlayerDurationItems(p);
         }
         for (const cr of this.activeCreatures) {
             if ((cr.hp | 0) <= 0 || cr.simSleeping) continue;
@@ -3783,8 +4513,13 @@ class World {
             this.say(session, 'You cannot cast that.');
             return;
         }
-        const target = body.targetId ? this.getEntity(body.targetId) : this.getEntity(session.targetId);
-        const aim = { x: body.x | 0, y: body.y | 0, z: body.z | 0 };
+        const selfCast = isSelfTargetSpell(spell);
+        const target = selfCast
+            ? session
+            : (body.targetId ? this.getEntity(body.targetId) : this.getEntity(session.targetId));
+        const aim = selfCast
+            ? { x: session.x | 0, y: session.y | 0, z: session.z | 0 }
+            : { x: body.x | 0, y: body.y | 0, z: body.z | 0 };
         this.runCast(session, spell, { target, aim, tickIndex, seq: intent.seq });
     }
 
@@ -3895,12 +4630,15 @@ class World {
                 amount = this.applyDamage(def, hit.final, hit.element, tickIndex, attacker);
             } else {
                 amount = this.applyDamage(def, hit.final, hit.element, tickIndex, attacker);
+                if (amount > 0 && attacker.type === 'player' && spellCanCritOrLeech(spell)) {
+                    this.applyAttackLeech(attacker, amount);
+                }
                 if (hit.critical) flags |= SWING_CRIT;
                 if (hit.fatal) flags |= SWING_FATAL;
                 if ((def.hp | 0) <= 0) flags |= SWING_DEATH;
             }
             if (!hit.field && def !== attacker) {
-                this.broadcastSwing(attacker, def, amount, flags);
+                this.broadcastSwing(attacker, def, amount, flags, hit);
             } else {
                 this.broadcastStats(def);
             }
@@ -3942,23 +4680,13 @@ class World {
             this.sendInventory(session);
             return;
         }
-        const heal = asHealRange(item);
-        const mana = asManaRange(item);
-        if (heal || mana) {
-            if (heal) {
-                const lo = heal[0];
-                const hi = heal[1];
-                const roll = lo >= hi ? lo : lo + Math.floor(this.rng() * (hi - lo + 1));
-                this.applyHp(session, (session.hp | 0) + roll);
+        const effect = resolveItemUseEffect(item);
+        if (effect.known || itemIsUsable(item)) {
+            if (!consumeInstanceCount(session.inventory, uid, 1, itemDb)) {
+                this.say(session, 'You cannot use that.');
+                return;
             }
-            if (mana) {
-                const lo = mana[0];
-                const hi = mana[1];
-                const roll = lo >= hi ? lo : lo + Math.floor(this.rng() * (hi - lo + 1));
-                session.mp = Math.max(0, Math.min(session.mpMax | 0, (session.mp | 0) + roll));
-                if (session.character) session.character.mp = session.mp;
-            }
-            consumeInstanceCount(session.inventory, uid, 1, itemDb);
+            applyItemUseEffect(session, effect, { rng: this.rng });
             this.sendInventory(session);
             session.send(S2C.STATS, encodeStats(session));
             return;

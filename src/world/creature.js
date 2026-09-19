@@ -2,6 +2,8 @@
 
 const { DIR } = require('../protocol/opcodes');
 const { copyNpcWanderFields } = require('./npc');
+const { normalizeSummonConfig, ensureSummonRuntime } = require('./summons');
+const { attachCreatureThreat, emptyThreatBag, DEFAULT_STRATEGIES } = require('./threat');
 
 function dirFromDelta(dx, dy) {
     const adx = Math.abs(dx | 0);
@@ -141,6 +143,7 @@ class Creature {
         this.shieldBlocksThisWindow = 0;
         this.shieldBlockWindowTick = 0;
         this.resists = (template && template.resists) || { physical: 0 };
+        this.immunities = (template && template.immunities) || null;
         this.critChance = Math.max(0, Number(template && template.critChance) || 0);
         this.critDamage = Math.max(0, Number(template && template.critDamage) || 0);
         this.exp = template ? template.exp | 0 : 0;
@@ -150,6 +153,12 @@ class Creature {
         this.flags = flags;
         this.aggro = !template || template.aggro !== false;
         this.attacks = (template && template.attacks) || [];
+        this.defenseSpells = (template && template.defenseSpells) || [];
+        this.summon = normalizeSummonConfig(template && template.summon);
+        this.summonIds = [];
+        this.masterId = 0;
+        this._summonReadyTicks = [];
+        ensureSummonRuntime(this);
         this.loot = (template && template.loot) || [];
         this.dialog = (template && template.dialog) || null;
         this.dialogId = (template && template.dialogId) || null;
@@ -165,6 +174,7 @@ class Creature {
         this.targetDistance = flags.targetDistance != null ? Math.max(1, flags.targetDistance | 0) : 1;
         this.aggroRange = flags.aggroRange == null ? 7 : flags.aggroRange | 0;
         this.loseTargetDistance = flags.loseTargetDistance == null ? 12 : flags.loseTargetDistance | 0;
+        attachCreatureThreat(this, template);
         this.targetId = 0;
         this.leashing = false;
         if (Array.isArray(this.path)) {
@@ -175,6 +185,7 @@ class Creature {
         this.moveReadyTick = 0;
         this.attackReadyTick = 0;
         this._attackReadyTicks = {};
+        this._defenseReadyTicks = {};
         this.simSleeping = false;
         this.pinIndex = null;
         this.baseSpeed = this.speed;
@@ -215,6 +226,7 @@ class Creature {
         this.shieldBlocksThisWindow = 0;
         this.shieldBlockWindowTick = 0;
         this.resists = null;
+        this.immunities = null;
         this.critChance = 0;
         this.critDamage = 0;
         this.exp = 0;
@@ -224,6 +236,13 @@ class Creature {
         this.flags = null;
         this.aggro = true;
         this.attacks = null;
+        this.defenseSpells = null;
+        this.summon = null;
+        if (Array.isArray(this.summonIds)) this.summonIds.length = 0;
+        else this.summonIds = [];
+        this.masterId = 0;
+        if (Array.isArray(this._summonReadyTicks)) this._summonReadyTicks.length = 0;
+        else this._summonReadyTicks = [];
         this.loot = null;
         this.dialog = null;
         this.dialogId = null;
@@ -238,6 +257,9 @@ class Creature {
         this.targetDistance = 1;
         this.aggroRange = 7;
         this.loseTargetDistance = 12;
+        this.strategiesTarget = Object.assign({}, DEFAULT_STRATEGIES);
+        this.changeTarget = { intervalSec: null, chance: null };
+        emptyThreatBag(this);
         this.targetId = 0;
         this.leashing = false;
         if (Array.isArray(this.path)) {
@@ -248,6 +270,7 @@ class Creature {
         this.moveReadyTick = 0;
         this.attackReadyTick = 0;
         this._attackReadyTicks = {};
+        this._defenseReadyTicks = {};
         this.simSleeping = false;
         this.pinIndex = null;
         this.baseSpeed = 100;

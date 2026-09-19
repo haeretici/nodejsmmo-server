@@ -1,6 +1,6 @@
 'use strict';
 
-/** Product port of HuntDL [27] exp / skill math. No kernel require. */
+/** Product port of HuntDL [27] exp / skill math and [09] L1–7 HP/MP pools. No kernel require. */
 
 const EXP_LEVEL_CACHE_MAX = 2000;
 const EXP_FOR_LEVEL_CACHE = new Array(EXP_LEVEL_CACHE_MAX + 1);
@@ -52,6 +52,13 @@ const SKILL_BASE = Object.freeze({
 const MAGIC_MANA_BASE = 1600;
 const SKILL_FLOOR = 10;
 const MAGIC_FLOOR = 0;
+
+/** L1–7: every class uses these HP/MP gains. L8 = class `baseHp`/`baseMp` (185/90). */
+const PRE_VOCATION_LEVEL = 8;
+const PRE_VOCATION_HP = 150;
+const PRE_VOCATION_MP = 50;
+const PRE_VOCATION_HP_GAIN = 5;
+const PRE_VOCATION_MP_GAIN = 5;
 
 const SKILL_KEYS = Object.freeze([
     'fist', 'club', 'sword', 'axe', 'distance', 'shielding', 'magic', 'fishing'
@@ -651,6 +658,52 @@ function skillLabel(skill) {
     return k || 'skill';
 }
 
+/**
+ * Max HP / MP from level + class.
+ * L1–7: 150+(L−1)×5 HP, 50+L×5 MP (L1 150/55). L8 = class baseline (185/90).
+ * After 8: base + (level−8)×perLevel.
+ */
+function poolMaxForLevel(level, cls) {
+    const bag = cls || {};
+    const lv = Math.max(1, Math.floor(Number(level) || 1));
+    const hpBonus = Number(bag.hpBonus) || 0;
+    const mpBonus = Number(bag.mpBonus) || 0;
+    if (lv < PRE_VOCATION_LEVEL) {
+        return {
+            hpMax: PRE_VOCATION_HP + (lv - 1) * PRE_VOCATION_HP_GAIN + hpBonus,
+            mpMax: PRE_VOCATION_MP + lv * PRE_VOCATION_MP_GAIN + mpBonus
+        };
+    }
+    const baseHp = bag.baseHp != null ? bag.baseHp : PRE_VOCATION_HP;
+    const baseMp = bag.baseMp != null ? bag.baseMp : 90;
+    const hpPerLevel = bag.hpPerLevel != null ? bag.hpPerLevel : 15;
+    const mpPerLevel = bag.mpPerLevel != null ? bag.mpPerLevel : 5;
+    const above = lv - PRE_VOCATION_LEVEL;
+    return {
+        hpMax: baseHp + above * hpPerLevel + hpBonus,
+        mpMax: baseMp + above * mpPerLevel + mpBonus
+    };
+}
+
+/**
+ * Set entity hpMax/mpMax from `newLevel`. Positive delta heals current HP/MP;
+ * a shrink (wrong L1 seed) only clamps.
+ */
+function applyLevelPoolDelta(entity, oldLevel, newLevel, cls) {
+    if (!entity || newLevel <= oldLevel) return false;
+    const next = poolMaxForLevel(newLevel, cls);
+    const hpGain = next.hpMax - (entity.hpMax | 0);
+    const mpGain = next.mpMax - (entity.mpMax | 0);
+    if (hpGain === 0 && mpGain === 0) return false;
+    entity.hpMax = next.hpMax;
+    entity.mpMax = next.mpMax;
+    if (hpGain > 0) entity.hp = Math.min(entity.hpMax, (entity.hp | 0) + hpGain);
+    else entity.hp = Math.min(entity.hpMax, entity.hp | 0);
+    if (mpGain > 0) entity.mp = Math.min(entity.mpMax, (entity.mp | 0) + mpGain);
+    else entity.mp = Math.min(entity.mpMax, entity.mp | 0);
+    return true;
+}
+
 module.exports = {
     SKILL_BASE,
     MAGIC_MANA_BASE,
@@ -692,5 +745,12 @@ module.exports = {
     resolveWeaponSkillBag,
     defenderHasShield,
     processAttackSkillProgression,
-    skillLabel
+    skillLabel,
+    PRE_VOCATION_LEVEL,
+    PRE_VOCATION_HP,
+    PRE_VOCATION_MP,
+    PRE_VOCATION_HP_GAIN,
+    PRE_VOCATION_MP_GAIN,
+    poolMaxForLevel,
+    applyLevelPoolDelta
 };

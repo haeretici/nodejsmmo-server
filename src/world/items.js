@@ -8,6 +8,34 @@ const DEFAULT_ROOT_SLOTS = 20;
 const ROOT_UID = 'root';
 const DEFAULT_BACKPACK_ITEM_ID = 'backpack';
 const INV_FLAG_CONTAINER = 1;
+/** Catalog crit extra / leech *amount* pipeline units → percent: 1000 = 10%. Chance is already 0–100. */
+const COMBAT_PIPELINE_PER_PERCENT = 100;
+
+const DEFAULT_RESISTS = Object.freeze({
+    physical: 0,
+    fire: 0,
+    ice: 0,
+    energy: 0,
+    earth: 0,
+    holy: 0,
+    death: 0
+});
+
+const WEAPON_CATEGORIES = Object.freeze([
+    'sword',
+    'axe',
+    'club',
+    'mace',
+    'dagger',
+    'bow',
+    'crossbow',
+    'spear',
+    'staff',
+    'wand',
+    'rod',
+    'fist',
+    'throwing'
+]);
 
 const EQUIPMENT_SLOTS = Object.freeze([
     'amulet',
@@ -206,6 +234,32 @@ function itemIsMagicWeapon(item) {
     return false;
 }
 
+function itemIsWeapon(item, slot) {
+    if (!item) return false;
+    if (itemIsAmmo(item) || itemIsShield(item) || itemIsQuiver(item)) return false;
+    const cat = item.category != null ? String(item.category).toLowerCase() : '';
+    if (cat === 'quiver') return false;
+    if (slot === 'leftHand' && WEAPON_CATEGORIES.indexOf(cat) < 0) return false;
+    if (item.slot === 'leftHand' && WEAPON_CATEGORIES.indexOf(cat) < 0) return false;
+    if (slot === 'rightHand' || item.slot === 'rightHand' || item.slot === 'weapon') return true;
+    if (item.weaponType && item.weaponType !== 'shield') return true;
+    if (cat && WEAPON_CATEGORIES.indexOf(cat) >= 0) return true;
+    return false;
+}
+
+function pipelineToPercent(n) {
+    return (Number(n) || 0) / COMBAT_PIPELINE_PER_PERCENT;
+}
+
+function stackResists(stacks) {
+    if (!stacks || !stacks.length) return 0;
+    let remain = 1;
+    for (let i = 0; i < stacks.length; i++) {
+        remain *= 1 - (Number(stacks[i]) || 0) / 100;
+    }
+    return (1 - remain) * 100;
+}
+
 function itemIsTwoHanded(item) {
     if (!item) return false;
     return item.twoHanded === true || item.twoHanded === 'true' || item.twoHanded === 1;
@@ -253,6 +307,36 @@ function weaponRequiredAmmoKind(weapon) {
 
 function itemIsBowOrCrossbowWeapon(item) {
     return weaponRequiredAmmoKind(item) != null;
+}
+
+function itemIsThrowingWeapon(item) {
+    if (!item || typeof item !== 'object') return false;
+    const cat = item.category != null ? String(item.category).toLowerCase() : '';
+    if (cat === 'spear' || cat === 'throwing') return true;
+    const types = item.type;
+    if (Array.isArray(types)) {
+        for (let i = 0; i < types.length; i++) {
+            if (String(types[i]).toLowerCase() === 'throwing') return true;
+        }
+    } else if (types != null && String(types).toLowerCase() === 'throwing') {
+        return true;
+    }
+    return false;
+}
+
+function itemBreakChance(item) {
+    if (!item || item.breakChance == null || item.breakChance === '') return null;
+    const n = Number(item.breakChance);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.min(100, n);
+}
+
+function normalizeAutoShape(shape) {
+    if (!shape || typeof shape !== 'object') return null;
+    if (String(shape.type || '') !== 'area') return null;
+    const code = Number(shape.code);
+    if (!Number.isFinite(code)) return null;
+    return { type: 'area', code };
 }
 
 function mapTokenToWeaponSkill(token) {
@@ -349,6 +433,18 @@ function itemIsMultiUse(item) {
     return false;
 }
 
+function itemIsFood(item) {
+    if (!item || typeof item !== 'object') return false;
+    const cat = item.category != null ? String(item.category).toLowerCase() : '';
+    if (cat === 'food') return true;
+    if (Array.isArray(item.type)) {
+        for (let i = 0; i < item.type.length; i++) {
+            if (String(item.type[i]).toLowerCase() === 'food') return true;
+        }
+    }
+    return false;
+}
+
 function itemIsUsable(item) {
     if (!item || typeof item !== 'object') return false;
     if (itemIsContainer(item) || itemIsMultiUse(item)) return false;
@@ -415,31 +511,53 @@ function containerCapacity(itemOrId, itemDb) {
     return DEFAULT_ROOT_SLOTS;
 }
 
-function asHealRange(item) {
-    if (!item) return null;
-    if (item.heal != null && Number.isFinite(Number(item.heal))) {
-        const n = Math.max(0, Math.floor(Number(item.heal)));
-        return [n, n];
-    }
-    if (item.healMin != null) {
-        const a = Math.floor(Number(item.healMin) || 0);
-        const b = Math.floor(Number(item.healMax != null ? item.healMax : item.healMin) || 0);
+function asRange(v) {
+    if (v == null) return null;
+    if (Array.isArray(v) && v.length >= 2) {
+        const a = Number(v[0]);
+        const b = Number(v[1]);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
         return a <= b ? [a, b] : [b, a];
     }
-    return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return [n, n];
+}
+
+function asHealRange(item) {
+    if (!item) return null;
+    const use = item.use && typeof item.use === 'object' ? item.use : null;
+    return asRange(item.heal)
+        || asRange(item.healMin != null ? [item.healMin, item.healMax != null ? item.healMax : item.healMin] : null)
+        || asRange(use && use.heal)
+        || null;
 }
 
 function asManaRange(item) {
     if (!item) return null;
-    if (item.restoreMana != null && Number.isFinite(Number(item.restoreMana))) {
-        const n = Math.max(0, Math.floor(Number(item.restoreMana)));
-        return [n, n];
+    const use = item.use && typeof item.use === 'object' ? item.use : null;
+    return asRange(item.restoreMana)
+        || asRange(item.mana)
+        || asRange(item.manaMin != null ? [item.manaMin, item.manaMax != null ? item.manaMax : item.manaMin] : null)
+        || asRange(use && use.mana)
+        || null;
+}
+
+function asCondition(v) {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+    const type = String(v.type || v.kind || '').trim();
+    if (!type) return null;
+    return Object.assign({}, v, { type });
+}
+
+function asDispel(v) {
+    if (!Array.isArray(v) || !v.length) return [];
+    const out = [];
+    for (let i = 0; i < v.length; i++) {
+        const k = String(v[i] || '').toLowerCase().trim();
+        if (k) out.push(k);
     }
-    if (item.mana != null && Number.isFinite(Number(item.mana))) {
-        const n = Math.max(0, Math.floor(Number(item.mana)));
-        return [n, n];
-    }
-    return null;
+    return out;
 }
 
 function computeMitigationPercent(shieldingSkill, defense) {
@@ -474,6 +592,9 @@ module.exports = {
     UNARMED_ATK,
     UNARMED_WEAPON_DEFENSE,
     BOW_MITIGATION_DEFENSE,
+    COMBAT_PIPELINE_PER_PERCENT,
+    DEFAULT_RESISTS,
+    WEAPON_CATEGORIES,
     MAX_STACK_SIZE,
     DEFAULT_ROOT_SLOTS,
     ROOT_UID,
@@ -496,7 +617,13 @@ module.exports = {
     itemAmmoKind,
     weaponRequiredAmmoKind,
     itemIsBowOrCrossbowWeapon,
+    itemIsThrowingWeapon,
+    itemBreakChance,
+    normalizeAutoShape,
     itemIsMagicWeapon,
+    itemIsWeapon,
+    pipelineToPercent,
+    stackResists,
     mapTokenToWeaponSkill,
     resolveWeaponSkillFromItem,
     itemIsContainer,
@@ -504,13 +631,17 @@ module.exports = {
     itemIsStackable,
     itemIsRune,
     itemIsMultiUse,
+    itemIsFood,
     itemIsUsable,
     preferredEquipSlot,
     canEquipInSlot,
     itemIsEquipable,
     containerCapacity,
+    asRange,
     asHealRange,
     asManaRange,
+    asCondition,
+    asDispel,
     computeMitigationPercent,
     computeMaxBlock,
     skillValue

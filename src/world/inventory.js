@@ -18,7 +18,11 @@ const {
     itemIsShield,
     itemIsTwoHanded,
     itemIsBowOrCrossbowWeapon,
+    itemIsThrowingWeapon,
     itemIsMagicWeapon,
+    itemIsWeapon,
+    itemBreakChance,
+    normalizeAutoShape,
     itemAmmoKind,
     weaponRequiredAmmoKind,
     canEquipInSlot,
@@ -29,7 +33,10 @@ const {
     resolveWeaponSkillFromItem,
     computeMitigationPercent,
     computeMaxBlock,
-    skillValue
+    skillValue,
+    DEFAULT_RESISTS,
+    pipelineToPercent,
+    stackResists
 } = require('./items');
 
 const CAP_CLASS_BAND = Object.freeze({
@@ -146,6 +153,7 @@ function createItemInstance(inv, itemId, itemDb, opts) {
         : (findItem(null, id) && findItem(null, id).weight != null ? Number(findItem(null, id).weight) || 0 : 0);
     const inst = { uid, itemId: id, location: null, unitWeight };
     if (count > 1) inst.count = count;
+    seedInstanceBudgets(inst, item, o);
     inv.items[uid] = inst;
     if (itemIsContainer(item) || (item && itemIsBackpackEquip(item))) {
         const cap = containerCapacity(item, itemDb);
@@ -1024,11 +1032,116 @@ function equippedRightHandItem(inv, itemDb) {
     return findItem(itemDb, inv.items[uid].itemId);
 }
 
+function equippedRightHandCount(inv) {
+    if (!inv || !inv.equipment) return 0;
+    const uid = inv.equipment.rightHand;
+    if (!uid || !inv.items[uid]) return 0;
+    return getStackCount(inv.items[uid]);
+}
+
+function equippedIsThrowingWeapon(inv, itemDb) {
+    return itemIsThrowingWeapon(equippedRightHandItem(inv, itemDb));
+}
+
+function tryBreakEquippedThrowingWeapon(inv, itemDb, rng) {
+    const empty = {
+        attempted: false,
+        broke: false,
+        changed: false,
+        itemId: null,
+        remaining: 0,
+        breakChance: null
+    };
+    if (!inv || !inv.equipment) return empty;
+    const uid = inv.equipment.rightHand;
+    if (!uid || !inv.items[uid]) return empty;
+    const inst = inv.items[uid];
+    const item = findItem(itemDb, inst.itemId);
+    if (!itemIsThrowingWeapon(item)) return empty;
+    const chance = itemBreakChance(item);
+    const itemId = inst.itemId != null ? String(inst.itemId) : null;
+    const remainingBefore = getStackCount(inst);
+    if (chance == null) {
+        return {
+            attempted: false,
+            broke: false,
+            changed: false,
+            itemId,
+            remaining: remainingBefore,
+            breakChance: null
+        };
+    }
+    if (chance <= 0) {
+        return {
+            attempted: true,
+            broke: false,
+            changed: false,
+            itemId,
+            remaining: remainingBefore,
+            breakChance: chance
+        };
+    }
+    if (chance < 100) {
+        const r = typeof rng === 'function' ? Number(rng()) : Math.random();
+        const roll = (Number.isFinite(r) ? r : Math.random()) * 100;
+        if (!(roll < chance)) {
+            return {
+                attempted: true,
+                broke: false,
+                changed: false,
+                itemId,
+                remaining: remainingBefore,
+                breakChance: chance
+            };
+        }
+    }
+    const unit = item && item.weight != null
+        ? Number(item.weight) || 0
+        : (inst.unitWeight != null ? Number(inst.unitWeight) || 0 : 0);
+    const left = remainingBefore - 1;
+    if (left <= 0) {
+        destroyItem(inv, uid, itemDb);
+        return {
+            attempted: true,
+            broke: true,
+            changed: true,
+            itemId,
+            remaining: 0,
+            breakChance: chance
+        };
+    }
+    setStackCount(inst, left);
+    if (typeof inv.totalWeight === 'number') {
+        inv.totalWeight = Math.max(0, inv.totalWeight - unit);
+    }
+    return {
+        attempted: true,
+        broke: true,
+        changed: true,
+        itemId,
+        remaining: left,
+        breakChance: chance
+    };
+}
+
+function resolveDistanceAutoShape(inv, itemDb) {
+    if (equippedIsThrowingWeapon(inv, itemDb)) return null;
+    const ammo = peekAmmoForShot(inv, itemDb);
+    return normalizeAutoShape(ammo && ammo.autoShape);
+}
+
 function equippedLeftHandItem(inv, itemDb) {
     if (!inv || !inv.equipment) return null;
     const uid = inv.equipment.leftHand;
     if (!uid || !inv.items[uid]) return null;
     return findItem(itemDb, inv.items[uid].itemId);
+}
+
+function authoredNonNeg(v) {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
 }
 
 function applyPlayerLoadout(session, itemDb) {
@@ -1080,8 +1193,8 @@ function applyPlayerLoadout(session, itemDb) {
 
     if (isMagic) {
         session.weaponType = 'magic';
-        session.weaponMin = Number(right.min) || 0;
-        session.weaponMax = Number(right.max) || 0;
+        session.weaponMin = authoredNonNeg(right.min);
+        session.weaponMax = authoredNonNeg(right.max);
         session.weaponElement = String(right.element || 'energy').toLowerCase();
         session.weaponRange = Math.max(1, Number(right.range) || 4);
         session.weaponManaGain = Math.max(0, Math.floor(Number(right.manaGain) || 0));
@@ -1129,18 +1242,34 @@ function applyPlayerLoadout(session, itemDb) {
     let armor = 0;
     let extraCrit = 0;
     let extraCritDmg = 0;
+    let gearSpeed = 0;
+    let extraFormulaAtk = 0;
+    let lifeLeechChance = Number(session._lifeLeechChance) || 0;
+    let lifeLeechAmountPipeline = 0;
+    let manaLeechChance = Number(session._manaLeechChance) || 0;
+    let manaLeechAmountPipeline = 0;
+    const resistStacks = Object.create(null);
     const eq = inv && inv.equipment;
     if (eq) {
         const keys = Object.keys(eq);
         for (let i = 0; i < keys.length; i++) {
-            if (keys[i] === 'backpack') continue;
-            const inst = inv.items[eq[keys[i]]];
+            const slot = keys[i];
+            if (slot === 'backpack') continue;
+            const inst = inv.items[eq[slot]];
             if (!inst) continue;
             const item = findItem(itemDb, inst.itemId);
             if (!item) continue;
             armor += Number(item.armor) || 0;
             extraCrit += Number(item.critChance) || 0;
             extraCritDmg += Number(item.critExtraDamage) || Number(item.critDamage) || 0;
+            gearSpeed += Number(item.speed) || 0;
+            if (!itemIsWeapon(item, slot) && !itemIsAmmo(item) && item.atk != null) {
+                extraFormulaAtk += Number(item.atk) || 0;
+            }
+            lifeLeechChance += Number(item.lifeLeechChance) || 0;
+            lifeLeechAmountPipeline += Number(item.lifeLeechAmount) || 0;
+            manaLeechChance += Number(item.manaLeechChance) || 0;
+            manaLeechAmountPipeline += Number(item.manaLeechAmount) || 0;
             const bonuses = item.skillBonuses || item.skills;
             if (bonuses && typeof bonuses === 'object') {
                 const bk = Object.keys(bonuses);
@@ -1149,9 +1278,44 @@ function applyPlayerLoadout(session, itemDb) {
                     session._gearSkillBonus[k] = (session._gearSkillBonus[k] || 0) + (Number(bonuses[k]) || 0);
                 }
             }
+            const resists = item.resists || item.resistances;
+            if (resists && typeof resists === 'object') {
+                const els = Object.keys(DEFAULT_RESISTS);
+                for (let e = 0; e < els.length; e++) {
+                    const el = els[e];
+                    const v = resists[el];
+                    if (v == null) continue;
+                    if (!resistStacks[el]) resistStacks[el] = [];
+                    if (Array.isArray(v)) {
+                        for (let n = 0; n < v.length; n++) resistStacks[el].push(Number(v[n]) || 0);
+                    } else {
+                        resistStacks[el].push(Number(v) || 0);
+                    }
+                }
+            }
         }
     }
-    session.armor = armor;
+    session.atk = atk + extraFormulaAtk + (Number(session._atkBonus) || 0);
+    session.armor = armor + (Number(session._classArmorBonus) || 0);
+    const resists = Object.assign({}, DEFAULT_RESISTS, session._classResists || {});
+    const stackedEls = Object.keys(resistStacks);
+    for (let i = 0; i < stackedEls.length; i++) {
+        const el = stackedEls[i];
+        resists[el] = stackResists(resistStacks[el]);
+    }
+    session.resists = resists;
+    session.lifeLeechChance = lifeLeechChance;
+    session.lifeLeechAmount = (Number(session._lifeLeechAmount) || 0) + pipelineToPercent(lifeLeechAmountPipeline);
+    session.manaLeechChance = manaLeechChance;
+    session.manaLeechAmount = (Number(session._manaLeechAmount) || 0) + pipelineToPercent(manaLeechAmountPipeline);
+    const levelForSpeed = Math.max(1, Math.floor(Number(session.level) || 1));
+    const classBaseSpeed = session._classBaseSpeed != null && Number.isFinite(Number(session._classBaseSpeed))
+        ? Number(session._classBaseSpeed)
+        : 110;
+    session.baseSpeed = classBaseSpeed
+        + (levelForSpeed - 1)
+        + gearSpeed
+        + (Number(session._speedBonus) || 0);
     if (session._baseCritChance == null) session._baseCritChance = Number(session.critChance) || 0;
     if (session._baseCritDamage == null) session._baseCritDamage = Number(session.critDamage) || 0;
     session.critChance = session._baseCritChance + extraCrit;
@@ -1179,12 +1343,59 @@ function applyPlayerLoadout(session, itemDb) {
     session.canBlock = session.maxBlock > 0;
 }
 
+function seedInstanceBudgets(inst, item, opts) {
+    if (!inst) return;
+    const o = opts && typeof opts === 'object' ? opts : {};
+    if (o.remainingCharges != null && Number.isFinite(Number(o.remainingCharges))) {
+        inst.remainingCharges = Math.max(0, Math.floor(Number(o.remainingCharges)));
+    } else if (item && item.charges != null && Number.isFinite(Number(item.charges))) {
+        const c = Math.floor(Number(item.charges));
+        if (c > 0) inst.remainingCharges = c;
+    }
+    if (o.remainingDurationSec != null && Number.isFinite(Number(o.remainingDurationSec))) {
+        inst.remainingDurationSec = Math.max(0, Number(o.remainingDurationSec));
+    } else if (item && item.durationSec != null && Number.isFinite(Number(item.durationSec))) {
+        const d = Number(item.durationSec);
+        if (d > 0) inst.remainingDurationSec = d;
+    }
+}
+
+function copyInstanceBudgets(src, dst) {
+    if (!src || !dst) return;
+    if (src.remainingDurationSec != null && Number.isFinite(Number(src.remainingDurationSec))) {
+        dst.remainingDurationSec = Math.max(0, Number(src.remainingDurationSec));
+    }
+    if (src.remainingCharges != null && Number.isFinite(Number(src.remainingCharges))) {
+        dst.remainingCharges = Math.max(0, Math.floor(Number(src.remainingCharges)));
+    }
+}
+
+function serializeItemInstance(inst) {
+    if (!inst) return null;
+    const row = {
+        uid: String(inst.uid),
+        itemId: String(inst.itemId || ''),
+        location: inst.location ? Object.assign({}, inst.location) : null
+    };
+    if (inst.count != null) row.count = inst.count;
+    if (inst.unitWeight != null) row.unitWeight = Number(inst.unitWeight) || 0;
+    copyInstanceBudgets(inst, row);
+    return row;
+}
+
 function serializeInventory(inv) {
     if (!isRuntimeInventory(inv)) return { items: [] };
+    const items = Object.create(null);
+    const src = inv.items || {};
+    const keys = Object.keys(src);
+    for (let i = 0; i < keys.length; i++) {
+        const row = serializeItemInstance(src[keys[i]]);
+        if (row && row.uid) items[row.uid] = row;
+    }
     const payload = {
         version: 1,
         nextUid: inv.nextUid | 0,
-        items: inv.items,
+        items,
         containers: inv.containers,
         rootUid: inv.rootUid,
         equipment: inv.equipment
@@ -1222,6 +1433,7 @@ function cloneInventory(inv) {
         };
         if (row.count == null) delete out.items[row.uid].count;
         if (out.items[row.uid].unitWeight === undefined) delete out.items[row.uid].unitWeight;
+        copyInstanceBudgets(row, out.items[row.uid]);
     }
     const containers = raw.containers || {};
     const ck = Object.keys(containers);
@@ -1545,9 +1757,16 @@ module.exports = {
     peekAmmoForShot,
     equippedWeaponAmmoKind,
     equippedRightHandItem,
+    equippedRightHandCount,
     equippedLeftHandItem,
+    equippedIsThrowingWeapon,
+    tryBreakEquippedThrowingWeapon,
+    resolveDistanceAutoShape,
     applyPlayerLoadout,
     serializeInventory,
+    serializeItemInstance,
+    seedInstanceBudgets,
+    copyInstanceBudgets,
     normalizeInventory,
     bagView,
     equipmentView,

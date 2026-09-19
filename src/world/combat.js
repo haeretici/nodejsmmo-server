@@ -4,6 +4,7 @@ const { SWING_FLAG } = require('../protocol/opcodes');
 
 const MELEE_AUTO_FACTOR = 0.102;
 const UNARMED_ATK = 7;
+const WAND_AUTO_FALLBACK_BASE_POWER = 18;
 const SWING_MISS = SWING_FLAG.MISS;
 const SWING_DEATH = SWING_FLAG.DEATH;
 const SWING_CRIT = SWING_FLAG.CRIT;
@@ -196,6 +197,89 @@ function kitAttack(attacker) {
     return fallback || list[0];
 }
 
+function kitAttackKind(atk) {
+    return String((atk && atk.kind) || 'melee').toLowerCase();
+}
+
+function isKitStatusAttack(atk) {
+    if (!atk) return false;
+    if (kitAttackKind(atk) === 'status') return true;
+    return !!(atk.statusOnly && atk.condition);
+}
+
+function isKitShapedAttack(atk) {
+    if (!atk) return false;
+    const kind = kitAttackKind(atk);
+    return kind === 'area' || kind === 'wave';
+}
+
+function kitAttackNeedsTarget(atk) {
+    if (!atk) return true;
+    return atk.target !== false && atk.needsTarget !== false;
+}
+
+function kitAttackReach(atk) {
+    if (!atk) return 1;
+    const kind = kitAttackKind(atk);
+    let range = atk.range != null ? Number(atk.range) : (kind === 'ranged' ? 5 : 1);
+    if (!Number.isFinite(range) || range < 0) range = kind === 'ranged' ? 5 : 1;
+    if (kind === 'wave') {
+        const length = atk.length != null ? Math.max(0, Number(atk.length) | 0) : 0;
+        if (length > range) range = length;
+    }
+    if (kind === 'area' || kind === 'wave' || kind === 'status') {
+        return Math.max(0, range);
+    }
+    return Math.max(1, range);
+}
+
+/**
+ * Synthetic spell def for a kit row. Area/wave carry `shape` so P12
+ * getAffectedTiles + resolveSpellHit share player CAST matrices.
+ */
+function kitAttackToSpell(atk) {
+    if (!atk) return null;
+    const kind = kitAttackKind(atk);
+    const length = atk.length != null ? Math.max(0, Number(atk.length) | 0) : 0;
+    const spread = atk.spread != null ? Math.max(0, Number(atk.spread) | 0) : 0;
+    const radius = atk.radius != null ? Math.max(0, Number(atk.radius) | 0) : 0;
+    let range = atk.range != null ? Number(atk.range) : 1;
+    if (!Number.isFinite(range)) range = 1;
+    if (kind === 'wave' && length > range) range = length;
+    let min = atk.min != null ? Number(atk.min) : 0;
+    let max = atk.max != null ? Number(atk.max) : 0;
+    if (!Number.isFinite(min)) min = 0;
+    if (!Number.isFinite(max)) max = 0;
+    if (max < min) {
+        const t = min;
+        min = max;
+        max = t;
+    }
+    const spell = {
+        id: atk.id != null ? String(atk.id) : kind,
+        kind: kind === 'melee' ? 'auto' : 'spell',
+        attackKind: kind,
+        radius,
+        length,
+        spread,
+        element: atk.element || 'physical',
+        range,
+        mana: 0,
+        hitChance: atk.hitChance != null ? Number(atk.hitChance) : 100,
+        isMelee: !!atk.isMelee,
+        min,
+        max,
+        statusOnly: !!atk.statusOnly
+    };
+    if (atk.condition) spell.condition = atk.condition;
+    if (kind === 'wave' && length > 0) {
+        spell.shape = { type: 'wave', length, spread };
+    } else if (kind === 'area' && radius > 0) {
+        spell.shape = { type: 'area', code: radius };
+    }
+    return spell;
+}
+
 function playerSkill(attacker) {
     if (attacker && attacker.skill != null) return Number(attacker.skill) || 0;
     const key = (attacker && attacker.weaponSkill) || 'fist';
@@ -264,6 +348,49 @@ function playerCombatFromClass(cls) {
     };
 }
 
+function applyClassCombatExtras(session, cls, settings) {
+    if (!session) return;
+    session._atkBonus = Number(cls && cls.atkBonus) || 0;
+    session._speedBonus = Number(cls && cls.speedBonus) || 0;
+    session._classBaseSpeed = (cls && cls.baseSpeed != null)
+        ? Number(cls.baseSpeed) || 0
+        : ((settings && settings.playerBaseSpeed) | 0) || 110;
+    session._classResists = (cls && cls.resists && typeof cls.resists === 'object')
+        ? Object.assign({}, cls.resists)
+        : null;
+    session._classArmorBonus = Number(cls && cls.armorBonus) || 0;
+    session._lifeLeechChance = Number(cls && cls.lifeLeechChance) || 0;
+    session._lifeLeechAmount = Number(
+        cls && (cls.lifeLeechAmount != null ? cls.lifeLeechAmount : cls.lifeLeech)
+    ) || 0;
+    session._manaLeechChance = Number(cls && cls.manaLeechChance) || 0;
+    session._manaLeechAmount = Number(
+        cls && (cls.manaLeechAmount != null ? cls.manaLeechAmount : cls.manaLeech)
+    ) || 0;
+}
+
+function rollLeechAmount(chance, amountPct, realDamage, rng) {
+    const dmg = Math.max(0, Number(realDamage) || 0);
+    const c = Math.max(0, Number(chance) || 0);
+    const a = Math.max(0, Number(amountPct) || 0);
+    if (dmg <= 0 || c <= 0 || a <= 0) return 0;
+    if (c < 100) {
+        const r = typeof rng === 'function' ? rng() : Math.random();
+        if (r * 100 >= c) return 0;
+    }
+    const raw = Math.round(dmg * (a / 100));
+    return Math.max(0, Math.min(dmg, raw));
+}
+
+function computeAttackLeech(attacker, realDamage, rng) {
+    const dmg = Math.max(0, Number(realDamage) || 0);
+    if (!attacker || dmg <= 0) return { life: 0, mana: 0 };
+    return {
+        life: rollLeechAmount(attacker.lifeLeechChance, attacker.lifeLeechAmount, dmg, rng),
+        mana: rollLeechAmount(attacker.manaLeechChance, attacker.manaLeechAmount, dmg, rng)
+    };
+}
+
 function missResult() {
     return {
         miss: true,
@@ -278,14 +405,21 @@ function missResult() {
     };
 }
 
-function rollRaw(min, max, isCritical, critDamage, rng, critBand) {
+function usesGaussianAutoRaw(powerCurve) {
+    return powerCurve === 'melee_auto' || powerCurve === 'distance_auto';
+}
+
+function rollRaw(min, max, isCritical, critDamage, rng, critBand, powerCurve) {
     const lo = Math.min(Number(min) || 0, Number(max) || 0);
     const hi = Math.max(Number(min) || 0, Number(max) || 0);
     const useAutoSt = !!isCritical && critBand === CRIT_BAND_AUTO_ST;
+    const useGaussian = !useAutoSt && (
+        critBand === CRIT_BAND_AUTO_ST || usesGaussianAutoRaw(powerCurve)
+    );
     let raw;
     if (useAutoSt) {
         raw = uniformRaw(autoStCritRollMin(lo, hi), hi, rng);
-    } else if (critBand === CRIT_BAND_AUTO_ST) {
+    } else if (useGaussian) {
         raw = gaussianRaw(lo, hi, rng);
     } else {
         raw = uniformRaw(lo, hi, rng);
@@ -452,12 +586,38 @@ function resolveMelee(attacker, defender, rng, opts) {
     };
 }
 
+function authoredNonNegBound(v) {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+}
+
+/**
+ * Wand item min/max when authored; omit both → magic_strike (basePower 18).
+ * @param {object|null|undefined} attacker
+ * @param {object} [opts]
+ * @returns {{ min: number, max: number }}
+ */
+function wandAutoBounds(attacker, opts) {
+    const o = opts || {};
+    const min = o.min != null ? authoredNonNegBound(o.min) : authoredNonNegBound(attacker && attacker.weaponMin);
+    const max = o.max != null ? authoredNonNegBound(o.max) : authoredNonNegBound(attacker && attacker.weaponMax);
+    if (min == null && max == null) {
+        return computeMagicStrikeRange(attacker, WAND_AUTO_FALLBACK_BASE_POWER, 0);
+    }
+    const lo = min != null ? min : 0;
+    const hi = max != null ? Math.max(lo, max) : lo;
+    return { min: lo, max: hi };
+}
+
 /**
  * Authoritative wand/rod auto-attack.
  * Fixed uniform roll in [min, max], elemental damage.
  * Multiplied on crit: uniform in [min, max] * (1 + critDamage/100).
  * Subject to defender mitigation% and resists[element]%.
  * Bypasses shield block (0) and armor reduction (0).
+ * Omit both item min/max → magic_strike fallback.
  * Returns { miss, hit, raw, final, critical, fatal: false, shieldBlock: 0, armorReduction: 0, blockChargeSpent: false, element, manaGain }
  */
 function resolveWandAuto(attacker, defender, rng, opts) {
@@ -489,14 +649,15 @@ function resolveWandAuto(attacker, defender, rng, opts) {
         ? !!o.critical
         : rollCritical(critChanceFor(attacker), rng);
 
-    const min = o.min != null
-        ? Number(o.min)
-        : (attacker && attacker.weaponMin != null ? Number(attacker.weaponMin) : 0);
-    const max = o.max != null
-        ? Number(o.max)
-        : (attacker && attacker.weaponMax != null ? Number(attacker.weaponMax) : 0);
-
-    const raw = rollRaw(min, max, isCritical, critDamageFor(attacker), rng, CRIT_BAND_MULTIPLY);
+    const range = wandAutoBounds(attacker, o);
+    const raw = rollRaw(
+        range.min,
+        range.max,
+        isCritical,
+        critDamageFor(attacker),
+        rng,
+        CRIT_BAND_MULTIPLY
+    );
 
     const mit = Math.max(0, Math.min(100, Number(defender && defender.mitigation) || 0));
     let remaining = raw * (1 - mit / 100);
@@ -793,7 +954,15 @@ function resolveSpellHit(attacker, defender, spell, rng, opts) {
         ? false
         : (o.critical === true || o.critical === false ? !!o.critical : rollCritical(critChanceFor(attacker), rng));
     const range = o.range || computeSpellDamageRange(spell, attacker);
-    let raw = rollRaw(range.min, range.max, isCritical, canCrit ? critDamageFor(attacker) : 0, rng, critBand);
+    let raw = rollRaw(
+        range.min,
+        range.max,
+        isCritical,
+        canCrit ? critDamageFor(attacker) : 0,
+        rng,
+        critBand,
+        spell && spell.powerCurve
+    );
     if (o.damageScale != null && Number(o.damageScale) !== 1) {
         raw = Math.max(0, Math.round(raw * Number(o.damageScale)));
     }
@@ -822,7 +991,11 @@ function resolveSpellHit(attacker, defender, spell, rng, opts) {
     }
     const isMelee = !!(spell && (spell.isMelee === true || spell.powerCurve === 'melee_strike'
         || spell.kind === 'strike' && (spell.element || 'physical') === 'physical'));
-    const mit = applyMitigation(raw, element, defender, { rng, isMelee });
+    const mit = applyMitigation(raw, element, defender, {
+        rng,
+        isMelee,
+        currentTick: o.currentTick
+    });
     return {
         miss: false,
         hit: true,
@@ -840,6 +1013,7 @@ function resolveSpellHit(attacker, defender, spell, rng, opts) {
 module.exports = {
     MELEE_AUTO_FACTOR,
     UNARMED_ATK,
+    WAND_AUTO_FALLBACK_BASE_POWER,
     SWING_MISS,
     SWING_DEATH,
     SWING_CRIT,
@@ -860,16 +1034,28 @@ module.exports = {
     autoStCritRollMin,
     rollHit,
     rollCritical,
+    critChanceFor,
     fatalChanceFromTier,
     rollFatal,
     applyFatalBonus,
     rollArmorReduction,
     rollShieldBlock,
     kitAttack,
+    kitAttackKind,
+    isKitStatusAttack,
+    isKitShapedAttack,
+    kitAttackNeedsTarget,
+    kitAttackReach,
+    kitAttackToSpell,
     classRow,
     playerCombatFromClass,
+    applyClassCombatExtras,
+    rollLeechAmount,
+    computeAttackLeech,
     playerSkill,
     resolveMelee,
+    wandAutoBounds,
+    usesGaussianAutoRaw,
     resolveWandAuto,
     resolveDistanceAuto,
     resolveCreatureAttack,

@@ -1,0 +1,5 @@
+{
+    "logLevel": "debug",
+    "gameOrigin": "http://127.0.0.1:8081",
+    "gameWsUrl": "ws://www.example.com/v1/ws"
+}

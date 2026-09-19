@@ -4,6 +4,8 @@ const { hashPassword, verifyPassword, dummyPasswordHash } = require('../security
 const { randomToken, tokenToHex, parseHexToken, hashToken } = require('../security/token');
 const { sessionCookieHeader, sidFromRequest } = require('./cookies');
 const { buildStarterInventory, serializeInventory } = require('../world/inventory');
+const { classRow } = require('../world/combat');
+const { poolMaxForLevel } = require('../world/progression');
 
 const NAME_RE = /^[A-Za-z][A-Za-z0-9]*(?: [A-Za-z0-9]+)*$/;
 const RESERVED_NAMES = new Set([
@@ -229,6 +231,8 @@ async function handleCreateCharacter(ctx, req, res, body) {
     const town = ctx.world && typeof ctx.world.townSpawn === 'function'
         ? ctx.world.townSpawn()
         : { x: nc.posX, y: nc.posY, z: nc.posZ };
+    const cls = classRow(ctx.world && ctx.world.pack, vocation);
+    const pools = poolMaxForLevel(nc.level, cls);
     let ch;
     try {
         ch = await ctx.store.createCharacter({
@@ -240,10 +244,10 @@ async function handleCreateCharacter(ctx, req, res, body) {
             posX: town.x,
             posY: town.y,
             posZ: town.z,
-            hp: nc.hp,
-            hpMax: nc.hpMax,
-            mp: nc.mp,
-            mpMax: nc.mpMax,
+            hp: pools.hpMax,
+            hpMax: pools.hpMax,
+            mp: pools.mpMax,
+            mpMax: pools.mpMax,
             townId: nc.townId,
             skills: nc.skills,
             inventory: inventoryForNewCharacter(ctx, vocation),

@@ -116,6 +116,7 @@ function main() {
     assert.strictEqual(dummy.name, 'Dummy');
     const appear = decodeAppear(lastOf(session.socket, S2C.APPEAR).payload);
     assert.strictEqual(appear.name, 'Dummy');
+    assert.ok(appear.dir === 0 || appear.dir === 1 || appear.dir === 2 || appear.dir === 3);
     dummy.hp = 1;
 
     assert.ok(w.enqueueIntent(session, {
@@ -127,6 +128,7 @@ function main() {
     const swing = decodeSwing(lastOf(session.socket, S2C.SWING).payload);
     assert.strictEqual(swing.targetId, dummy.id);
     assert.ok(swing.amount >= 1);
+    assert.strictEqual(typeof swing.element, 'number');
     const death = decodeDeath(lastOf(session.socket, S2C.DEATH).payload);
     assert.strictEqual(death.id, dummy.id);
     const corpse = decodeCorpse(lastOf(session.socket, S2C.CORPSE).payload);

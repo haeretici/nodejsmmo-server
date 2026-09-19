@@ -1,8 +1,8 @@
 'use strict';
 
 const assert = require('assert');
-const { encodeFrame, decodeFrame, Writer, Reader } = require('../src/protocol/frame');
-const { C2S, S2C, PROTOCOL_VERSION } = require('../src/protocol/opcodes');
+const { encodeFrame, decodeFrame, decodeFrames, Writer, Reader } = require('../src/protocol/frame');
+const { C2S, S2C, PROTOCOL_VERSION, SWING_ELEMENT } = require('../src/protocol/opcodes');
 const {
     encodeHello,
     decodeHello,
@@ -25,6 +25,8 @@ const {
     decodeContainer,
     encodeAppear,
     decodeAppear,
+    encodeField,
+    decodeField,
     encodeInventory,
     decodeInventory,
     encodeEquipment,
@@ -136,10 +138,18 @@ function main() {
     }));
     assert.strictEqual(sw.targetId, 1000000000);
     assert.strictEqual(sw.flags, 2);
+    assert.strictEqual(sw.element, SWING_ELEMENT.PHYSICAL);
+    assert.strictEqual(sw.weaponId, '');
     const sw2 = decodeSwing(encodeSwing({
-        sourceId: 3, targetId: 1, amount: 6, flags: 4 | 8
+        sourceId: 3, targetId: 1, amount: 6, flags: 4 | 8, element: 'fire', weaponId: 'ember_wand'
     }));
     assert.strictEqual(sw2.flags, 12);
+    assert.strictEqual(sw2.element, SWING_ELEMENT.FIRE);
+    assert.strictEqual(sw2.weaponId, 'ember_wand');
+    const swOld = decodeSwing(Buffer.from([3, 0, 0, 0, 1, 0, 0, 0, 6, 0, 4]));
+    assert.strictEqual(swOld.amount, 6);
+    assert.strictEqual(swOld.flags, 4);
+    assert.strictEqual(swOld.element, 0);
 
     const corpse = decodeCorpse(encodeCorpse({
         id: 2000000000, x: 12, y: 11, z: 0, name: 'Dummy'
@@ -153,13 +163,45 @@ function main() {
     assert.strictEqual(bag.items[0].count, 2);
 
     const ap = decodeAppear(encodeAppear({
-        id: 3, name: 'Ash', x: 12, y: 12, z: 0, hp: 185, hpMax: 185
+        id: 3, name: 'Ash', x: 12, y: 12, z: 0, hp: 185, hpMax: 185, dir: 3
     }));
     assert.strictEqual(ap.flags, 0);
+    assert.strictEqual(ap.dir, 3);
     const npc = decodeAppear(encodeAppear({
         id: 9, name: 'Guide', x: 6, y: 12, z: 0, hp: 100, hpMax: 100, type: 'npc', isNpc: true
     }));
     assert.strictEqual(npc.flags, 1);
+    assert.strictEqual(npc.dir, 0);
+    const field = decodeField(encodeField({
+        x: 14, y: 16, z: 7, kind: 'fire', createdTick: 40, source: 'player'
+    }));
+    assert.strictEqual(field.kind, 'fire');
+    assert.strictEqual(field.flags, 2);
+    assert.strictEqual(field.createdTick, 40);
+    const fieldOld = decodeField(encodeField({ x: 1, y: 2, z: 0, kind: 'poison' }).subarray(0, -4));
+    assert.strictEqual(fieldOld.kind, 'poison');
+    assert.strictEqual(fieldOld.createdTick, null);
+
+    const batched = Buffer.concat([
+        encodeFrame(S2C.APPEAR, 1, encodeAppear({
+            id: 2, name: 'Rat', x: 1, y: 2, z: 6, hp: 5, hpMax: 20, kind: 'rat', dir: 1
+        })),
+        encodeFrame(S2C.FIELD, 2, encodeField({
+            x: 3, y: 4, z: 6, kind: 'energy', createdTick: 80
+        })),
+        encodeFrame(S2C.SWING, 3, encodeSwing({
+            sourceId: 2, targetId: 3, amount: 7, flags: 0, element: 'energy', weaponId: 'spark_wand'
+        })),
+        encodeFrame(S2C.SAY, 4, encodeSay('Need directions?', { speakerId: 2, yell: true }))
+    ]);
+    const parsed = decodeFrames(batched);
+    assert.strictEqual(parsed.length, 4);
+    assert.strictEqual(decodeAppear(parsed[0].payload).dir, 1);
+    assert.strictEqual(decodeField(parsed[1].payload).createdTick, 80);
+    assert.strictEqual(decodeSwing(parsed[2].payload).element, SWING_ELEMENT.ENERGY);
+    assert.strictEqual(decodeSwing(parsed[2].payload).weaponId, 'spark_wand');
+    assert.strictEqual(decodeSay(parsed[3].payload).speakerId, 2);
+    assert.strictEqual(decodeSay(parsed[3].payload).yell, true);
 
     const inv = decodeInventory(encodeInventory([{ id: 'gold_coin', count: 4 }]));
     assert.strictEqual(inv.slots[0].count, 4);
@@ -167,7 +209,18 @@ function main() {
         cap: 582, capMax: 600, slots: [{ slot: 'weapon', id: 'iron_longsword', count: 1 }]
     }));
     assert.strictEqual(eq.slots[0].id, 'iron_longsword');
-    assert.strictEqual(decodeSay(encodeSay('You cannot afford that.')), 'You cannot afford that.');
+    const saySys = decodeSay(encodeSay('You cannot afford that.'));
+    assert.strictEqual(saySys.text, 'You cannot afford that.');
+    assert.strictEqual(saySys.speakerId, 0);
+    assert.strictEqual(saySys.yell, false);
+    const sayVoice = decodeSay(encodeSay('Need directions?', { speakerId: 9, yell: true }));
+    assert.strictEqual(sayVoice.text, 'Need directions?');
+    assert.strictEqual(sayVoice.speakerId, 9);
+    assert.strictEqual(sayVoice.yell, true);
+    const sayOld = decodeSay(encodeSay('Need directions?', { speakerId: 9, yell: true }).subarray(0, -5));
+    assert.strictEqual(sayOld.text, 'Need directions?');
+    assert.strictEqual(sayOld.speakerId, 0);
+    assert.strictEqual(sayOld.yell, false);
     const dlg = decodeDialog(encodeDialog({
         npcId: 9, nodeId: 'start', text: 'Hi', replies: [{ label: 'Bye' }]
     }));

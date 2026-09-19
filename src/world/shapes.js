@@ -1169,89 +1169,6 @@ function entitiesOnTiles(entities, tiles, z) {
     return out;
 }
 
-/**
- * Rank area blast centers that maximize hits (legacy bot findTopAttackPositions).
- * Used by resolveAreaCenter when centerMode is **maximize** (Smart Cast action
- * bar, player/creature AI). Manual castWith tile aim and Active Target use
- * primary-tile centering instead. Wave shapes return [] (facing from caster).
- *
- * @param {{x:number,y:number}} casterTile
- * @param {object[]} targets entities with .tile
- * @param {Record<string, unknown>} shape area shape
- * @param {number} [topN=10]
- * @returns {{x:number,y:number,hits:number}[]}
- */
-function findTopAreaCenters(casterTile, targets, shape, topN) {
-    if (!shape || spellTypeFromShape(shape) !== 'area') return [];
-    if (!targets || !targets.length || !casterTile) return [];
-
-    const area = matrixFromShape(shape);
-    if (!area.length || !area[0] || !area[0].length) return [];
-    const origin = findOriginInMatrix(area);
-    if (!origin) return [];
-
-    const numRows = area.length;
-    const numCols = area[0].length;
-    const halfH = Math.floor(numRows / 2);
-    const halfW = Math.floor(numCols / 2);
-
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-    for (let t = 0; t < targets.length; t++) {
-        const tile = targets[t] && targets[t].tile;
-        if (!tile) continue;
-        if (tile.x < minX) minX = tile.x;
-        if (tile.x > maxX) maxX = tile.x;
-        if (tile.y < minY) minY = tile.y;
-        if (tile.y > maxY) maxY = tile.y;
-    }
-    if (!Number.isFinite(minX)) return [];
-
-    minX -= halfW;
-    maxX += halfW;
-    minY -= halfH;
-    maxY += halfH;
-
-    /** @type {{x:number,y:number,hits:number}[]} */
-    const candidates = [];
-    for (let cx = minX; cx <= maxX; cx++) {
-        for (let cy = minY; cy <= maxY; cy++) {
-            let count = 0;
-            for (let t = 0; t < targets.length; t++) {
-                const ent = targets[t];
-                if (!ent || !ent.tile) continue;
-                const dx = ent.tile.x - cx;
-                const dy = ent.tile.y - cy;
-                const col = origin.col + dx;
-                const row = origin.row + dy;
-                if (row < 0 || row >= numRows || col < 0 || col >= numCols) {
-                    continue;
-                }
-                if (area[row][col] >= 1) count += 1;
-            }
-            if (count > 0) {
-                candidates.push({ x: cx, y: cy, hits: count });
-            }
-        }
-    }
-
-    const px = casterTile.x;
-    const py = casterTile.y;
-    candidates.sort((a, b) => {
-        if (b.hits !== a.hits) return b.hits - a.hits;
-        const distA = Math.abs(a.x - px) + Math.abs(a.y - py);
-        const distB = Math.abs(b.x - px) + Math.abs(b.y - py);
-        if (distA !== distB) return distA - distB;
-        if (a.y !== b.y) return a.y - b.y;
-        return a.x - b.x;
-    });
-
-    const n = topN != null ? Math.max(0, topN | 0) : 10;
-    return candidates.slice(0, n);
-}
-
 module.exports = {
     getAreaArray,
     matrixFromShape,
@@ -1278,7 +1195,6 @@ module.exports = {
     filterAffectedTilesWithObstacles,
     getAffectedTiles,
     entitiesOnTiles,
-    findTopAreaCenters,
     WAVE_SPREAD_MAP,
     AREA_ENTRIES,
     FRICTION_BLOCKED,

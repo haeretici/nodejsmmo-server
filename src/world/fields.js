@@ -327,6 +327,9 @@ function deployFieldToTile(store, x, y, z, opts) {
     const ty = Math.round(y);
     const key = tileKey(tx, ty, tz);
     const createdAt = o.createdAt != null ? Number(o.createdAt) : 0;
+    const createdTick = o.createdTick != null
+        ? (o.createdTick >>> 0)
+        : (Number.isFinite(createdAt) && createdAt > 0 ? Math.round(createdAt * 20) >>> 0 : 0);
     const durationSec = o.durationSec != null && Number.isFinite(Number(o.durationSec))
         ? Number(o.durationSec)
         : defaultDurationSec(kind);
@@ -337,6 +340,7 @@ function deployFieldToTile(store, x, y, z, opts) {
         kind,
         source: o.source || FIELD_SOURCES.SCENARIO,
         createdAt,
+        createdTick,
         durationSec,
         expireAt: createdAt + durationSec,
         x: tx,

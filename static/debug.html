@@ -49,7 +49,7 @@
 <script>
 const C2S = {
   ENTER: 1, PING: 2, LOGOUT: 3, MOVE_STEP: 10,
-  SET_TARGET: 11, SET_AUTO_CHASE: 12, USE_STAIR: 13, USE: 14, USE_ITEM_WITH: 15,
+  SET_TARGET: 11, USE_STAIR: 13, USE: 14, USE_ITEM_WITH: 15,
   OPEN_CORPSE: 20, LOOT_TAKE: 21, LOOT_CLOSE: 22,
   TALK: 30, TALK_REPLY: 31, TALK_CLOSE: 32, SHOP_BUY: 33, SHOP_SELL: 34
 };
@@ -587,7 +587,6 @@ canvas.addEventListener('click', (ev) => {
         return;
       }
       send(C2S.SET_TARGET, u32buf(p.id));
-      send(C2S.SET_AUTO_CHASE, Uint8Array.of(1));
       log('target ' + p.name);
       return;
     }

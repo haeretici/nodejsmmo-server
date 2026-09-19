@@ -111,6 +111,29 @@ function isHarmfulSpell(spell) {
     return true;
 }
 
+/**
+ * Instant self-origin spells (reference `isSelfTarget`). Origin is always the
+ * caster: ignore CAST targetId / sticky / aim. Area/wave/chain/field rows are
+ * not self-only — they still use the caster as center when range ≤ 1.
+ */
+function isSelfTargetSpell(spell) {
+    if (!spell) return false;
+    if (spell.selfTarget === true) return true;
+    if (spell.selfTarget === false) return false;
+    if (spell.requiresTarget) return false;
+    if (spellHasShape(spell)) return false;
+    if (spell.deploysField || spell.destroysField) return false;
+    if (normalizeChainSpec(spell)) return false;
+    const kind = String(spell.kind || '');
+    if (kind === 'heal' || kind === 'support') return true;
+    return spell.range != null && Number(spell.range) <= 0;
+}
+
+function allowsOnSelf(spell) {
+    if (!spell) return true;
+    return spell.allowOnSelf !== false;
+}
+
 function isWithinSpellCastRange(from, to, spell, range) {
     if (!from || !to) return false;
     if (from.z != null && to.z != null && (from.z | 0) !== (to.z | 0)) return false;
@@ -219,7 +242,7 @@ function canCast(attacker, spell, ctx) {
         return { ok: false, reason: 'pacified' };
     }
     const tileMap = c.tileMap || null;
-    if (tileMap && typeof tileMap.blocksCast === 'function'
+    if (isHarmfulSpell(spell) && tileMap && typeof tileMap.blocksCast === 'function'
         && tileMap.blocksCast(attacker.x, attacker.y, attacker.z)) {
         return { ok: false, reason: 'no_cast' };
     }
@@ -365,9 +388,16 @@ function resolveCast(opts) {
     if (!gate.ok) return Object.assign({}, empty, { reason: gate.reason, spell });
 
     const tileMap = o.tileMap || null;
-    const primary = o.target && o.target !== attacker ? o.target : null;
-    const aim = o.aim || null;
+    const selfTarget = isSelfTargetSpell(spell);
+    const primary = selfTarget
+        ? null
+        : (o.target && o.target !== attacker ? o.target : null);
+    const aim = selfTarget ? null : (o.aim || null);
     const casterPos = posOf(attacker);
+
+    if (!selfTarget && !allowsOnSelf(spell) && (!o.target || o.target === attacker)) {
+        return Object.assign({}, empty, { reason: 'no_target', spell });
+    }
 
     if (spell.requiresTarget && !isSelfCenteredAreaSpell(spell) && !spell.deploysField && !spell.destroysField) {
         if (!primary || !isCombatantAlive(primary)) {
@@ -493,7 +523,7 @@ function resolveCast(opts) {
                 t.x,
                 t.y,
                 t.z,
-                { kind: fieldKind, source, createdAt: now },
+                { kind: fieldKind, source, createdAt: now, createdTick: tickIndex },
                 tileMap && typeof tileMap.getCombatantEntities === 'function'
                     ? tileMap.getCombatantEntities(t.x, t.y, t.z)
                     : [],
@@ -526,9 +556,7 @@ function resolveCast(opts) {
     }
 
     const statusOnly = !!spell.statusOnly && !(spell.min || spell.max || spell.powerCurve);
-    const selfCast = !primary && !spellHasShape(spell) && (spell.kind === 'heal' || spell.kind === 'support'
-        || (spell.range != null && Number(spell.range) <= 0));
-    if (selfCast) targets = [attacker];
+    if (selfTarget) targets = [attacker];
 
     let sharedCrit = null;
     for (let i = 0; i < targets.length; i++) {
@@ -640,6 +668,8 @@ module.exports = {
     isAutoAttackId,
     spellHasShape,
     isHarmfulSpell,
+    isSelfTargetSpell,
+    allowsOnSelf,
     isWithinSpellCastRange,
     canUseSpell,
     canCast,

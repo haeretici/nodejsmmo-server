@@ -1,6 +1,6 @@
 'use strict';
 
-const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND } = require('./opcodes');
+const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND, swingElementId } = require('./opcodes');
 const { FastWriter, Writer, Reader, clampU16 } = require('./frame');
 
 function wrap(fn, payload) {
@@ -81,6 +81,37 @@ function decodeMoveStep(payload) {
             throw new Error('bad move');
         }
         return new Reader(p).u8();
+    }, payload);
+}
+
+function encodeMovePath(dirs) {
+    const list = Array.isArray(dirs) ? dirs : [];
+    const n = Math.min(255, list.length);
+    const w = new FastWriter().u8(n);
+    for (let i = 0; i < n; i++) {
+        w.u8(list[i] & 0xff);
+    }
+    return w.toBuffer();
+}
+
+function decodeMovePath(payload) {
+    return wrap((p) => {
+        if (!p || p.length < 1) {
+            throw new Error('bad move path');
+        }
+        const n = p[0];
+        if (p.length !== 1 + n) {
+            throw new Error('bad move path');
+        }
+        const dirs = [];
+        for (let i = 0; i < n; i++) {
+            const d = p[1 + i];
+            if (d > 3) {
+                throw new Error('bad move path');
+            }
+            dirs.push(d);
+        }
+        return dirs;
     }, payload);
 }
 
@@ -277,6 +308,7 @@ function encodeAppear(entity) {
         .u16(clampU16(v.hpMax))
         .u8(appearFlags(entity))
         .str(v.look || '')
+        .u8(entity && entity.dir != null ? (entity.dir & 3) : 0)
         .toBuffer();
 }
 
@@ -292,7 +324,8 @@ function decodeAppear(payload) {
             hp: r.u16(),
             hpMax: r.u16(),
             flags: r.rest().length ? r.u8() : 0,
-            look: r.rest().length ? r.str() : ''
+            look: r.rest().length ? r.str() : '',
+            dir: r.rest().length ? r.u8() : 0
         };
     }, payload);
 }
@@ -344,19 +377,6 @@ function decodeSetTarget(payload) {
             throw new Error('bad target');
         }
         return new Reader(p).u32();
-    }, payload);
-}
-
-function decodeSetAutoChase(payload) {
-    return wrap((p) => {
-        if (!p || p.length !== 1) {
-            throw new Error('bad chase');
-        }
-        const v = new Reader(p).u8();
-        if (v > 1) {
-            throw new Error('bad chase');
-        }
-        return v;
     }, payload);
 }
 
@@ -415,24 +435,34 @@ function decodeStats(payload) {
     }, payload);
 }
 
-function encodeSwing({ sourceId, targetId, amount, flags }) {
+function encodeSwing({ sourceId, targetId, amount, flags, element, weaponId, ammoId }) {
     return new FastWriter()
         .u32(sourceId >>> 0)
         .u32(targetId >>> 0)
         .u16(clampU16(amount))
         .u8(flags || 0)
+        .u8(swingElementId(element))
+        .str(weaponId || '')
+        .str(ammoId || '')
         .toBuffer();
 }
 
 function decodeSwing(payload) {
     return wrap((p) => {
         const r = new Reader(p);
-        return {
+        const out = {
             sourceId: r.u32(),
             targetId: r.u32(),
             amount: r.u16(),
-            flags: r.u8()
+            flags: r.u8(),
+            element: 0,
+            weaponId: '',
+            ammoId: ''
         };
+        if (r.rest().length) out.element = r.u8();
+        if (r.rest().length) out.weaponId = r.str();
+        if (r.rest().length) out.ammoId = r.str();
+        return out;
     }, payload);
 }
 
@@ -734,8 +764,14 @@ function decodeMoveItem(payload) {
     }, payload);
 }
 
-function encodeSay(text) {
-    return new FastWriter().str(text == null ? '' : text).toBuffer();
+function encodeSay(text, extra) {
+    const speakerId = extra && extra.speakerId != null ? extra.speakerId >>> 0 : 0;
+    const yell = extra && (extra.yell === true || extra.yell === 1) ? 1 : 0;
+    return new FastWriter()
+        .str(text == null ? '' : text)
+        .u32(speakerId)
+        .u8(yell)
+        .toBuffer();
 }
 
 function encodeSkills(skills) {
@@ -760,7 +796,13 @@ function decodeSkills(payload) {
 }
 
 function decodeSay(payload) {
-    return wrap((p) => new Reader(p).str(), payload);
+    return wrap((p) => {
+        const r = new Reader(p);
+        const text = r.str();
+        const speakerId = r.rest().length >= 4 ? r.u32() : 0;
+        const yell = r.rest().length >= 1 ? r.u8() !== 0 : false;
+        return { text, speakerId, yell };
+    }, payload);
 }
 
 function decodeTalk(payload) {
@@ -925,6 +967,16 @@ function decodeCastFx(payload) {
     }, payload);
 }
 
+function fieldCreatedTick(field) {
+    if (field && field.createdTick != null) return field.createdTick >>> 0;
+    const createdAt = field && field.createdAt != null ? Number(field.createdAt) : 0;
+    if (!Number.isFinite(createdAt) || createdAt <= 0) return 0;
+    const ups = (field && field.logicUps != null && Number(field.logicUps) > 0)
+        ? Number(field.logicUps)
+        : 20;
+    return Math.round(createdAt * ups) >>> 0;
+}
+
 function encodeField(field) {
     let flags = 0;
     if (field && field.isObstacle) flags |= 1;
@@ -935,19 +987,24 @@ function encodeField(field) {
         .i8(field && field.z)
         .str((field && (field.fieldKind || field.kind)) || '')
         .u8(flags)
+        .u32(fieldCreatedTick(field))
         .toBuffer();
 }
 
 function decodeField(payload) {
     return wrap((p) => {
         const r = new Reader(p);
-        return {
+        const out = {
             x: r.i16(),
             y: r.i16(),
             z: r.i8(),
             kind: r.str(),
-            flags: r.rest().length ? r.u8() : 0
+            flags: 0,
+            createdTick: null
         };
+        if (r.rest().length) out.flags = r.u8();
+        if (r.rest().length >= 4) out.createdTick = r.u32();
+        return out;
     }, payload);
 }
 
@@ -962,6 +1019,7 @@ function decodeFieldGone(payload) {
     }, payload);
 }
 
+
 module.exports = {
     encodeHello,
     decodeHello,
@@ -973,6 +1031,8 @@ module.exports = {
     decodePong,
     decodePing,
     decodeMoveStep,
+    encodeMovePath,
+    decodeMovePath,
     decodeUseStair,
     encodeUseTile,
     decodeUseTile,
@@ -983,7 +1043,6 @@ module.exports = {
     encodeWorldPinGone,
     decodeWorldPinGone,
     decodeSetTarget,
-    decodeSetAutoChase,
     decodeOpenCorpse,
     decodeLootTake,
     decodeLootClose,

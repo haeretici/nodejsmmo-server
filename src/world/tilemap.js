@@ -560,6 +560,19 @@ class TileMap {
         return (this.flagsAt(x, y, z) & TILE_FLAG_NO_CAST) !== 0;
     }
 
+    /**
+     * Harmful autos / spells / AOE may affect this tile.
+     * Fails when NO_CAST is set (full PZ package and NO_CAST-only).
+     */
+    attackMayAffectTile(x, y, z) {
+        return (this.flagsAt(x, y, z) & TILE_FLAG_NO_CAST) === 0;
+    }
+
+    isProtectionZonePackage(x, y, z) {
+        const f = this.flagsAt(x, y, z);
+        return (f & TILE_FLAG_PZ_PACKAGE) === TILE_FLAG_PZ_PACKAGE;
+    }
+
     getFriction(x, y, z) {
         return this.frictionAt(x, y, z);
     }

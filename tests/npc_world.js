@@ -112,6 +112,7 @@ function main() {
     const appear = decodeAppear(lastOf(session.socket, S2C.APPEAR).payload);
     assert.strictEqual(appear.name, 'Guide');
     assert.strictEqual(appear.flags, 1);
+    assert.ok(appear.dir === 0 || appear.dir === 1 || appear.dir === 2 || appear.dir === 3);
 
     assert.ok(w.enqueueIntent(session, {
         opcode: C2S.SET_TARGET, seq: 1, payload: u32(guide.id)
@@ -140,7 +141,7 @@ function main() {
         opcode: C2S.SHOP_BUY, seq: 4, payload: dealBuf(guide.id, 1, 'cookie')
     }));
     w.step(4);
-    assert.strictEqual(decodeSay(lastOf(session.socket, S2C.SAY).payload), 'You cannot afford that.');
+    assert.strictEqual(decodeSay(lastOf(session.socket, S2C.SAY).payload).text, 'You cannot afford that.');
 
     stackItem(session.inventory, 'gold_coin', 10, w.itemDb());
     assert.ok(w.enqueueIntent(session, {

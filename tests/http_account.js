@@ -59,7 +59,10 @@ async function main() {
         assert.strictEqual(created.status, 201);
         assert.strictEqual(created.json.vocation, 'scout');
         assert.strictEqual(created.json.level, 1);
-        assert.strictEqual(created.json.hp, 185);
+        assert.strictEqual(created.json.hp, 150);
+        assert.strictEqual(created.json.hpMax, 150);
+        assert.strictEqual(created.json.mp, 55);
+        assert.strictEqual(created.json.mpMax, 55);
         assert.strictEqual(created.json.pos.x, 12);
         assert.strictEqual(created.json.pos.y, 12);
 

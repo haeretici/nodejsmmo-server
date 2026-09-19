@@ -14,7 +14,7 @@ const {
     applyFieldEntryEffects,
     getFieldOnTile
 } = require('../src/world/fields');
-const { canCast, resolveCast, indexSpellBook } = require('../src/world/spells');
+const { canCast, resolveCast, indexSpellBook, isSelfTargetSpell } = require('../src/world/spells');
 const Cooldowns = require('../src/world/cooldowns');
 const { TILE_FLAG_NO_CAST } = require('../src/world/tilemap');
 
@@ -122,6 +122,93 @@ function main() {
     const blocked = canCast(caster, spell, { tickIndex: 0, tileMap: pzMap });
     assert.strictEqual(blocked.ok, false);
     assert.strictEqual(blocked.reason, 'no_cast');
+
+    const patch = {
+        id: 'magic_patch',
+        kind: 'heal',
+        element: 'healing',
+        powerCurve: 'magic_strike',
+        basePower: 20,
+        range: 1,
+        mana: 6,
+        hitChance: 100,
+        requiresTarget: false,
+        selfTarget: true,
+        vocations: ['mystic'],
+        level: 1,
+        damageAmplitude: 0.1702,
+        cooldowns: { primary: { healing: 1 } }
+    };
+    const healer = Object.assign({}, caster, {
+        knownSpells: ['magic_patch'],
+        hp: 50,
+        mp: 90,
+        cooldowns: null
+    });
+    Cooldowns.ensureCooldowns(healer);
+    assert.strictEqual(isSelfTargetSpell(patch), true);
+    assert.strictEqual(isSelfTargetSpell({ id: 'heal_light', kind: 'heal', requiresTarget: false }), true);
+    assert.strictEqual(isSelfTargetSpell({ id: 'heal_friend', kind: 'heal', requiresTarget: true }), false);
+    assert.strictEqual(isSelfTargetSpell({
+        id: 'mass_heal', kind: 'heal', requiresTarget: false, shape: { type: 'area', code: 5 }
+    }), false);
+    const pzHeal = canCast(healer, patch, { tickIndex: 0, tileMap: pzMap });
+    assert.strictEqual(pzHeal.ok, true, 'heal allowed on caster PZ');
+
+    const other = Object.assign(dummyDef(), { id: 2, x: 0, y: 1, z: 0, type: 'creature', hp: 10, hpMax: 100 });
+    const selfHeal = resolveCast({
+        attacker: healer,
+        spell: patch,
+        target: other,
+        aim: { x: other.x, y: other.y, z: other.z },
+        rng: () => 0.5,
+        tickIndex: 0,
+        skipMoveLock: true
+    });
+    assert.strictEqual(selfHeal.ok, true);
+    assert.strictEqual(selfHeal.hits.length, 1);
+    assert.strictEqual(selfHeal.hits[0].defender, healer);
+    assert.ok(selfHeal.hits[0].result.final > 0);
+    assert.strictEqual(other.hp, 10);
+
+    const friend = Object.assign({}, patch, {
+        id: 'heal_friend',
+        requiresTarget: true,
+        selfTarget: false,
+        allowOnSelf: false,
+        mana: 12
+    });
+    const friendCaster = Object.assign({}, caster, {
+        knownSpells: ['heal_friend'],
+        hp: 50,
+        mp: 90,
+        cooldowns: null
+    });
+    Cooldowns.ensureCooldowns(friendCaster);
+    const friendOther = Object.assign(dummyDef(), { id: 3, x: 0, y: 1, z: 0, type: 'creature', hp: 10, hpMax: 100 });
+    const onOther = resolveCast({
+        attacker: friendCaster,
+        spell: friend,
+        target: friendOther,
+        rng: () => 0.5,
+        tickIndex: 0,
+        skipMoveLock: true
+    });
+    assert.strictEqual(onOther.ok, true);
+    assert.strictEqual(onOther.hits[0].defender, friendOther);
+
+    const selfCaster = Object.assign({}, friendCaster, { cooldowns: null, mp: 90 });
+    Cooldowns.ensureCooldowns(selfCaster);
+    const onSelf = resolveCast({
+        attacker: selfCaster,
+        spell: friend,
+        target: selfCaster,
+        rng: () => 0.5,
+        tickIndex: 0,
+        skipMoveLock: true
+    });
+    assert.strictEqual(onSelf.ok, false);
+    assert.strictEqual(onSelf.reason, 'no_target');
 
     const target = Object.assign(dummyDef(), { id: 2, x: 0, y: 1, z: 0, type: 'creature' });
     const cast = resolveCast({

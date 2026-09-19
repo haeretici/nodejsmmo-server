@@ -9,6 +9,7 @@ const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
 const { REASON } = require('../src/protocol/opcodes');
 const { chebyshev } = require('../src/world/combat');
+const { TILE_FLAG_PZ_PACKAGE } = require('../src/world/tilemap');
 
 function fakeSocket() {
     return {
@@ -226,6 +227,68 @@ function main() {
     assert.strictEqual(alone.x, 4);
     assert.strictEqual(alone.y, 4);
     wEmpty.stop();
+
+    // Sticky chase into PZ: drop target, keep moving, no damage (engine hunt_ai PZ).
+    const wPz = makeWorld({
+        autoIntervalTicks: 1,
+        spawns: [{ kind: 'rat', x: 2, y: 2, z: 0 }]
+    });
+    const pzPlayer = makeSession(wPz, ash(5), { x: 6, y: 2, z: 0 });
+    const chaser = Array.from(wPz.creatures.values())[0];
+    wPz.tileMap.setTileFlags(8, 2, 0, TILE_FLAG_PZ_PACKAGE);
+    wPz.tileMap.setTileFlags(9, 2, 0, TILE_FLAG_PZ_PACKAGE);
+    wPz.tileMap.setTileFlags(8, 3, 0, TILE_FLAG_PZ_PACKAGE);
+    wPz.tileMap.setTileFlags(9, 3, 0, TILE_FLAG_PZ_PACKAGE);
+    assert.strictEqual(wPz.tileMap.attackMayAffectTile(8, 2, 0), false);
+    assert.strictEqual(wPz.tileMap.isProtectionZonePackage(8, 2, 0), true);
+    let acquired = false;
+    for (let t = 1; t <= 12; t++) {
+        wPz.step(t);
+        if (chaser.targetId === pzPlayer.id) {
+            acquired = true;
+            break;
+        }
+    }
+    assert.ok(acquired, 'rat acquires player off PZ');
+    assert.ok(
+        chaser.x !== chaser.spawnX || chaser.y !== chaser.spawnY,
+        'rat left spawn while chasing'
+    );
+    assert.ok(wPz.tileMap.moveEntityToTile(8, 2, 0, pzPlayer));
+    const hpOnPz = pzPlayer.hp | 0;
+    const freezeX = chaser.x | 0;
+    const freezeY = chaser.y | 0;
+    let movedAfterPz = false;
+    for (let t = 20; t <= 40; t++) {
+        wPz.step(t);
+        assert.strictEqual(chaser.targetId, 0, 'PZ drops sticky creature target');
+        assert.strictEqual(pzPlayer.hp | 0, hpOnPz, 'no harmful hits into PZ');
+        if ((chaser.x | 0) !== freezeX || (chaser.y | 0) !== freezeY) {
+            movedAfterPz = true;
+        }
+    }
+    assert.ok(movedAfterPz, 'creature keeps moving after target enters PZ');
+    pzPlayer.kick(REASON.LOGOUT);
+    wPz.stop();
+
+    // Already on PZ: never acquire
+    const wPzIdle = makeWorld({
+        autoIntervalTicks: 1,
+        spawns: [{ kind: 'rat', x: 5, y: 5, z: 0 }]
+    });
+    wPzIdle.tileMap.setTileFlags(8, 5, 0, TILE_FLAG_PZ_PACKAGE);
+    const safe = makeSession(wPzIdle, ash(6), { x: 8, y: 5, z: 0 });
+    const idleChaser = Array.from(wPzIdle.creatures.values())[0];
+    const idleKey = `${idleChaser.x},${idleChaser.y}`;
+    let idleStepped = false;
+    for (let t = 1; t <= 12; t++) {
+        wPzIdle.step(t);
+        assert.strictEqual(idleChaser.targetId, 0, 'must not aggro a player on PZ');
+        if (`${idleChaser.x},${idleChaser.y}` !== idleKey) idleStepped = true;
+    }
+    assert.ok(idleStepped, 'awake creature still wanders while player is on PZ');
+    safe.kick(REASON.LOGOUT);
+    wPzIdle.stop();
 
     console.log('ok combat_creature_ai');
 }

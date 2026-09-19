@@ -284,6 +284,7 @@ async function main() {
             session.y = 99;
             session.z = 6;
             session.attackReadyTick = 0;
+            session.moveReadyTick = 0;
         }
 
         enterKit(g, 'dagger');
