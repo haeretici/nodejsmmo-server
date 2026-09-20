@@ -25,6 +25,7 @@ class MemoryStore {
         this.playTokens = new Map();
         this.ipBans = new Map();
         this.accountBans = new Map();
+        this.worldGround = null;
     }
 
     async ping() {
@@ -325,6 +326,15 @@ class MemoryStore {
             const sk = this.skills.get(row.id) || {};
             this.skills.set(row.id, Object.assign({}, sk, snap.skills));
         }
+        return true;
+    }
+
+    async loadWorldGround() {
+        return this.worldGround ? cloneJson(this.worldGround) : null;
+    }
+
+    async saveWorldGround(blob) {
+        this.worldGround = blob ? cloneJson(blob) : { version: 1, nextUid: 1, items: {}, containers: {}, stacks: {} };
         return true;
     }
 

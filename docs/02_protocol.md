@@ -60,9 +60,10 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `SHOP_SELL` | 34 | same as buy |
 | `EQUIP` | 40 | `containerId str`, `index u8`, `slot str` (empty = preferred). Designer or engine slot names |
 | `UNEQUIP` | 41 | `slot str` into backpack |
-| `MOVE_ITEM` | 42 | from loc + to loc + `count u16` (0 = all). Loc: `kind u8` 0=container (`id str` `index u8`) 1=equipment (`slot str`) |
+| `MOVE_ITEM` | 42 | from loc + to loc + `count u16` (0 = all). Loc: `kind u8` 0=container (`id str` `index u8`) 1=equipment (`slot str`) 2=tile (`x i16 y i16 z i8` + `stackIndex u8`, **0 = top**). Pickup / drop / tile slide are this opcode. No `PICKUP`/`DROP` C2S |
 | `USE_ITEM` | 43 | `containerId str`, `index u8` — equip / open bag / consume (`heal` / `restoreMana` arrays, food regen, dispel, condition; empty-effect `usable` still consume) |
-| `OPEN_BAG` | 44 | `containerId str`, `index u8` nested container |
+| `OPEN_BAG` | 44 | `containerId str`, `index u8`. Nested bag: parent uid + slot `0–254`. Equipped container: designer slot name (`shield`, `backpack`, …) + index 0. Ground bag from canvas: GROUND uid + index **255** (open that uid). Ground nested: parent ground uid + slot |
+| `CLOSE_BAG` | 45 | `containerId str` (instance uid). Empty string closes all open bags |
 
 | S2C | id | Payload |
 | :--- | ---: | :--- |
@@ -88,8 +89,8 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `SKILLS` | 124 | 8× `u16`: fist, club, sword, axe, distance, shielding, magic, fishing. Sent on enter and skill level-up. Extra bytes ignored |
 | `WORLD_PIN` | 125 | `id u32`, `x i16 y i16 z i8`, `kind str`, `catalogId str`, `flags u8` (`1` blocking, `2` pickupable). Viewport AOI. Extra bytes ignored |
 | `WORLD_PIN_GONE` | 126 | `id u32` |
-| `EQUIPMENT` | 127 | `cap u16`, `capMax u16`, `n u8`, n× (`slot str`, `id str`, `count u16`). Designer slot names. Sent with inventory |
-| `BAG` | 128 | same payload as `INVENTORY` for the open nested bag. Empty `containerId` closes it |
+| `EQUIPMENT` | 127 | `cap u16`, `capMax u16`, `n u8`, n× (`slot str`, `id str`, `count u16`, `flags u8`). Designer slot names. Flag 1 = container. Sent with inventory |
+| `BAG` | 128 | same payload as `INVENTORY` for one open nested bag. One stream per open uid (cap 8). Empty `containerId` closes all; `capacity` 0 closes that uid |
 | `CAST` | 129 | `sourceId u32`, `spellId str`, `targetId u32`, `x i16 y i16 z i8`, `flags u8`. FX after accepted cast |
 | `DIALOG` | 130 | `npcId u32`, `nodeId str`, `text str`, `n u8`, n× `label str` |
 | `DIALOG_CLOSE` | 131 | `npcId u32` |
@@ -97,6 +98,8 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `FIELD` | 133 | `x i16 y i16 z i8`, `kind str`, `flags u8`, extra `createdTick u32` (logic tick at plant). Extra bytes ignored |
 | `FIELD_GONE` | 134 | `x i16 y i16 z i8` |
 | *(unused)* | 135 | Do not reuse. Bars are client IndexedDB |
+| `GROUND` | 136 | one visible stack slot: `x i16 y i16 z i8`, `stackIndex u8` (0 = top), `uid str`, `id str`, `count u16`, `flags u8` (flag 1 = container). Viewport AOI. Cap **N ≤ 10** from the top; extras stay on the server. No nested guts |
+| `GROUND_GONE` | 137 | `uid str`, extra `x i16 y i16 z i8` ignored |
 
 `ENTER_WORLD`: `id u32`, name, vocation, `level u16`, `experience u32`, hp/mp u16×4, `x i16 y i16 z i8`, `townId u16`, then viewport: `originX i16 originY i16 z i8 w u8 h u8 tiles u16[w*h]`. Viewport `z` is the player floor. `tiles` are friction-derived debug ids (`0` void, `1` walk, `3` wall, `4` water, `5` town) — not visual stamps. Strings: `u8 len` + UTF-8.
 
@@ -120,7 +123,7 @@ Packet flood → kick `RATE_LIMITED`. Close code = `4000 + reason`. Clients MUST
 
 `BAD_FRAME=1` `BAD_TOKEN=2` `UNAUTHORIZED=5` `WORLD_FULL=6` `ALREADY_ONLINE=7` `RATE_LIMITED=8` `UNKNOWN_OPCODE=9` `NOT_IMPLEMENTED=10` `NOT_ENTERED=11` `TIMEOUT=12` `IP_MISMATCH=13` `BANNED=14` `REPLACED=15` `LOGOUT=16` `BAD_SEQ=17` `BLOCKED=18` `BUSY=19` `NO_TARGET=20` `OUT_OF_RANGE=21`
 
-`BLOCKED` = dest not walkable / occupancy deny / bad dir / `MOVE_PATH` over cap / PvP-off player target / talkable NPC target / stair dest deny. Mid-path occupancy fail stops the queue and `REJECT`s the path seq. `BUSY` = `MOVE_STEP` / `USE_STAIR` before `stepDelayTicks`, or non-`PING`/`LOGOUT` while downed. `MOVE_PATH` while not ready **replaces** the queue and waits. `NO_TARGET=20` unknown / empty slot / bad reply index / `USE_STAIR` with no pad. `OUT_OF_RANGE=21` corpse farther than Chebyshev 1, NPC farther than **3**, or `USE` / `USE_ITEM_WITH` farther than Chebyshev **1**. Do not renumber existing codes.
+`BLOCKED` = dest not walkable / occupancy deny / bad dir / `MOVE_PATH` over cap / PvP-off player target / talkable NPC target / stair dest deny. Mid-path occupancy fail stops the queue and `REJECT`s the path seq. `BUSY` = `MOVE_STEP` / `USE_STAIR` before `stepDelayTicks`, or non-`PING`/`LOGOUT` while downed. `MOVE_PATH` while not ready **replaces** the queue and waits. `NO_TARGET=20` unknown / empty slot / bad reply index / `USE_STAIR` with no pad. `OUT_OF_RANGE=21` corpse farther than Chebyshev 1, NPC farther than **3**, or `USE` / `USE_ITEM_WITH` / `MOVE_ITEM` tile loc / `OPEN_BAG` of a ground uid farther than Chebyshev **1** (same `z`). Do not renumber existing codes.
 
 `APPEAR` ends with `flags u8` (`1` = NPC) then `look str` (catalog / vocation id for sprites) then extra `dir u8`. Extra bytes after older fields stay backward compatible. The game process still does **not** send visual stamps.
 
@@ -140,3 +143,21 @@ Packet flood → kick `RATE_LIMITED`. Close code = `4000 + reason`. Clients MUST
 S6 frontend (`../frontend`) uses this pipe. Do not add WebTransport. Play token stays in the ENTER payload, never the URL.
 
 P18 bars fire `CAST` **16** / `USE_ITEM` / `EQUIP` only. No hotkeys JSON on the socket. Contract: `../frontend/docs/03_action_bars.md`.
+
+## Ground items (player-dropped stacks)
+
+Fifth surface next to bags (`MOVE_ITEM` / `OPEN_BAG` / `BAG`), authored pins (`WORLD_PIN` / `USE` / `CONTAINER`), corpses (`CORPSE` / `OPEN_CORPSE` / `LOOT_TAKE`), terrain (`VIEWPORT`), and fields (`FIELD`). Do **not** stuff drops into `VIEWPORT.tiles` or `WORLD_PIN`. Corpses and world-pin crates stay their own packets.
+
+**Loc kind `2` (tile)** on `MOVE_ITEM` 42: `x i16 y i16 z i8` + `stackIndex u8` with **0 = top**. Server resolves the current uid; a stale index is `NO_TARGET`. Pickup = from tile → backpack/equipment loc (autostack / first free — never “move to the same tile”). Drop = from container/equipment → tile. Slide = tile → tile. `count u16` is C1 (`0` = all). Same-id stackables **merge** on the dest tile.
+
+**Range** is server policy, not on the wire: Chebyshev ≤ **1**, same `z`. Dest tile must be walkable terrain (dropped stacks do not block; occupancy of creatures is allowed). Out of range → `OUT_OF_RANGE`. Blocked dest → `BLOCKED`. Do not path the player. Do not copy throw range 15. Dropping the equipped backpack is forbidden.
+
+**Identity:** world `GroundStore` (tile → uid[] bottom→top) with its own `nextUid`. Transfer the item tree player ↔ ground and **remint** uids (player `iN` would collide on the floor). Nested `containers[uid]` travel with the bag. Open bag stays on the tile; guts travel only via `BAG` after `OPEN_BAG`.
+
+**S2C AOI:** `GROUND` **136** (one visible slot) + `GROUND_GONE` **137** (by uid). Mutation broadcasts to viewers of **that tile**. Enter/step: appear/gone when the tile crosses the viewport (same loop as `WORLD_PIN`). Draw/send cap top **N ≤ 10**. Client indexes sprites by uid. No optimistic local remove.
+
+**Open:** `OPEN_BAG` resolves a ground uid the same way it resolves equipment. Canvas opens the named uid with index **255**. Nested open is parent uid + slot (C3). `USE` 14 stays world-pins only.
+
+**Walk-away close (Q7.6 A):** after each accepted `MOVE_STEP` / `MOVE_PATH` dir (and when the bag slides/is taken), if the **ground root** tile is Chebyshev > 1 or different `z`, forget that uid and send `BAG` capacity 0. Nested open bags of that root close with it. Backpack / equipped quiver stay. `#loot-panel` (`openCorpseId` / crate) uses the same range: clear the id and send empty `CONTAINER` so take cannot succeed from 2 sqm. Authority on the server — the client does not distance-poll and must not echo `CLOSE_BAG` for a uid the server already forgot.
+
+**Persist:** world ground blob (`saveWorldGround` / `loadWorldGround`), not the dropper’s character row. Restart must not delete floor items and must not duplicate them back into the backpack. Character snapshot after a drop must not still hold that uid.

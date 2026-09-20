@@ -206,9 +206,14 @@ function main() {
     const inv = decodeInventory(encodeInventory([{ id: 'gold_coin', count: 4 }]));
     assert.strictEqual(inv.slots[0].count, 4);
     const eq = decodeEquipment(encodeEquipment({
-        cap: 582, capMax: 600, slots: [{ slot: 'weapon', id: 'iron_longsword', count: 1 }]
+        cap: 582, capMax: 600, slots: [{ slot: 'weapon', id: 'iron_longsword', count: 1, flags: 0 }]
     }));
     assert.strictEqual(eq.slots[0].id, 'iron_longsword');
+    assert.strictEqual(eq.slots[0].flags, 0);
+    const eqBag = decodeEquipment(encodeEquipment({
+        cap: 1, capMax: 2, slots: [{ slot: 'shield', id: 'quiver', count: 1, flags: 1 }]
+    }));
+    assert.strictEqual(eqBag.slots[0].flags, 1);
     const saySys = decodeSay(encodeSay('You cannot afford that.'));
     assert.strictEqual(saySys.text, 'You cannot afford that.');
     assert.strictEqual(saySys.speakerId, 0);

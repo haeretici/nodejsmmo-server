@@ -1,6 +1,6 @@
 'use strict';
 
-const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND, swingElementId } = require('./opcodes');
+const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND, INV_FLAG, swingElementId } = require('./opcodes');
 const { FastWriter, Writer, Reader, clampU16 } = require('./frame');
 
 function wrap(fn, payload) {
@@ -654,6 +654,7 @@ function encodeEquipment({ cap, capMax, slots }) {
         w.str(list[i].slot);
         w.str(list[i].id);
         w.u16(clampU16(list[i].count));
+        w.u8(list[i].flags | 0);
     }
     return w.toBuffer();
 }
@@ -666,7 +667,7 @@ function decodeEquipment(payload) {
         const n = r.u8();
         const slots = [];
         for (let i = 0; i < n; i++) {
-            slots.push({ slot: r.str(), id: r.str(), count: r.u16() });
+            slots.push({ slot: r.str(), id: r.str(), count: r.u16(), flags: r.u8() });
         }
         return { cap, capMax, slots };
     }, payload);
@@ -727,7 +728,29 @@ function decodeUnequip(payload) {
     }, payload);
 }
 
+function encodeCloseBag(containerId) {
+    return new FastWriter().str(containerId || '').toBuffer();
+}
+
+function decodeCloseBag(payload) {
+    if (payload == null) return '';
+    const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+    if (!buf.length) return '';
+    return wrap((p) => {
+        const r = new Reader(p);
+        return r.str();
+    }, buf);
+}
+
 function writeItemLoc(w, loc) {
+    if (loc && (loc.kind === 'tile' || loc.kind === LOC_KIND.TILE)) {
+        w.u8(LOC_KIND.TILE);
+        w.i16(loc.x | 0);
+        w.i16(loc.y | 0);
+        w.i8(loc.z | 0);
+        w.u8(loc.stackIndex | 0);
+        return;
+    }
     if (loc && loc.kind === 'equipment') {
         w.u8(LOC_KIND.EQUIPMENT);
         w.str(loc.slot || '');
@@ -748,10 +771,74 @@ function encodeMoveItem(from, to, count) {
 
 function readItemLoc(r) {
     const kind = r.u8();
+    if (kind === LOC_KIND.TILE) {
+        return {
+            kind: 'tile',
+            x: r.i16(),
+            y: r.i16(),
+            z: r.i8(),
+            stackIndex: r.u8()
+        };
+    }
     if (kind === LOC_KIND.EQUIPMENT) {
         return { kind: 'equipment', slot: r.str() };
     }
     return { kind: 'container', containerUid: r.str(), index: r.u8() };
+}
+
+function encodeGround(slot) {
+    const flags = slot && slot.flags != null
+        ? (slot.flags | 0)
+        : ((slot && slot.container) ? INV_FLAG.CONTAINER : 0);
+    return new FastWriter()
+        .i16(slot && slot.x)
+        .i16(slot && slot.y)
+        .i8(slot && slot.z)
+        .u8((slot && slot.stackIndex) | 0)
+        .str((slot && (slot.uid || slot.containerId)) || '')
+        .str((slot && (slot.id || slot.itemId)) || '')
+        .u16(clampU16((slot && slot.count) || 0))
+        .u8(flags & 0xff)
+        .toBuffer();
+}
+
+function decodeGround(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const out = {
+            x: r.i16(),
+            y: r.i16(),
+            z: r.i8(),
+            stackIndex: r.u8(),
+            uid: r.str(),
+            id: r.str(),
+            count: r.u16(),
+            flags: 0
+        };
+        if (r.rest().length) out.flags = r.u8();
+        return out;
+    }, payload);
+}
+
+function encodeGroundGone(uid, extra) {
+    const w = new FastWriter().str(uid || '');
+    if (extra && extra.x != null) {
+        w.i16(extra.x | 0).i16(extra.y | 0).i8(extra.z | 0);
+    }
+    return w.toBuffer();
+}
+
+function decodeGroundGone(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const out = { uid: r.str() };
+        if (r.rest().length >= 5) {
+            out.x = r.i16();
+            out.y = r.i16();
+            out.z = r.i8();
+        }
+        return out;
+    }, payload);
 }
 
 function decodeMoveItem(payload) {
@@ -1086,8 +1173,14 @@ module.exports = {
     decodeEquip,
     encodeUnequip,
     decodeUnequip,
+    encodeCloseBag,
+    decodeCloseBag,
     encodeMoveItem,
     decodeMoveItem,
+    encodeGround,
+    decodeGround,
+    encodeGroundGone,
+    decodeGroundGone,
     encodeSay,
     decodeSay,
     encodeSkills,

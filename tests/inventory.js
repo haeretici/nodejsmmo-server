@@ -13,6 +13,7 @@ const {
     equipItem,
     unequipItem,
     moveItem,
+    getStackCount,
     serializeInventory,
     normalizeInventory,
     totalCarriedWeight,
@@ -206,6 +207,22 @@ function main() {
     );
     assert.strictEqual(cycle.ok, false);
 
+    const nestInv = createEmptyInventory();
+    ensureEquippedBackpack(nestInv, itemDb);
+    const nestA = createItemInstance(nestInv, 'bag', itemDb);
+    assert.ok(placeInContainer(nestInv, nestA, nestInv.rootUid, null, itemDb).ok);
+    const nestB = createItemInstance(nestInv, 'bag', itemDb);
+    assert.ok(placeInContainer(nestInv, nestB, nestA, null, itemDb).ok);
+    const locA = nestInv.items[nestA].location;
+    const nestCycle = moveItem(
+        nestInv,
+        locA,
+        { kind: 'container', containerUid: nestB, index: 0 },
+        itemDb
+    );
+    assert.strictEqual(nestCycle.ok, false);
+    assert.strictEqual(nestCycle.error, 'cycle');
+
     const weight = totalCarriedWeight(loaded, itemDb);
     assert.ok(weight > 1800);
     assert.strictEqual(canCarryAdditional(1, weight, 1000000, 'scout'), false);
@@ -356,7 +373,391 @@ function main() {
     );
     assert.strictEqual(resolveDistanceAutoShape(throwInv, itemDb), null, 'throwing stays ST');
 
+    const splitInv = createEmptyInventory();
+    ensureEquippedBackpack(splitInv, itemDb);
+    const sixUid = createItemInstance(splitInv, 'gold_coin', itemDb, { count: 6 });
+    assert.ok(placeInContainer(splitInv, sixUid, splitInv.rootUid, 0, itemDb).ok);
+    const split = moveItem(
+        splitInv,
+        { kind: 'container', containerUid: splitInv.rootUid, index: 0 },
+        { kind: 'container', containerUid: splitInv.rootUid, index: 1 },
+        itemDb,
+        3
+    );
+    assert.ok(split.ok, 'split 3 of 6 into empty slot');
+    assert.strictEqual(countItem(splitInv, 'gold_coin'), 6);
+    assert.strictEqual(getStackCount(splitInv.items[sixUid]), 3);
+    const splitView = bagView(splitInv, splitInv.rootUid, itemDb);
+    const threeAt0 = splitView.slots.find((s) => s.index === 0);
+    const threeAt1 = splitView.slots.find((s) => s.index === 1);
+    assert.ok(threeAt0 && threeAt0.id === 'gold_coin' && threeAt0.count === 3);
+    assert.ok(threeAt1 && threeAt1.id === 'gold_coin' && threeAt1.count === 3);
+
+    const mergeInv = createEmptyInventory();
+    ensureEquippedBackpack(mergeInv, itemDb);
+    const srcUid = createItemInstance(mergeInv, 'gold_coin', itemDb, { count: 6 });
+    const dstUid = createItemInstance(mergeInv, 'gold_coin', itemDb, { count: 4 });
+    assert.ok(placeInContainer(mergeInv, srcUid, mergeInv.rootUid, 0, itemDb).ok);
+    assert.ok(placeInContainer(mergeInv, dstUid, mergeInv.rootUid, 1, itemDb).ok);
+    const merged = moveItem(
+        mergeInv,
+        { kind: 'container', containerUid: mergeInv.rootUid, index: 0 },
+        { kind: 'container', containerUid: mergeInv.rootUid, index: 1 },
+        itemDb,
+        3
+    );
+    assert.ok(merged.ok && merged.merged, 'partial merge into dest stack');
+    assert.strictEqual(getStackCount(mergeInv.items[srcUid]), 3);
+    assert.strictEqual(getStackCount(mergeInv.items[dstUid]), 7);
+
+    const allMoved = moveItem(
+        mergeInv,
+        { kind: 'container', containerUid: mergeInv.rootUid, index: 0 },
+        { kind: 'container', containerUid: mergeInv.rootUid, index: 1 },
+        itemDb,
+        0
+    );
+    assert.ok(allMoved.ok, 'count 0 moves remaining stack');
+    assert.ok(!mergeInv.items[srcUid], 'source stack gone after full move');
+    assert.strictEqual(getStackCount(mergeInv.items[dstUid]), 10);
+
+    const occInv = createEmptyInventory();
+    ensureEquippedBackpack(occInv, itemDb);
+    const occGold = createItemInstance(occInv, 'gold_coin', itemDb, { count: 6 });
+    const occSword = createItemInstance(occInv, 'iron_longsword', itemDb);
+    assert.ok(placeInContainer(occInv, occGold, occInv.rootUid, 0, itemDb).ok);
+    assert.ok(placeInContainer(occInv, occSword, occInv.rootUid, 1, itemDb).ok);
+    const occupied = moveItem(
+        occInv,
+        { kind: 'container', containerUid: occInv.rootUid, index: 0 },
+        { kind: 'container', containerUid: occInv.rootUid, index: 1 },
+        itemDb,
+        3
+    );
+    assert.strictEqual(occupied.ok, false);
+    assert.strictEqual(occupied.error, 'occupied');
+    assert.strictEqual(getStackCount(occInv.items[occGold]), 6);
+    assert.strictEqual(occInv.items[occSword].itemId, 'iron_longsword');
+
+    testOpenEquippedContainer();
+    testNestedBags();
+
     console.log('ok inventory');
+}
+
+function testOpenEquippedContainer() {
+    const { testSettings } = require('./helpers');
+    const { World } = require('../src/world/world');
+    const { GameSession } = require('../src/world/session');
+    const { MemoryStore } = require('../src/persist/memory_store');
+    const { RateLimiter } = require('../src/security/rate_limit');
+    const { createLog } = require('../src/log');
+    const { C2S, S2C } = require('../src/protocol/opcodes');
+    const { decodeFrame } = require('../src/protocol/frame');
+    const { encodeContainerSlot, decodeInventory, decodeEquipment } = require('../src/protocol/messages');
+    const { createStaticMap } = require('../src/world/static_map');
+
+    function fakeSocket() {
+        return {
+            readyState: 1,
+            sent: [],
+            send(buf) { this.sent.push(Buffer.from(buf)); },
+            close() { this.readyState = 3; this.closed = true; },
+            terminate() { this.readyState = 3; this.closed = true; }
+        };
+    }
+
+    function lastOf(sock, opcode) {
+        for (let i = sock.sent.length - 1; i >= 0; i--) {
+            const f = decodeFrame(sock.sent[i]);
+            if (f.opcode === opcode) return f;
+        }
+        return null;
+    }
+
+    const world = new World({
+        settings: testSettings(),
+        store: new MemoryStore(),
+        log: createLog(testSettings()),
+        schedule: () => 0,
+        clear: () => {},
+        map: createStaticMap(),
+        pack: { classes: { classes: [{ id: 'scout', baseRegenHp: 0, baseRegenMp: 0 }] } }
+    });
+    world._itemDb = itemDb;
+    world.start();
+
+    function makeSession(name) {
+        const session = new GameSession({
+            socket: fakeSocket(),
+            ip: '127.0.0.1',
+            world,
+            settings: world.settings,
+            limiter: new RateLimiter(),
+            log: world.log
+        });
+        session.bindCharacter({
+            id: name === 'scout' ? 1 : 2,
+            accountId: 1,
+            name: name,
+            vocation: name === 'scout' ? 'scout' : 'guardian',
+            level: 1,
+            experience: 0,
+            hp: 185,
+            hpMax: 185,
+            mp: 90,
+            mpMax: 90,
+            townId: 1
+        }, world.spawnPos({ townId: 1 }));
+        assert.ok(world.add(session));
+        return session;
+    }
+
+    const scout = makeSession('scout');
+    const scoutInv = createEmptyInventory();
+    ensureEquippedBackpack(scoutInv, itemDb);
+    const bowUid = createItemInstance(scoutInv, 'hunter_bow', itemDb);
+    assert.ok(placeInEquipment(scoutInv, bowUid, 'rightHand', itemDb).ok);
+    const quiverUid = createItemInstance(scoutInv, 'quiver', itemDb);
+    assert.ok(placeInEquipment(scoutInv, quiverUid, 'leftHand', itemDb).ok);
+    const arrowUid = createItemInstance(scoutInv, 'sniper_arrow', itemDb, { count: 100 });
+    assert.ok(placeInContainer(scoutInv, arrowUid, quiverUid, null, itemDb).ok);
+    const bagUid = createItemInstance(scoutInv, 'bag', itemDb);
+    assert.ok(placeInContainer(scoutInv, bagUid, scoutInv.rootUid, null, itemDb).ok);
+    scout.inventory = scoutInv;
+    applyPlayerLoadout(scout, itemDb);
+    world.sendEnterWorld(scout);
+
+    const eqFrame = lastOf(scout.socket, S2C.EQUIPMENT);
+    assert.ok(eqFrame, 'EQUIPMENT after enter');
+    const eq = decodeEquipment(eqFrame.payload);
+    const shield = eq.slots.find((s) => s.slot === 'shield');
+    assert.ok(shield && shield.id === 'quiver', 'quiver in left hand');
+    const weapon = eq.slots.find((s) => s.slot === 'weapon');
+    assert.ok(weapon && weapon.id === 'hunter_bow');
+    assert.strictEqual(shield.flags, 1, 'quiver slot flagged container');
+    assert.strictEqual(weapon.flags, 0, 'bow is not a container');
+
+    scout.socket.sent = [];
+    assert.ok(world.enqueueIntent(scout, {
+        opcode: C2S.OPEN_BAG,
+        seq: scout.nextClientSeq,
+        payload: encodeContainerSlot('shield', 0)
+    }));
+    world.step(1);
+    assert.strictEqual(scout.openBagUid, quiverUid);
+    const bagPkt = decodeInventory(lastOf(scout.socket, S2C.BAG).payload);
+    assert.strictEqual(bagPkt.containerId, quiverUid);
+    const arrows = bagPkt.slots.find((s) => s.id === 'sniper_arrow');
+    assert.ok(arrows, 'quiver BAG lists arrows');
+    assert.strictEqual(arrows.count, 100);
+
+    const repairedInv = createEmptyInventory();
+    ensureEquippedBackpack(repairedInv, itemDb);
+    const repairedQ = createItemInstance(repairedInv, 'quiver', itemDb);
+    assert.ok(placeInEquipment(repairedInv, repairedQ, 'leftHand', itemDb).ok);
+    delete repairedInv.containers[repairedQ];
+    scout.inventory = repairedInv;
+    applyPlayerLoadout(scout, itemDb);
+    scout.socket.sent = [];
+    assert.ok(world.enqueueIntent(scout, {
+        opcode: C2S.OPEN_BAG,
+        seq: scout.nextClientSeq,
+        payload: encodeContainerSlot('leftHand', 0)
+    }));
+    world.step(2);
+    assert.ok(repairedInv.containers[repairedQ], 'OPEN_BAG repairs missing quiver container');
+    assert.strictEqual(scout.openBagUid, repairedQ);
+
+    scout.inventory = scoutInv;
+    applyPlayerLoadout(scout, itemDb);
+    world.sendInventory(scout);
+    const rootView = decodeInventory(lastOf(scout.socket, S2C.INVENTORY).payload);
+    const nested = rootView.slots.find((s) => s.id === 'bag');
+    assert.ok(nested && (nested.flags & 1), 'nested bag flagged');
+    scout.socket.sent = [];
+    assert.ok(world.enqueueIntent(scout, {
+        opcode: C2S.OPEN_BAG,
+        seq: scout.nextClientSeq,
+        payload: encodeContainerSlot(rootView.containerId, nested.index)
+    }));
+    world.step(3);
+    assert.strictEqual(scout.openBagUid, bagUid, 'OPEN_BAG still opens nested bag by parent+index');
+
+    const guard = makeSession('guard');
+    const guardInv = createEmptyInventory();
+    ensureEquippedBackpack(guardInv, itemDb);
+    const swordUid = createItemInstance(guardInv, 'iron_longsword', itemDb);
+    assert.ok(placeInEquipment(guardInv, swordUid, 'rightHand', itemDb).ok);
+    const shieldUid = createItemInstance(guardInv, 'wooden_shield', itemDb);
+    assert.ok(placeInEquipment(guardInv, shieldUid, 'leftHand', itemDb).ok);
+    guard.inventory = guardInv;
+    applyPlayerLoadout(guard, itemDb);
+    world.sendEnterWorld(guard);
+    guard.socket.sent = [];
+    assert.ok(world.enqueueIntent(guard, {
+        opcode: C2S.OPEN_BAG,
+        seq: guard.nextClientSeq,
+        payload: encodeContainerSlot('shield', 0)
+    }));
+    world.step(4);
+    assert.ok(!guard.openBagUid, 'wooden_shield OPEN_BAG rejected');
+    assert.ok(lastOf(guard.socket, S2C.REJECT), 'non-container equipment rejects');
+
+    world.stop();
+}
+
+function testNestedBags() {
+    const { testSettings } = require('./helpers');
+    const { World } = require('../src/world/world');
+    const { GameSession } = require('../src/world/session');
+    const { MemoryStore } = require('../src/persist/memory_store');
+    const { RateLimiter } = require('../src/security/rate_limit');
+    const { createLog } = require('../src/log');
+    const { C2S, S2C } = require('../src/protocol/opcodes');
+    const { decodeFrame } = require('../src/protocol/frame');
+    const { encodeContainerSlot, decodeInventory, encodeCloseBag } = require('../src/protocol/messages');
+    const { createStaticMap } = require('../src/world/static_map');
+
+    function fakeSocket() {
+        return {
+            readyState: 1,
+            sent: [],
+            send(buf) { this.sent.push(Buffer.from(buf)); },
+            close() { this.readyState = 3; this.closed = true; },
+            terminate() { this.readyState = 3; this.closed = true; }
+        };
+    }
+
+    function allOf(sock, opcode) {
+        const out = [];
+        for (let i = 0; i < sock.sent.length; i++) {
+            const f = decodeFrame(sock.sent[i]);
+            if (f.opcode === opcode) out.push(f);
+        }
+        return out;
+    }
+
+    const world = new World({
+        settings: testSettings(),
+        store: new MemoryStore(),
+        log: createLog(testSettings()),
+        schedule: () => 0,
+        clear: () => {},
+        map: createStaticMap(),
+        pack: { classes: { classes: [{ id: 'scout', baseRegenHp: 0, baseRegenMp: 0 }] } }
+    });
+    world._itemDb = itemDb;
+    world.start();
+
+    const session = new GameSession({
+        socket: fakeSocket(),
+        ip: '127.0.0.1',
+        world,
+        settings: world.settings,
+        limiter: new RateLimiter(),
+        log: world.log
+    });
+    session.bindCharacter({
+        id: 3,
+        accountId: 1,
+        name: 'nest',
+        vocation: 'scout',
+        level: 1,
+        experience: 0,
+        hp: 185,
+        hpMax: 185,
+        mp: 90,
+        mpMax: 90,
+        townId: 1
+    }, world.spawnPos({ townId: 1 }));
+    assert.ok(world.add(session));
+    const sock = session.socket;
+
+    const inv = createEmptyInventory();
+    ensureEquippedBackpack(inv, itemDb);
+    const bagA = createItemInstance(inv, 'bag', itemDb);
+    assert.ok(placeInContainer(inv, bagA, inv.rootUid, null, itemDb).ok);
+    const goldA = createItemInstance(inv, 'gold_coin', itemDb, { count: 4 });
+    assert.ok(placeInContainer(inv, goldA, bagA, null, itemDb).ok);
+    const bagB = createItemInstance(inv, 'bag', itemDb);
+    assert.ok(placeInContainer(inv, bagB, bagA, null, itemDb).ok);
+    const goldB = createItemInstance(inv, 'gold_coin', itemDb, { count: 2 });
+    assert.ok(placeInContainer(inv, goldB, bagB, null, itemDb).ok);
+    session.inventory = inv;
+    applyPlayerLoadout(session, itemDb);
+    world.sendEnterWorld(session);
+
+    const rootView = decodeInventory(allOf(sock, S2C.INVENTORY).pop().payload);
+    const slotA = rootView.slots.find((s) => s.id === 'bag');
+    assert.ok(slotA && (slotA.flags & 1), 'bag in root is flagged container');
+
+    sock.sent = [];
+    assert.ok(world.enqueueIntent(session, {
+        opcode: C2S.OPEN_BAG,
+        seq: session.nextClientSeq,
+        payload: encodeContainerSlot(rootView.containerId, slotA.index)
+    }));
+    world.step(1);
+    assert.deepStrictEqual(session.openBagUids, [bagA]);
+    assert.strictEqual(session.openBagUid, bagA);
+    const openA = decodeInventory(allOf(sock, S2C.BAG).pop().payload);
+    assert.strictEqual(openA.containerId, bagA);
+    assert.ok(openA.slots.some((s) => s.id === 'gold_coin' && s.count === 4), 'bag A inner gold');
+    const innerBag = openA.slots.find((s) => s.id === 'bag');
+    assert.ok(innerBag && (innerBag.flags & 1), 'bag B flagged inside A');
+
+    sock.sent = [];
+    assert.ok(world.enqueueIntent(session, {
+        opcode: C2S.OPEN_BAG,
+        seq: session.nextClientSeq,
+        payload: encodeContainerSlot(bagA, innerBag.index)
+    }));
+    world.step(2);
+    assert.strictEqual(session.openBagUids.length, 2, 'parent stays in open list');
+    assert.ok(session.openBagUids.indexOf(bagA) >= 0);
+    assert.ok(session.openBagUids.indexOf(bagB) >= 0);
+    assert.strictEqual(session.openBagUid, bagB);
+    const live = allOf(sock, S2C.BAG)
+        .map((f) => decodeInventory(f.payload))
+        .filter((v) => (v.capacity | 0) > 0);
+    assert.ok(live.some((v) => v.containerId === bagA), 'BAG still streams parent A');
+    const viewB = live.find((v) => v.containerId === bagB);
+    assert.ok(viewB, 'BAG streams nested B');
+    assert.ok(viewB.slots.some((s) => s.id === 'gold_coin' && s.count === 2), 'bag B inner gold');
+
+    sock.sent = [];
+    assert.ok(world.enqueueIntent(session, {
+        opcode: C2S.CLOSE_BAG,
+        seq: session.nextClientSeq,
+        payload: encodeCloseBag(bagB)
+    }));
+    world.step(3);
+    assert.deepStrictEqual(session.openBagUids, [bagA], 'CLOSE_BAG drops only B');
+    const afterClose = allOf(sock, S2C.BAG).map((f) => decodeInventory(f.payload));
+    assert.ok(afterClose.some((v) => v.containerId === bagB && (v.capacity | 0) === 0), 'closed B is capacity 0');
+    assert.ok(afterClose.some((v) => v.containerId === bagA && (v.capacity | 0) > 0), 'A still sent');
+
+    sock.sent = [];
+    world.sendInventory(session);
+    const refresh = allOf(sock, S2C.BAG).map((f) => decodeInventory(f.payload));
+    assert.ok(refresh.every((v) => v.containerId !== bagB || (v.capacity | 0) === 0), 'closed B not refreshed');
+    assert.ok(refresh.some((v) => v.containerId === bagA && (v.capacity | 0) > 0));
+
+    sock.sent = [];
+    assert.ok(world.enqueueIntent(session, {
+        opcode: C2S.CLOSE_BAG,
+        seq: session.nextClientSeq,
+        payload: encodeCloseBag('')
+    }));
+    world.step(4);
+    assert.deepStrictEqual(session.openBagUids, []);
+    assert.strictEqual(session.openBagUid, '');
+    const closedAll = decodeInventory(allOf(sock, S2C.BAG).pop().payload);
+    assert.strictEqual(closedAll.containerId, '');
+    assert.strictEqual(closedAll.capacity, 0);
+
+    world.stop();
 }
 
 main();

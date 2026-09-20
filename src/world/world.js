@@ -1,7 +1,7 @@
 'use strict';
 
 const { WorldTick } = require('./tick');
-const { C2S, S2C, C2S_ENTERED, C2S_DOWNED, REASON, DIR_DELTA } = require('../protocol/opcodes');
+const { C2S, S2C, C2S_ENTERED, C2S_DOWNED, REASON, DIR_DELTA, OPEN_BAG_SELF_INDEX } = require('../protocol/opcodes');
 const {
     encodeEnterWorld,
     encodeAppear,
@@ -29,6 +29,8 @@ const {
     encodeCastFx,
     encodeField,
     encodeFieldGone,
+    encodeGround,
+    encodeGroundGone,
     decodeCast,
     decodePing,
     decodeMoveStep,
@@ -47,7 +49,8 @@ const {
     decodeEquip,
     decodeUnequip,
     decodeMoveItem,
-    decodeContainerSlot
+    decodeContainerSlot,
+    decodeCloseBag
 } = require('../protocol/messages');
 const { createStaticMap, viewport, viewportWindow, inViewport, clampSpawn } = require('./static_map');
 const { fromStaticMap } = require('./tilemap');
@@ -100,6 +103,8 @@ const {
     equipmentView,
     playerCap,
     ownsContainer,
+    ensurePlayerContainer,
+    resolveOpenBagUid,
     resolveLocationUid,
     equipItem,
     unequipItem,
@@ -251,6 +256,22 @@ const {
     SPELL_MOVE_LOCK_DEFAULT
 } = require('./spells');
 const { SpatialIndex } = require('./spatial_index');
+const {
+    MAX_GROUND_RENDER,
+    createGroundStore,
+    loadGroundStore,
+    serializeGroundStore,
+    tileKey,
+    parseTileKey,
+    listGroundTiles,
+    visibleGroundSlots,
+    groundRootLocation,
+    inGroundRange,
+    moveWithGround,
+    locIsGroundContainer,
+    isGroundStoreItem,
+    subtreeContainerUids
+} = require('./ground_items');
 
 const CREATURE_ID_BASE = 1000000000;
 const CORPSE_ID_BASE = 2000000000;
@@ -261,6 +282,55 @@ function kitAttackIsMelee(atk) {
     if (atk.isMelee === true || atk.kind === 'melee') return true;
     if (atk.kind && atk.kind !== 'melee') return false;
     return atk.range == null || Number(atk.range) <= 1;
+}
+
+const MAX_OPEN_BAGS = 8;
+
+function openBagList(session) {
+    if (!session) return [];
+    if (!Array.isArray(session.openBagUids)) {
+        session.openBagUids = session.openBagUid ? [session.openBagUid] : [];
+    }
+    return session.openBagUids;
+}
+
+function syncOpenBagUid(session) {
+    const list = openBagList(session);
+    session.openBagUid = list.length ? list[list.length - 1] : '';
+}
+
+function rememberOpenBag(session, uid) {
+    const list = openBagList(session);
+    const dropped = [];
+    if (!uid) return dropped;
+    const at = list.indexOf(uid);
+    if (at >= 0) list.splice(at, 1);
+    list.push(uid);
+    while (list.length > MAX_OPEN_BAGS) dropped.push(list.shift());
+    syncOpenBagUid(session);
+    return dropped;
+}
+
+function forgetOpenBag(session, uid) {
+    const list = openBagList(session);
+    if (!uid) {
+        const gone = list.slice();
+        list.length = 0;
+        session.openBagUid = '';
+        return gone;
+    }
+    const at = list.indexOf(uid);
+    if (at >= 0) list.splice(at, 1);
+    syncOpenBagUid(session);
+    return at >= 0 ? [uid] : [];
+}
+
+function sendBagClosed(session, uid) {
+    session.send(S2C.BAG, encodeInventory({
+        containerId: uid || '',
+        capacity: 0,
+        slots: []
+    }));
 }
 
 class World {
@@ -338,6 +408,10 @@ class World {
         this._persistGate = new PersistGate(
             (opts.settings && opts.settings.persistConcurrency) || 8
         );
+        this.ground = createGroundStore();
+        this.groundSpatial = new SpatialIndex({ chunkSize: 32 });
+        this._groundDirty = false;
+        this._groundPersistTail = Promise.resolve();
         this._globalSaveTimer = null;
         this._globalNotifyTimer = null;
         this._intervalTimer = null;
@@ -444,6 +518,9 @@ class World {
         this.tick.start();
         this._scheduleGlobalSave();
         this._scheduleIntervalSave();
+        this.loadGroundStore().catch((err) => {
+            this.log.error('ground load', { err: err && err.message });
+        });
     }
 
     stop() {
@@ -460,6 +537,7 @@ class World {
     async shutdown() {
         this.stop();
         await this.flushPersist();
+        await this.saveGroundStore();
     }
 
     snapshot() {
@@ -1293,6 +1371,8 @@ class World {
     }
 
     sendEnterWorld(session) {
+        session.openBagUids = [];
+        session.openBagUid = '';
         const vp = this.viewportOf(session);
         session.send(S2C.ENTER_WORLD, encodeEnterWorld({
             character: session.character,
@@ -1304,6 +1384,7 @@ class World {
         this.tickSpawnPins(this.tick.tickIndex, { appear: false });
         this.sendInventory(session);
         this.sendSkills(session);
+        this.sendGroundInView(session);
     }
 
     syncAppears(session) {
@@ -1346,6 +1427,7 @@ class World {
             }
         }
         this.sendFieldsInView(session);
+        this.sendGroundInView(session);
     }
 
     broadcastAppear(entity) {
@@ -1563,6 +1645,9 @@ class World {
             case C2S.OPEN_BAG:
                 this.applyOpenBag(session, intent);
                 return;
+            case C2S.CLOSE_BAG:
+                this.applyCloseBag(session, intent);
+                return;
             case C2S.CAST:
                 this.applyCastIntent(session, intent, tickIndex);
                 return;
@@ -1654,6 +1739,7 @@ class World {
         session.movedThisTick = true;
         this.broadcastMove(session, from, dir);
         this.applyWorldPinStep(session, from, tickIndex);
+        this.closeContainersOutOfRange(session);
         return true;
     }
 
@@ -1685,6 +1771,7 @@ class World {
         session.movedThisTick = true;
         this.broadcastMove(session, from, session.dir);
         this.applyWorldPinStep(session, from, tickIndex);
+        this.closeContainersOutOfRange(session);
     }
 
     applyUse(session, intent, tickIndex) {
@@ -3744,6 +3831,39 @@ class World {
                 entity.send(S2C.WORLD_PIN_GONE, encodeWorldPinGone(inst.id));
             }
         }
+
+        const candidateGround = [];
+        if (this.groundSpatial) {
+            const seenG = new Set();
+            const addG = (list) => {
+                for (let i = 0; i < list.length; i++) {
+                    const ent = list[i];
+                    if (!ent || seenG.has(ent.id)) continue;
+                    seenG.add(ent.id);
+                    candidateGround.push(ent);
+                }
+            };
+            addG(this.groundSpatial.queryChunkCandidates(entity.x, entity.y, entity.z, 16));
+            if ((from.z | 0) !== (entity.z | 0)) {
+                addG(this.groundSpatial.queryChunkCandidates(from.x, from.y, from.z, 16));
+            }
+        }
+        for (let i = 0; i < candidateGround.length; i++) {
+            const ent = candidateGround[i];
+            if (!ent) continue;
+            const selfSaw = inViewport(
+                this.map, from.x, from.y, ent.x, ent.y, ent.z, null, null, from.z
+            );
+            const selfSees = this.sees(entity, ent.x, ent.y, ent.z);
+            if (!selfSaw && selfSees) {
+                this.sendGroundTileTo(entity, ent.x, ent.y, ent.z);
+            } else if (selfSaw && !selfSees) {
+                const slots = visibleGroundSlots(this.ground, ent.x, ent.y, ent.z);
+                for (let s = 0; s < slots.length; s++) {
+                    this.sendGroundGoneTo(entity, slots[s].uid, { x: ent.x, y: ent.y, z: ent.z });
+                }
+            }
+        }
     }
 
     talkRange() {
@@ -3765,12 +3885,206 @@ class World {
             capMax: cap.capMax,
             slots: equipmentView(inv, itemDb)
         }));
-        if (session.openBagUid && ownsContainer(inv, session.openBagUid)) {
-            session.send(S2C.BAG, encodeInventory(bagView(inv, session.openBagUid, itemDb)));
-        } else if (session.openBagUid) {
-            session.openBagUid = '';
-            session.send(S2C.BAG, encodeInventory({ containerId: '', capacity: 0, slots: [] }));
+        const list = openBagList(session);
+        const kept = [];
+        for (let i = 0; i < list.length; i++) {
+            const uid = list[i];
+            if (uid && ownsContainer(inv, uid)) {
+                kept.push(uid);
+                continue;
+            }
+            if (uid && isGroundStoreItem(this.ground, uid) && this.ground.inventory.containers[uid]) {
+                const root = groundRootLocation(this.ground, uid);
+                if (root && inGroundRange(session.x, session.y, session.z, root.x, root.y, root.z)) {
+                    kept.push(uid);
+                    continue;
+                }
+            }
+            if (uid) sendBagClosed(session, uid);
         }
+        session.openBagUids = kept;
+        syncOpenBagUid(session);
+        for (let i = 0; i < kept.length; i++) {
+            const uid = kept[i];
+            const storeInv = ownsContainer(inv, uid) ? inv : this.ground.inventory;
+            session.send(S2C.BAG, encodeInventory(bagView(storeInv, uid, itemDb)));
+        }
+    }
+
+    async loadGroundStore() {
+        if (!this.store || typeof this.store.loadWorldGround !== 'function') return false;
+        try {
+            const blob = await this.store.loadWorldGround();
+            if (blob) this.ground = loadGroundStore(blob);
+            else this.ground = createGroundStore();
+            this._reindexGroundSpatial();
+            return true;
+        } catch (err) {
+            this.log.error('ground load', { err: err && err.message });
+            return false;
+        }
+    }
+
+    async saveGroundStore() {
+        if (!this.store || typeof this.store.saveWorldGround !== 'function') return false;
+        if (!this._groundDirty && this._groundPersistTail) {
+            /* still write if dirty flag missed on shutdown */
+        }
+        const blob = serializeGroundStore(this.ground);
+        const run = () => this._persistGate.run(async () => {
+            try {
+                await this.store.saveWorldGround(blob);
+                this._groundDirty = false;
+                return true;
+            } catch (err) {
+                this.log.error('ground persist', { err: err && err.message });
+                return false;
+            }
+        });
+        const tail = this._groundPersistTail.then(run, run);
+        this._groundPersistTail = tail;
+        return tail;
+    }
+
+    markGroundDirty() {
+        this._groundDirty = true;
+    }
+
+    _reindexGroundSpatial() {
+        this.groundSpatial = new SpatialIndex({ chunkSize: 32 });
+        const keys = listGroundTiles(this.ground);
+        for (let i = 0; i < keys.length; i++) {
+            const pos = parseTileKey(keys[i]);
+            if (!pos) continue;
+            this.groundSpatial.insert({ id: keys[i], x: pos.x, y: pos.y, z: pos.z });
+        }
+    }
+
+    _syncGroundSpatialKey(key) {
+        if (!key) return;
+        const stack = this.ground.stacks[key];
+        const pos = parseTileKey(key);
+        if (!pos) return;
+        if (Array.isArray(stack) && stack.length) {
+            this.groundSpatial.update({ id: key, x: pos.x, y: pos.y, z: pos.z });
+        } else {
+            this.groundSpatial.remove(key);
+        }
+    }
+
+    _touchGroundTile(x, y, z) {
+        this._syncGroundSpatialKey(tileKey(x, y, z));
+        this.markGroundDirty();
+    }
+
+    sendGroundTileTo(session, x, y, z) {
+        if (!session) return;
+        const slots = visibleGroundSlots(this.ground, x, y, z);
+        for (let i = 0; i < slots.length; i++) {
+            session.send(S2C.GROUND, encodeGround(slots[i]));
+        }
+    }
+
+    sendGroundGoneTo(session, uid, extra) {
+        if (!session || !uid) return;
+        session.send(S2C.GROUND_GONE, encodeGroundGone(uid, extra));
+    }
+
+    sendGroundInView(session) {
+        const vp = this.viewportOf(session);
+        const candidates = this.groundSpatial
+            ? this.groundSpatial.queryChunkCandidates(session.x, session.y, session.z, 16)
+            : [];
+        const seen = new Set();
+        for (let i = 0; i < candidates.length; i++) {
+            const ent = candidates[i];
+            if (!ent || seen.has(ent.id)) continue;
+            seen.add(ent.id);
+            if (this.sees(session, ent.x, ent.y, ent.z)) {
+                this.sendGroundTileTo(session, ent.x, ent.y, ent.z);
+            }
+        }
+        if (!candidates.length) {
+            const keys = listGroundTiles(this.ground);
+            for (let i = 0; i < keys.length; i++) {
+                const pos = parseTileKey(keys[i]);
+                if (pos && this.sees(session, pos.x, pos.y, pos.z)) {
+                    this.sendGroundTileTo(session, pos.x, pos.y, pos.z);
+                }
+            }
+        }
+        void vp;
+    }
+
+    broadcastGroundTile(x, y, z, goneUids) {
+        const slots = visibleGroundSlots(this.ground, x, y, z);
+        const live = new Set(slots.map((s) => s.uid));
+        this.broadcastToViewers(x, y, z, (p) => {
+            if (goneUids) {
+                for (let i = 0; i < goneUids.length; i++) {
+                    const uid = goneUids[i];
+                    if (uid && !live.has(uid)) this.sendGroundGoneTo(p, uid, { x, y, z });
+                }
+            }
+            for (let i = 0; i < slots.length; i++) {
+                p.send(S2C.GROUND, encodeGround(slots[i]));
+            }
+        });
+        this._touchGroundTile(x, y, z);
+    }
+
+    closeContainersOutOfRange(session) {
+        if (!session) return;
+        const itemDb = this.itemDb();
+        const list = openBagList(session).slice();
+        const dropped = [];
+        for (let i = 0; i < list.length; i++) {
+            const uid = list[i];
+            if (!uid) continue;
+            if (ownsContainer(session.inventory, uid)) continue;
+            if (!isGroundStoreItem(this.ground, uid)) {
+                dropped.push(uid);
+                continue;
+            }
+            const root = groundRootLocation(this.ground, uid);
+            if (!root || !inGroundRange(session.x, session.y, session.z, root.x, root.y, root.z)) {
+                dropped.push(uid);
+            }
+        }
+        for (let i = 0; i < dropped.length; i++) {
+            const gone = forgetOpenBag(session, dropped[i]);
+            for (let j = 0; j < gone.length; j++) sendBagClosed(session, gone[j]);
+        }
+        void itemDb;
+        if (session.openCorpseId) {
+            const container = this.containerById(session.openCorpseId);
+            if (!container
+                || (container.z | 0) !== (session.z | 0)
+                || !inGroundRange(session.x, session.y, session.z, container.x, container.y, container.z)) {
+                const id = session.openCorpseId;
+                session.openCorpseId = 0;
+                session.send(S2C.CONTAINER, encodeContainer({ id, items: [] }));
+            }
+        }
+    }
+
+    closeGroundUidsForAll(uids) {
+        if (!uids || !uids.length) return;
+        const set = new Set(uids);
+        for (const p of this.players.values()) {
+            if (!p || p.dead) continue;
+            const list = openBagList(p).slice();
+            for (let i = 0; i < list.length; i++) {
+                if (set.has(list[i])) {
+                    const gone = forgetOpenBag(p, list[i]);
+                    for (let j = 0; j < gone.length; j++) sendBagClosed(p, gone[j]);
+                }
+            }
+        }
+    }
+
+    groundRangeReject(session, x, y, z) {
+        return !inGroundRange(session.x, session.y, session.z, x, y, z);
     }
 
     sendSkills(session) {
@@ -3851,6 +4165,7 @@ class World {
         this.log.info('interval save', { players: this.players.size });
         try {
             await this.saveAllOnline('interval');
+            if (this._groundDirty) await this.saveGroundStore();
         } finally {
             this._intervalRunning = false;
             this._scheduleIntervalSave();
@@ -3930,6 +4245,7 @@ class World {
 
     async flushPersist() {
         const jobs = Array.from(this._persistTails.values());
+        if (this._groundDirty) jobs.push(this.saveGroundStore());
         if (!jobs.length) return;
         await Promise.all(jobs.map((p) => p.catch(() => {})));
     }
@@ -4272,15 +4588,24 @@ class World {
             session.malformed();
             return;
         }
-        if (body.from.kind === 'container' && !ownsContainer(session.inventory, body.from.containerUid)) {
+        const from = body.from;
+        const to = body.to;
+        const usesGround = from.kind === 'tile' || to.kind === 'tile'
+            || locIsGroundContainer(this.ground, from)
+            || locIsGroundContainer(this.ground, to);
+        if (usesGround) {
+            this.applyGroundMove(session, intent, body);
+            return;
+        }
+        if (from.kind === 'container' && !ownsContainer(session.inventory, from.containerUid)) {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
-        if (body.to.kind === 'container' && !ownsContainer(session.inventory, body.to.containerUid)) {
+        if (to.kind === 'container' && !ownsContainer(session.inventory, to.containerUid)) {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
-        const r = moveItem(session.inventory, body.from, body.to, this.itemDb());
+        const r = moveItem(session.inventory, from, to, this.itemDb(), body.count);
         if (!r.ok) {
             this.say(session, r.error === 'full' || r.error === 'no_room' || r.error === 'cycle'
                 ? 'You cannot carry that.'
@@ -4290,26 +4615,171 @@ class World {
         this.refreshLoadout(session);
     }
 
+    applyGroundMove(session, intent, body) {
+        const from = body.from && body.from.kind === 'equipment'
+            ? { kind: 'equipment', slot: designerSlotToEngine(body.from.slot) || body.from.slot }
+            : body.from;
+        const to = body.to && body.to.kind === 'equipment'
+            ? { kind: 'equipment', slot: designerSlotToEngine(body.to.slot) || body.to.slot }
+            : body.to;
+        const map = this.tileMap;
+        function tileWalkable(x, y, z) {
+            return !!(map && typeof map.isWalkable === 'function' && map.isWalkable(x, y, z));
+        }
+        if (from.kind === 'tile' && this.groundRangeReject(session, from.x, from.y, from.z)) {
+            session.reject(intent.seq, REASON.OUT_OF_RANGE);
+            return;
+        }
+        if (to.kind === 'tile') {
+            if (this.groundRangeReject(session, to.x, to.y, to.z)) {
+                session.reject(intent.seq, REASON.OUT_OF_RANGE);
+                return;
+            }
+            if (!tileWalkable(to.x | 0, to.y | 0, to.z | 0)) {
+                session.reject(intent.seq, REASON.BLOCKED);
+                return;
+            }
+        }
+        if (locIsGroundContainer(this.ground, from)) {
+            const root = groundRootLocation(this.ground, from.containerUid || from.containerId);
+            if (!root || this.groundRangeReject(session, root.x, root.y, root.z)) {
+                session.reject(intent.seq, REASON.OUT_OF_RANGE);
+                return;
+            }
+        }
+        if (locIsGroundContainer(this.ground, to)) {
+            const root = groundRootLocation(this.ground, to.containerUid || to.containerId);
+            if (!root || this.groundRangeReject(session, root.x, root.y, root.z)) {
+                session.reject(intent.seq, REASON.OUT_OF_RANGE);
+                return;
+            }
+        }
+        const beforeFrom = from.kind === 'tile'
+            ? visibleGroundSlots(this.ground, from.x, from.y, from.z).map((s) => s.uid)
+            : [];
+        const beforeTo = to.kind === 'tile'
+            ? visibleGroundSlots(this.ground, to.x, to.y, to.z).map((s) => s.uid)
+            : [];
+        const r = moveWithGround({
+            ground: this.ground,
+            playerInv: session.inventory,
+            player: session,
+            from,
+            to,
+            count: body.count,
+            itemDb: this.itemDb()
+        });
+        if (!r.ok) {
+            if (r.error === 'equipped_backpack') {
+                this.say(session, 'You cannot drop that.');
+                return;
+            }
+            if (r.error === 'not_enough_cap' || r.error === 'full' || r.error === 'no_room') {
+                this.say(session, 'You cannot carry that.');
+                return;
+            }
+            if (r.error === 'empty_source' || r.error === 'unknown_item' || r.error === 'not_on_ground') {
+                session.reject(intent.seq, REASON.NO_TARGET);
+                return;
+            }
+            this.say(session, 'You cannot do that.');
+            return;
+        }
+        const tiles = [];
+        if (r.fromTile) tiles.push(r.fromTile);
+        if (r.toTile) tiles.push(r.toTile);
+        if (from.kind === 'tile') tiles.push({ x: from.x | 0, y: from.y | 0, z: from.z | 0 });
+        if (to.kind === 'tile') tiles.push({ x: to.x | 0, y: to.y | 0, z: to.z | 0 });
+        const seenT = new Set();
+        for (let i = 0; i < tiles.length; i++) {
+            const t = tiles[i];
+            if (!t) continue;
+            const k = tileKey(t.x, t.y, t.z);
+            if (seenT.has(k)) continue;
+            seenT.add(k);
+            const before = (from.kind === 'tile' && (from.x | 0) === t.x && (from.y | 0) === t.y && (from.z | 0) === t.z)
+                ? beforeFrom
+                : ((to.kind === 'tile' && (to.x | 0) === t.x && (to.y | 0) === t.y && (to.z | 0) === t.z)
+                    ? beforeTo
+                    : []);
+            this.broadcastGroundTile(t.x, t.y, t.z, before.concat(r.closedUids || []));
+        }
+        if (r.closedUids && r.closedUids.length) this.closeGroundUidsForAll(r.closedUids);
+        this.refreshLoadout(session);
+        this.closeContainersOutOfRange(session);
+        for (const p of this.players.values()) {
+            if (p !== session && !p.dead) this.closeContainersOutOfRange(p);
+        }
+    }
+
     applyOpenBag(session, intent) {
         const body = decodeContainerSlot(intent.payload);
         if (!body) {
             session.malformed();
             return;
         }
-        if (!ownsContainer(session.inventory, body.containerId)) {
+        const itemDb = this.itemDb();
+        let uid = resolveOpenBagUid(session.inventory, body.containerId, body.index);
+        let storeInv = session.inventory;
+        if (!uid) {
+            const gInv = this.ground.inventory;
+            const id = body.containerId != null ? String(body.containerId) : '';
+            const idx = body.index | 0;
+            if (idx === OPEN_BAG_SELF_INDEX && gInv.items[id]) {
+                uid = id;
+            } else if (ownsContainer(gInv, id)) {
+                uid = resolveLocationUid(gInv, {
+                    kind: 'container',
+                    containerUid: id,
+                    index: idx
+                });
+            } else if (gInv.items[id] && gInv.containers[id]) {
+                uid = id;
+            }
+            if (uid) storeInv = gInv;
+        }
+        if (!uid) {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
-        const uid = resolveLocationUid(session.inventory, {
-            kind: 'container',
-            containerUid: body.containerId,
-            index: body.index
-        });
-        if (!uid || !session.inventory.containers[uid]) {
+        const inst = storeInv.items[uid];
+        if (!inst) {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
-        session.openBagUid = uid;
+        if (storeInv === this.ground.inventory) {
+            const root = groundRootLocation(this.ground, uid);
+            if (!root || this.groundRangeReject(session, root.x, root.y, root.z)) {
+                session.reject(intent.seq, REASON.OUT_OF_RANGE);
+                return;
+            }
+        }
+        const item = findItem(itemDb, inst.itemId);
+        if (!itemIsContainer(item)) {
+            session.reject(intent.seq, REASON.NO_TARGET);
+            return;
+        }
+        if (!ensurePlayerContainer(storeInv, uid, itemDb)) {
+            session.reject(intent.seq, REASON.NO_TARGET);
+            return;
+        }
+        const dropped = rememberOpenBag(session, uid);
+        for (let i = 0; i < dropped.length; i++) sendBagClosed(session, dropped[i]);
+        this.sendInventory(session);
+    }
+
+    applyCloseBag(session, intent) {
+        const id = decodeCloseBag(intent.payload);
+        if (id === null) {
+            session.malformed();
+            return;
+        }
+        const dropped = forgetOpenBag(session, id);
+        if (!id) {
+            sendBagClosed(session, '');
+            return;
+        }
+        for (let i = 0; i < dropped.length; i++) sendBagClosed(session, dropped[i]);
         this.sendInventory(session);
     }
 
@@ -4675,8 +5145,13 @@ class World {
         }
         const itemDb = this.itemDb();
         const item = findItem(itemDb, inst.itemId);
-        if (itemIsContainer(item) && session.inventory.containers[uid]) {
-            session.openBagUid = uid;
+        if (itemIsContainer(item)) {
+            if (!ensurePlayerContainer(session.inventory, uid, itemDb)) {
+                session.reject(intent.seq, REASON.NO_TARGET);
+                return;
+            }
+            const dropped = rememberOpenBag(session, uid);
+            for (let i = 0; i < dropped.length; i++) sendBagClosed(session, dropped[i]);
             this.sendInventory(session);
             return;
         }

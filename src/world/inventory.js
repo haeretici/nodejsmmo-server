@@ -30,6 +30,7 @@ const {
     containerCapacity,
     canonicalEquipmentSlot,
     engineSlotToDesigner,
+    designerSlotToEngine,
     resolveWeaponSkillFromItem,
     computeMitigationPercent,
     computeMaxBlock,
@@ -257,14 +258,17 @@ function canMergeStacks(inv, uidA, uidB, itemDb) {
     return stackRoom(b) > 0;
 }
 
-function mergeStacks(inv, sourceUid, destUid, itemDb) {
+function mergeStacks(inv, sourceUid, destUid, itemDb, maxTake) {
     if (!inv || !sourceUid || !destUid || sourceUid === destUid) return false;
     const src = inv.items[sourceUid];
     const dst = inv.items[destUid];
     if (!src || !dst) return false;
     const room = stackRoom(dst);
     if (room <= 0) return false;
-    const take = Math.min(getStackCount(src), room);
+    let take = Math.min(getStackCount(src), room);
+    if (maxTake != null && Number.isFinite(Number(maxTake))) {
+        take = Math.min(take, Math.max(0, Math.floor(Number(maxTake))));
+    }
     if (take <= 0) return false;
     setStackCount(dst, getStackCount(dst) + take);
     const left = getStackCount(src) - take;
@@ -487,8 +491,121 @@ function prepareRightHandForLeftHandEquip(inv, leftItem, itemDb) {
     return { ok: true };
 }
 
-function moveItem(inv, from, to, itemDb) {
+function moveItem(inv, from, to, itemDb, amount) {
     if (!inv || !from || !to) return { ok: false, error: 'bad_args' };
+    const uidFrom = resolveLocationUid(inv, from);
+    if (!uidFrom) return { ok: false, error: 'empty_source' };
+    const src = inv.items[uidFrom];
+    if (!src) return { ok: false, error: 'unknown_item' };
+    const total = getStackCount(src);
+    const n = Math.floor(Number(amount));
+    const partial = Number.isFinite(n) && n >= 1 && n < total;
+    if (partial) {
+        const item = findItem(itemDb, src.itemId);
+        if (itemIsStackable(item)) return moveItemAmount(inv, from, to, n, itemDb);
+    }
+    return moveItemWhole(inv, from, to, itemDb);
+}
+
+function moveItemAmount(inv, from, to, amount, itemDb) {
+    const uidFrom = resolveLocationUid(inv, from);
+    if (!uidFrom) return { ok: false, error: 'empty_source' };
+    const src = inv.items[uidFrom];
+    if (!src) return { ok: false, error: 'unknown_item' };
+    if (locationsEqual(from, to)) return { ok: true };
+
+    const n = Math.max(1, Math.floor(Number(amount)));
+    const uidTo = resolveLocationUid(inv, to);
+
+    if (to.kind === 'container' && uidTo && inv.containers[uidTo]) {
+        if (uidFrom === uidTo) return { ok: false, error: 'cycle' };
+        if (inv.containers[uidFrom] && isInsideSubtree(inv, uidTo, uidFrom)) {
+            return { ok: false, error: 'cycle' };
+        }
+        const existing = findStackInContainer(inv, uidTo, src.itemId, uidFrom);
+        if (existing && canMergeStacks(inv, uidFrom, existing, itemDb)) {
+            const dest = inv.items[existing];
+            const destIndex = dest && dest.location && dest.location.kind === 'container'
+                ? dest.location.index
+                : 0;
+            return moveItemAmount(
+                inv,
+                from,
+                { kind: 'container', containerUid: uidTo, index: destIndex },
+                n,
+                itemDb
+            );
+        }
+        const free = firstFreeSlot(inv.containers[uidTo]);
+        if (free < 0) return { ok: false, error: 'full' };
+        return moveItemAmount(
+            inv,
+            from,
+            { kind: 'container', containerUid: uidTo, index: free },
+            n,
+            itemDb
+        );
+    }
+
+    if (uidTo && canMergeStacks(inv, uidFrom, uidTo, itemDb)) {
+        mergeStacks(inv, uidFrom, uidTo, itemDb, n);
+        recomputeTotalWeight(inv, itemDb);
+        return { ok: true, merged: true };
+    }
+
+    if (to.kind === 'equipment') {
+        const item = findItem(itemDb, src.itemId);
+        if (item && !canEquipInSlot(item, to.slot)) return { ok: false, error: 'wrong_slot' };
+        if (uidTo) return { ok: false, error: 'occupied' };
+    }
+
+    if (to.kind === 'container') {
+        const cont = inv.containers[to.containerUid];
+        if (!cont) return { ok: false, error: 'unknown_container' };
+        if (to.index < 0 || to.index >= cont.capacity) return { ok: false, error: 'invalid_index' };
+        if (uidTo) return { ok: false, error: 'occupied' };
+        if (inv.containers[uidFrom] && isInsideSubtree(inv, to.containerUid, uidFrom)) {
+            return { ok: false, error: 'cycle' };
+        }
+    }
+
+    const prevCount = getStackCount(src);
+    setStackCount(src, prevCount - n);
+    let splitUid;
+    try {
+        splitUid = createItemInstance(inv, src.itemId, itemDb, { count: n });
+    } catch (e) {
+        setStackCount(src, prevCount);
+        return { ok: false, error: 'split_failed' };
+    }
+    const splitInst = inv.items[splitUid];
+    if (!splitInst) {
+        setStackCount(src, prevCount);
+        return { ok: false, error: 'split_failed' };
+    }
+    splitInst.location = null;
+
+    let placeResult;
+    if (to.kind === 'equipment') {
+        placeResult = placeInEquipment(inv, splitUid, to.slot, itemDb);
+    } else {
+        placeResult = placeInContainer(inv, splitUid, to.containerUid, to.index, itemDb);
+    }
+    if (!placeResult || !placeResult.ok) {
+        if (inv.items[splitUid]) destroyItem(inv, splitUid, itemDb);
+        setStackCount(src, prevCount);
+        recomputeTotalWeight(inv, itemDb);
+        return { ok: false, error: (placeResult && placeResult.error) || 'place_failed' };
+    }
+    recomputeTotalWeight(inv, itemDb);
+    return {
+        ok: true,
+        splitUid: inv.items[splitUid] ? splitUid : undefined,
+        merged: !!placeResult.merged
+    };
+}
+
+function moveItemWhole(inv, from, to, itemDb) {
     const uidFrom = resolveLocationUid(inv, from);
     if (!uidFrom) return { ok: false, error: 'empty_source' };
     if (locationsEqual(from, to)) return { ok: true };
@@ -1580,10 +1697,12 @@ function equipmentView(inv, itemDb) {
         if (!uid) continue;
         const inst = inv.items[uid];
         if (!inst) continue;
+        const item = findItem(itemDb, inst.itemId);
         slots.push({
             slot: engineSlotToDesigner(keys[i]),
             id: inst.itemId,
-            count: getStackCount(inst)
+            count: getStackCount(inst),
+            flags: (inv.containers[uid] || itemIsContainer(item)) ? 1 : 0
         });
     }
     return slots;
@@ -1602,6 +1721,36 @@ function ownsContainer(inv, containerUid) {
     if (!inv || !containerUid) return false;
     if (containerUid === inv.rootUid || containerUid === ROOT_UID) return !!inv.containers[containerUid];
     return !!(inv.containers[containerUid] && inv.items[containerUid]);
+}
+
+function ensurePlayerContainer(inv, uid, itemDb) {
+    if (!inv || !uid) return null;
+    if (inv.containers[uid]) return inv.containers[uid];
+    const inst = inv.items[uid];
+    if (!inst) return null;
+    const item = findItem(itemDb, inst.itemId);
+    if (!itemIsContainer(item)) return null;
+    const cap = Math.max(0, containerCapacity(item, itemDb) | 0);
+    inv.containers[uid] = { capacity: cap, slots: emptySlots(cap), isRoot: false };
+    return inv.containers[uid];
+}
+
+function resolveOpenBagUid(inv, containerId, index) {
+    if (!inv) return null;
+    const id = containerId != null ? String(containerId) : '';
+    if (!id) return null;
+    if (ownsContainer(inv, id)) {
+        return resolveLocationUid(inv, {
+            kind: 'container',
+            containerUid: id,
+            index: index | 0
+        });
+    }
+    const slot = designerSlotToEngine(id);
+    if (slot && inv.equipment && inv.equipment[slot]) {
+        return inv.equipment[slot];
+    }
+    return null;
 }
 
 const STARTER_SLOT_ORDER = Object.freeze([
@@ -1765,6 +1914,7 @@ module.exports = {
     applyPlayerLoadout,
     serializeInventory,
     serializeItemInstance,
+    cloneInventory,
     seedInstanceBudgets,
     copyInstanceBudgets,
     normalizeInventory,
@@ -1772,6 +1922,8 @@ module.exports = {
     equipmentView,
     playerCap,
     ownsContainer,
+    ensurePlayerContainer,
+    resolveOpenBagUid,
     itemIsMagicWeapon,
     applyStarterLoadout,
     buildStarterInventory,

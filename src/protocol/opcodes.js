@@ -28,7 +28,8 @@ const C2S = Object.freeze({
     UNEQUIP: 41,
     MOVE_ITEM: 42,
     USE_ITEM: 43,
-    OPEN_BAG: 44
+    OPEN_BAG: 44,
+    CLOSE_BAG: 45
 });
 
 const S2C = Object.freeze({
@@ -61,8 +62,10 @@ const S2C = Object.freeze({
     DIALOG_CLOSE: 131,
     SHOP: 132,
     FIELD: 133,
-    FIELD_GONE: 134
+    FIELD_GONE: 134,
     // 135 unused (was HOTKEYS; bars are client IndexedDB)
+    GROUND: 136,
+    GROUND_GONE: 137
 });
 
 const REASON = Object.freeze({
@@ -97,8 +100,12 @@ const INV_FLAG = Object.freeze({
 
 const LOC_KIND = Object.freeze({
     CONTAINER: 0,
-    EQUIPMENT: 1
+    EQUIPMENT: 1,
+    TILE: 2
 });
+
+/** OPEN_BAG index that names the container uid itself (canvas ground bag). */
+const OPEN_BAG_SELF_INDEX = 255;
 
 /** Wire order for S2C.SKILLS (u16 each). Persist column names. */
 const SKILL_ORDER = Object.freeze([
@@ -192,7 +199,8 @@ const C2S_ENTERED = new Set([
     C2S.UNEQUIP,
     C2S.MOVE_ITEM,
     C2S.USE_ITEM,
-    C2S.OPEN_BAG
+    C2S.OPEN_BAG,
+    C2S.CLOSE_BAG
 ]);
 
 const C2S_DOWNED = new Set([C2S.PING, C2S.LOGOUT]);
@@ -211,6 +219,7 @@ module.exports = {
     APPEAR_FLAG,
     INV_FLAG,
     LOC_KIND,
+    OPEN_BAG_SELF_INDEX,
     SKILL_ORDER,
     SWING_FLAG,
     SWING_ELEMENT,

@@ -413,6 +413,27 @@ class MysqlStore {
         };
     }
 
+    async loadWorldGround() {
+        const [rows] = await this.pool.query(
+            'SELECT ground FROM world_state WHERE id = 1 LIMIT 1'
+        );
+        const row = rows[0];
+        if (!row) return null;
+        return asJson(row.ground, null);
+    }
+
+    async saveWorldGround(blob) {
+        const payload = JSON.stringify(blob != null ? blob : {
+            version: 1, nextUid: 1, items: {}, containers: {}, stacks: {}
+        });
+        await this.pool.query(
+            `INSERT INTO world_state (id, ground) VALUES (1, ?)
+             ON DUPLICATE KEY UPDATE ground = VALUES(ground)`,
+            [payload]
+        );
+        return true;
+    }
+
     async saveCharacter(id, snap) {
         if (!snap) return false;
         const conn = await this.pool.getConnection();

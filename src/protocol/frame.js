@@ -363,7 +363,7 @@ function measureFramePayload(opcode, buf, off = 0) {
             for (let i = 0; i < n; i++) {
                 if (readStr() == null) return -1;
                 if (readStr() == null) return -1;
-                if (!need(2)) return -1; o += 2;
+                if (!need(3)) return -1; o += 3;
             }
             return o - off;
         }
@@ -408,6 +408,20 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (readStr() == null) return -1;
             if (need(1)) o += 1;
             if (need(4)) o += 4;
+            return o - off;
+        }
+        case S2C.GROUND: {
+            if (!need(5)) return -1; o += 5;
+            if (!need(1)) return -1; o += 1;
+            if (readStr() == null) return -1;
+            if (readStr() == null) return -1;
+            if (!need(2)) return -1; o += 2;
+            if (need(1)) o += 1;
+            return o - off;
+        }
+        case S2C.GROUND_GONE: {
+            if (readStr() == null) return -1;
+            if (need(5)) o += 5;
             return o - off;
         }
         case S2C.EXP: {

@@ -98,6 +98,7 @@ class GameSession {
         this.storage = Object.create(null);
         this.openCorpseId = 0;
         this.openBagUid = '';
+        this.openBagUids = [];
         this.talkNpcId = 0;
         this.talkNodeId = '';
         this.shopOpen = false;
@@ -191,6 +192,7 @@ class GameSession {
         this.storage = cloneStorage(state && state.storage);
         this.openCorpseId = 0;
         this.openBagUid = '';
+        this.openBagUids = [];
         this.talkNpcId = 0;
         this.talkNodeId = '';
         this.shopOpen = false;
