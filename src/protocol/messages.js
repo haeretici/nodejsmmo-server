@@ -1,7 +1,7 @@
 'use strict';
 
 const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND, INV_FLAG, swingElementId } = require('./opcodes');
-const { FastWriter, Writer, Reader, clampU16 } = require('./frame');
+const { FastWriter, Writer, Reader, clampU16, clampU32 } = require('./frame');
 
 function wrap(fn, payload) {
     try {
@@ -106,7 +106,7 @@ function decodeMovePath(payload) {
         const dirs = [];
         for (let i = 0; i < n; i++) {
             const d = p[1 + i];
-            if (d > 3) {
+            if (d > 7) {
                 throw new Error('bad move path');
             }
             dirs.push(d);
@@ -232,11 +232,11 @@ function encodeEnterWorld({ character, x, y, z, viewport }) {
     w.str(character.name);
     w.str(character.vocation);
     w.u16(character.level);
-    w.u32(Math.min(0xffffffff, Number(character.experience) || 0));
-    w.u16(clampU16(character.hp));
-    w.u16(clampU16(character.hpMax));
-    w.u16(clampU16(character.mp));
-    w.u16(clampU16(character.mpMax));
+    w.u64(character.experience);
+    w.u32(clampU32(character.hp));
+    w.u32(clampU32(character.hpMax));
+    w.u32(clampU32(character.mp));
+    w.u32(clampU32(character.mpMax));
     w.i16(x);
     w.i16(y);
     w.i8(z);
@@ -253,11 +253,11 @@ function decodeEnterWorld(payload) {
             name: r.str(),
             vocation: r.str(),
             level: r.u16(),
-            experience: r.u32(),
-            hp: r.u16(),
-            hpMax: r.u16(),
-            mp: r.u16(),
-            mpMax: r.u16(),
+            experience: r.u64(),
+            hp: r.u32(),
+            hpMax: r.u32(),
+            mp: r.u32(),
+            mpMax: r.u32(),
             x: r.i16(),
             y: r.i16(),
             z: r.i8(),
@@ -304,8 +304,8 @@ function encodeAppear(entity) {
         .i16(v.x)
         .i16(v.y)
         .i8(v.z)
-        .u16(clampU16(v.hp))
-        .u16(clampU16(v.hpMax))
+        .u32(clampU32(v.hp))
+        .u32(clampU32(v.hpMax))
         .u8(appearFlags(entity))
         .str(v.look || '')
         .u8(entity && entity.dir != null ? (entity.dir & 3) : 0)
@@ -321,8 +321,8 @@ function decodeAppear(payload) {
             x: r.i16(),
             y: r.i16(),
             z: r.i8(),
-            hp: r.u16(),
-            hpMax: r.u16(),
+            hp: r.u32(),
+            hpMax: r.u32(),
             flags: r.rest().length ? r.u8() : 0,
             look: r.rest().length ? r.str() : '',
             dir: r.rest().length ? r.u8() : 0
@@ -415,10 +415,10 @@ function encodeStats(entity) {
     const v = appearView(entity);
     return new FastWriter()
         .u32(v.id)
-        .u16(clampU16(v.hp))
-        .u16(clampU16(v.hpMax))
-        .u16(clampU16(mp))
-        .u16(clampU16(mpMax))
+        .u32(clampU32(v.hp))
+        .u32(clampU32(v.hpMax))
+        .u32(clampU32(mp))
+        .u32(clampU32(mpMax))
         .toBuffer();
 }
 
@@ -427,10 +427,10 @@ function decodeStats(payload) {
         const r = new Reader(p);
         return {
             id: r.u32(),
-            hp: r.u16(),
-            hpMax: r.u16(),
-            mp: r.u16(),
-            mpMax: r.u16()
+            hp: r.u32(),
+            hpMax: r.u32(),
+            mp: r.u32(),
+            mpMax: r.u32()
         };
     }, payload);
 }
@@ -552,19 +552,17 @@ function decodeItemGain(payload) {
 }
 
 function encodeExp(total, gained, level) {
-    const w = new FastWriter()
-        .u32(total >>> 0)
-        .u32(gained >>> 0);
-    if (level != null) w.u16(clampU16(level));
-    return w.toBuffer();
+    return new FastWriter()
+        .u64(total)
+        .u64(gained)
+        .u16(clampU16(level))
+        .toBuffer();
 }
 
 function decodeExp(payload) {
     return wrap((p) => {
         const r = new Reader(p);
-        const out = { experience: r.u32(), gained: r.u32() };
-        if (r.rest().length >= 2) out.level = r.u16();
-        return out;
+        return { experience: r.u64(), gained: r.u64(), level: r.u16() };
     }, payload);
 }
 
@@ -841,6 +839,65 @@ function decodeGroundGone(payload) {
     }, payload);
 }
 
+function encodeBrowseFieldTile(x, y, z) {
+    return new FastWriter().i16(x).i16(y).i8(z).toBuffer();
+}
+
+function decodeBrowseFieldTile(payload) {
+    return wrap((p) => {
+        if (!p || p.length !== 5) {
+            throw new Error('bad browse field');
+        }
+        const r = new Reader(p);
+        return { x: r.i16(), y: r.i16(), z: r.i8() };
+    }, payload);
+}
+
+function encodeBrowseField(msg) {
+    const slots = msg && Array.isArray(msg.slots) ? msg.slots : [];
+    const n = Math.min(255, slots.length);
+    const w = new FastWriter()
+        .i16(msg && msg.x)
+        .i16(msg && msg.y)
+        .i8(msg && msg.z)
+        .u8(n);
+    for (let i = 0; i < n; i++) {
+        const slot = slots[i] || {};
+        const flags = slot.flags != null
+            ? (slot.flags | 0)
+            : (slot.container ? INV_FLAG.CONTAINER : 0);
+        w.u8(slot.stackIndex | 0)
+            .str(slot.uid || '')
+            .str(slot.id || slot.itemId || '')
+            .u16(clampU16(slot.count || 0))
+            .u8(flags & 0xff);
+    }
+    return w.toBuffer();
+}
+
+function decodeBrowseField(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const out = {
+            x: r.i16(),
+            y: r.i16(),
+            z: r.i8(),
+            n: r.u8(),
+            slots: []
+        };
+        for (let i = 0; i < out.n; i++) {
+            out.slots.push({
+                stackIndex: r.u8(),
+                uid: r.str(),
+                id: r.str(),
+                count: r.u16(),
+                flags: r.u8()
+            });
+        }
+        return out;
+    }, payload);
+}
+
 function decodeMoveItem(payload) {
     return wrap((p) => {
         const r = new Reader(p);
@@ -877,6 +934,32 @@ function decodeSkills(payload) {
         const out = {};
         for (let i = 0; i < SKILL_ORDER.length; i++) {
             out[SKILL_ORDER[i]] = r.u16();
+        }
+        return out;
+    }, payload);
+}
+
+function encodeSkillProgress(source) {
+    const w = new FastWriter();
+    const bag = source && source._skillTryProgress && typeof source._skillTryProgress === 'object'
+        ? source._skillTryProgress
+        : (source || {});
+    const mana = source && source._manaTowardMagic != null
+        ? source._manaTowardMagic
+        : bag.magic;
+    for (let i = 0; i < SKILL_ORDER.length; i++) {
+        const key = SKILL_ORDER[i];
+        w.u64(key === 'magic' ? mana : bag[key]);
+    }
+    return w.toBuffer();
+}
+
+function decodeSkillProgress(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const out = {};
+        for (let i = 0; i < SKILL_ORDER.length; i++) {
+            out[SKILL_ORDER[i]] = r.u64();
         }
         return out;
     }, payload);
@@ -1181,10 +1264,16 @@ module.exports = {
     decodeGround,
     encodeGroundGone,
     decodeGroundGone,
+    encodeBrowseFieldTile,
+    decodeBrowseFieldTile,
+    encodeBrowseField,
+    decodeBrowseField,
     encodeSay,
     decodeSay,
     encodeSkills,
     decodeSkills,
+    encodeSkillProgress,
+    decodeSkillProgress,
     decodeTalk,
     decodeTalkReply,
     decodeTalkClose,

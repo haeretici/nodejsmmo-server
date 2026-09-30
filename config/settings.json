@@ -97,8 +97,7 @@
         "scout",
         "mystic",
         "adept",
-        "warden",
-        "adventurer"
+        "warden"
     ],
     "newCharacter": {
         "level": 1,

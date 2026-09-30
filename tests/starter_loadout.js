@@ -245,8 +245,13 @@ async function main() {
         assert.strictEqual(equippedId(wd.inv, 'rightHand'), 'frostbite_wand');
         assert.strictEqual(wd.session.weaponType, 'magic');
 
-        const av = await createVoc('Rook', 'adventurer');
-        assert.strictEqual(equippedId(av.inv, 'rightHand'), 'dagger');
+        const refused = await request(port, {
+            method: 'POST',
+            path: '/v1/characters',
+            cookie,
+            body: { name: 'Rook', vocation: 'adventurer' }
+        });
+        assert.strictEqual(refused.status, 422);
 
         world.rng = () => 0.5;
 

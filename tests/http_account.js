@@ -74,6 +74,14 @@ async function main() {
         });
         assert.strictEqual(badVoc.status, 422);
 
+        const adventurer = await request(port, {
+            method: 'POST',
+            path: '/v1/characters',
+            cookie,
+            body: { name: 'Rook', vocation: 'adventurer' }
+        });
+        assert.strictEqual(adventurer.status, 422);
+
         const list = await request(port, { method: 'GET', path: '/v1/characters', cookie });
         assert.strictEqual(list.status, 200);
         assert.strictEqual(list.json.characters.length, 1);

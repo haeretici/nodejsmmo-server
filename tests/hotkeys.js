@@ -9,6 +9,7 @@ const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
 const { C2S, S2C, REASON } = require('../src/protocol/opcodes');
 const { decodeFrame } = require('../src/protocol/frame');
+const { decodeSkillProgress } = require('../src/protocol/messages');
 const { snapshotSession } = require('../src/world/snapshot');
 const { createStaticMap } = require('../src/world/static_map');
 
@@ -99,7 +100,12 @@ async function main() {
     const { world, store, ch, session } = await bootMystic();
     assert.strictEqual(session.hotkeys, undefined);
     assert.ok(!Object.prototype.hasOwnProperty.call(session, 'hotkeys'));
-    assert.ok(!lastOf(session.socket, 135), 'enter does not send HOTKEYS');
+    const progFrame = lastOf(session.socket, S2C.SKILL_PROGRESS);
+    assert.ok(progFrame, 'enter sends skill progress');
+    assert.strictEqual(progFrame.payload.length, 64);
+    const prog = decodeSkillProgress(progFrame.payload);
+    assert.strictEqual(prog.fist, 0);
+    assert.strictEqual(prog.magic, 0);
 
     const snap = snapshotSession(session, {});
     assert.deepStrictEqual(snap.hotkeys, {}, 'snapshot does not copy bar JSON');

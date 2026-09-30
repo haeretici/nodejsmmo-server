@@ -6,11 +6,13 @@ const { normalizeSummonConfig, ensureSummonRuntime } = require('./summons');
 const { attachCreatureThreat, emptyThreatBag, DEFAULT_STRATEGIES } = require('./threat');
 
 function dirFromDelta(dx, dy) {
-    const adx = Math.abs(dx | 0);
-    const ady = Math.abs(dy | 0);
-    if (adx === 0 && ady === 0) return DIR.N;
-    if (adx >= ady) return (dx | 0) > 0 ? DIR.E : DIR.W;
-    return (dy | 0) > 0 ? DIR.S : DIR.N;
+    const sx = Math.sign(dx | 0);
+    const sy = Math.sign(dy | 0);
+    if (sx === 0 && sy === 0) return DIR.N;
+    if (sx === 0) return sy > 0 ? DIR.S : DIR.N;
+    if (sy === 0) return sx > 0 ? DIR.E : DIR.W;
+    if (sy < 0) return sx > 0 ? DIR.NE : DIR.NW;
+    return sx > 0 ? DIR.SE : DIR.SW;
 }
 
 function greedyOrthogonal(fromX, fromY, toX, toY) {

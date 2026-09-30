@@ -91,6 +91,13 @@ class FastWriter {
         return this;
     }
 
+    u64(v) {
+        this.ensure(8);
+        this.buf.writeBigUInt64LE(asU64(v), this.start + this.offset);
+        this.offset += 8;
+        return this;
+    }
+
     str(s) {
         const strVal = String(s == null ? '' : s);
         const byteLen = Buffer.byteLength(strVal, 'utf8');
@@ -233,6 +240,15 @@ class Reader {
         return v;
     }
 
+    u64() {
+        this.need(8);
+        const v = this.buf.readBigUInt64LE(this.o);
+        this.o += 8;
+        // Exact through level 5000. Past Number.MAX_SAFE_INTEGER the
+        // integer is no longer exact; that level is far above 5000.
+        return Number(v);
+    }
+
     str() {
         const n = this.u8();
         this.need(n);
@@ -302,8 +318,9 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (readStr() == null) return o - off;
             return o - off;
         }
-        case S2C.STATS: return rem >= 12 ? 12 : -1;
+        case S2C.STATS: return rem >= 20 ? 20 : -1;
         case S2C.SKILLS: return rem >= 16 ? 16 : -1;
+        case S2C.SKILL_PROGRESS: return rem >= 64 ? 64 : -1;
         case S2C.FIELD_GONE: return rem >= 5 ? 5 : -1;
         case S2C.SAY: {
             if (readStr() == null) return -1;
@@ -326,7 +343,8 @@ function measureFramePayload(opcode, buf, off = 0) {
         case S2C.APPEAR: {
             if (!need(4)) return -1; o += 4;
             if (readStr() == null) return -1;
-            if (!need(10)) return -1; o += 10;
+            // x i16, y i16, z i8, hp u32, hpMax u32, flags u8
+            if (!need(14)) return -1; o += 14;
             if (readStr() == null) return -1;
             if (need(1)) o += 1;
             return o - off;
@@ -424,17 +442,30 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (need(5)) o += 5;
             return o - off;
         }
-        case S2C.EXP: {
-            return rem >= 10 ? 10 : (rem >= 8 ? 8 : -1);
+        case S2C.BROWSE_FIELD: {
+            if (!need(6)) return -1;
+            o += 5;
+            const n = buf[o++];
+            for (let i = 0; i < n; i++) {
+                if (!need(1)) return -1;
+                o += 1;
+                if (readStr() == null) return -1;
+                if (readStr() == null) return -1;
+                if (!need(3)) return -1;
+                o += 3;
+            }
+            return o - off;
         }
+        case S2C.EXP: return rem >= 18 ? 18 : -1;
         case S2C.ENTER_WORLD: {
             if (!need(4)) return -1; o += 4;
             if (readStr() == null) return -1;
             if (readStr() == null) return -1;
-            if (!need(2 + 4 + 8 + 5 + 2 + 7)) return -1;
-            const w = buf[o + 26];
-            const h = buf[o + 27];
-            o += 28;
+            // level u16, experience u64, four pools u32, x y z town, viewport header
+            if (!need(2 + 8 + 16 + 7 + 7)) return -1;
+            const w = buf[o + 38];
+            const h = buf[o + 39];
+            o += 40;
             if (!need(w * h * 2)) return -1;
             o += w * h * 2;
             return o - off;
@@ -486,6 +517,31 @@ function clampU16(v) {
     return n;
 }
 
+function clampU32(v) {
+    const n = Math.floor(Number(v) || 0);
+    if (n < 0) return 0;
+    if (n > 0xffffffff) return 0xffffffff;
+    return n;
+}
+
+const U64_MAX = 0xffffffffffffffffn;
+
+function asU64(v) {
+    let n = 0n;
+    if (typeof v === 'bigint') n = v;
+    else if (typeof v === 'string' && /^-?\d+$/.test(v)) n = BigInt(v);
+    else {
+        const num = Number(v);
+        if (Number.isFinite(num) && num > 0) {
+            const floored = Math.floor(num);
+            if (Number.isSafeInteger(floored)) n = BigInt(floored);
+        }
+    }
+    if (n < 0n) return 0n;
+    if (n > U64_MAX) return U64_MAX;
+    return n;
+}
+
 module.exports = {
     FastWriter,
     Writer,
@@ -494,5 +550,6 @@ module.exports = {
     decodeFrame,
     decodeFrames,
     measureFramePayload,
-    clampU16
+    clampU16,
+    clampU32
 };

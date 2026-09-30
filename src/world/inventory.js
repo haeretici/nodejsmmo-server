@@ -491,6 +491,272 @@ function prepareRightHandForLeftHandEquip(inv, leftItem, itemDb) {
     return { ok: true };
 }
 
+function copyLocation(loc) {
+    if (!loc) return null;
+    if (loc.kind === 'equipment') return { kind: 'equipment', slot: loc.slot };
+    if (loc.kind === 'container') {
+        return { kind: 'container', containerUid: loc.containerUid, index: loc.index };
+    }
+    return null;
+}
+
+function containerOccupied(cont) {
+    if (!cont || !Array.isArray(cont.slots)) return 0;
+    let n = 0;
+    for (let i = 0; i < cont.slots.length; i++) {
+        if (cont.slots[i]) n++;
+    }
+    return n;
+}
+
+function containerHasFreeSlot(cont) {
+    if (!cont || !Array.isArray(cont.slots)) return false;
+    const occupied = containerOccupied(cont);
+    return occupied < (cont.capacity | 0) && occupied < cont.slots.length;
+}
+
+function snapshotSlots(cont) {
+    return cont && Array.isArray(cont.slots) ? cont.slots.slice() : null;
+}
+
+function restoreSlots(inv, containerUid, slots) {
+    const cont = inv.containers[containerUid];
+    if (!cont || !slots) return;
+    for (let i = 0; i < cont.slots.length; i++) {
+        const uid = i < slots.length ? slots[i] : null;
+        cont.slots[i] = uid || null;
+        if (uid && inv.items[uid]) {
+            inv.items[uid].location = { kind: 'container', containerUid, index: i };
+        }
+    }
+}
+
+function compactContainer(inv, containerUid) {
+    const cont = inv.containers[containerUid];
+    if (!cont || !Array.isArray(cont.slots)) return;
+    const packed = [];
+    for (let i = 0; i < cont.slots.length; i++) {
+        const uid = cont.slots[i];
+        if (uid && inv.items[uid]) packed.push(uid);
+    }
+    for (let i = 0; i < cont.slots.length; i++) {
+        const uid = i < packed.length ? packed[i] : null;
+        cont.slots[i] = uid;
+        if (uid) inv.items[uid].location = { kind: 'container', containerUid, index: i };
+    }
+}
+
+function insertAtFront(inv, uid, containerUid) {
+    const cont = inv.containers[containerUid];
+    const cap = cont.slots.length;
+    for (let i = cap - 1; i > 0; i--) cont.slots[i] = cont.slots[i - 1];
+    cont.slots[0] = uid;
+    for (let i = 0; i < cap; i++) {
+        const id = cont.slots[i];
+        if (id && inv.items[id]) {
+            inv.items[id].location = { kind: 'container', containerUid, index: i };
+        }
+    }
+}
+
+function findFirstPartialStack(inv, containerUid, itemId, exceptUid) {
+    const cont = inv.containers[containerUid];
+    if (!cont || !itemId) return null;
+    const id = String(itemId);
+    for (let i = 0; i < cont.slots.length; i++) {
+        const uid = cont.slots[i];
+        if (!uid || uid === exceptUid) continue;
+        const inst = inv.items[uid];
+        if (!inst || inst.itemId !== id || inv.containers[uid]) continue;
+        if (stackRoom(inst) > 0) return uid;
+    }
+    return null;
+}
+
+function stackableMove(item) {
+    return !item || itemIsStackable(item);
+}
+
+function movedUnitsFit(inv, sourceUid, destUid, count, itemDb, freesSlot) {
+    const inst = inv.items[sourceUid];
+    const cont = inv.containers[destUid];
+    if (!inst || !cont) return false;
+    const item = findItem(itemDb, inst.itemId);
+    let rest = count;
+    if (stackableMove(item)) {
+        const partial = findFirstPartialStack(inv, destUid, inst.itemId, sourceUid);
+        if (partial && canMergeStacks(inv, sourceUid, partial, itemDb)) {
+            rest -= stackRoom(inv.items[partial]);
+        }
+    }
+    if (rest <= 0) return true;
+    let occupied = containerOccupied(cont);
+    if (freesSlot) occupied -= 1;
+    return occupied < (cont.capacity | 0) && occupied < cont.slots.length;
+}
+
+function placeDetachedInContainer(inv, uid, containerUid, itemDb, exceptUid) {
+    const inst = inv.items[uid];
+    if (!inst) return { ok: true, merged: true };
+    if (inst.location) return { ok: false, error: 'still_attached' };
+    const cont = inv.containers[containerUid];
+    if (!cont) return { ok: false, error: 'unknown_container' };
+    const item = findItem(itemDb, inst.itemId);
+    const skip = exceptUid || uid;
+    const partial = stackableMove(item)
+        ? findFirstPartialStack(inv, containerUid, inst.itemId, skip)
+        : null;
+    let rest = getStackCount(inst);
+    const canMerge = !!(partial && canMergeStacks(inv, uid, partial, itemDb));
+    if (canMerge) rest -= stackRoom(inv.items[partial]);
+    if (rest > 0 && !containerHasFreeSlot(cont)) return { ok: false, error: 'full' };
+    if (canMerge) {
+        mergeStacks(inv, uid, partial, itemDb);
+        if (!inv.items[uid]) return { ok: true, merged: true, uid: partial };
+    }
+    if (!inv.items[uid]) return { ok: true, merged: true };
+    compactContainer(inv, containerUid);
+    insertAtFront(inv, uid, containerUid);
+    return { ok: true, index: 0, uid };
+}
+
+// Container destinations ignore the requested index: insert at slot 0 and
+// shift later items. A slot that holds another container is entered first.
+// Moved units merge into a different partial stack, never back into the source.
+// A same-container reorder detaches before the insert so a full container still fits.
+function resolveContainerInsertTarget(inv, uidFrom, to, itemDb) {
+    if (!inv || !uidFrom || !to) return null;
+    if (to.kind === 'equipment') {
+        const slot = canonicalEquipmentSlot(to.slot) || to.slot;
+        if (slot !== 'leftHand') return null;
+        const quiverUid = inv.equipment && inv.equipment.leftHand;
+        if (!quiverUid || !inv.containers[quiverUid]) return null;
+        const held = inv.items[quiverUid];
+        const heldItem = held && findItem(itemDb, held.itemId);
+        if (!itemIsQuiver(heldItem)) return null;
+        const moving = inv.items[uidFrom];
+        const movingItem = moving && findItem(itemDb, moving.itemId);
+        if (!itemIsAmmo(movingItem)) return null;
+        if (uidFrom === quiverUid) return { error: 'cycle' };
+        if (inv.containers[uidFrom] && isInsideSubtree(inv, quiverUid, uidFrom)) {
+            return { error: 'cycle' };
+        }
+        return { containerUid: quiverUid };
+    }
+    if (to.kind !== 'container') return null;
+    const parentUid = to.containerUid;
+    const parent = inv.containers[parentUid];
+    if (!parent) return { error: 'unknown_container' };
+    let destUid = parentUid;
+    const rawIndex = Number(to.index);
+    if (Number.isFinite(rawIndex)) {
+        const idx = Math.floor(rawIndex);
+        if (idx >= 0 && idx < parent.slots.length) {
+            const at = parent.slots[idx];
+            if (at && at !== uidFrom && inv.containers[at]) destUid = at;
+        }
+    }
+    if (uidFrom === destUid) return { error: 'cycle' };
+    if (inv.containers[uidFrom] && isInsideSubtree(inv, destUid, uidFrom)) {
+        return { error: 'cycle' };
+    }
+    const destInst = inv.items[destUid];
+    const destItem = destInst ? findItem(itemDb, destInst.itemId) : null;
+    if (itemIsQuiver(destItem)) {
+        const moving = inv.items[uidFrom];
+        const movingItem = moving && findItem(itemDb, moving.itemId);
+        if (!itemIsAmmo(movingItem)) return { error: 'only_ammo' };
+    }
+    return { containerUid: destUid };
+}
+
+function reattachItem(inv, uid, loc) {
+    const inst = inv.items[uid];
+    if (!inst || !loc) return;
+    if (loc.kind === 'equipment') {
+        const slot = canonicalEquipmentSlot(loc.slot) || loc.slot;
+        inv.equipment[slot] = uid;
+        inst.location = { kind: 'equipment', slot };
+        return;
+    }
+    if (loc.kind === 'container') {
+        const cont = inv.containers[loc.containerUid];
+        if (cont && loc.index >= 0 && loc.index < cont.slots.length && cont.slots[loc.index] == null) {
+            cont.slots[loc.index] = uid;
+        }
+        inst.location = { kind: 'container', containerUid: loc.containerUid, index: loc.index };
+    }
+}
+
+function moveWholeIntoContainer(inv, uidFrom, destUid, itemDb) {
+    const src = inv.items[uidFrom];
+    if (!src) return { ok: false, error: 'unknown_item' };
+    const loc = copyLocation(src.location);
+    const inDest = !!(loc && loc.kind === 'container' && loc.containerUid === destUid);
+    const total = getStackCount(src);
+    if (!movedUnitsFit(inv, uidFrom, destUid, total, itemDb, inDest)) {
+        return { ok: false, error: 'full' };
+    }
+    const fromCont = loc && loc.kind === 'container' ? loc.containerUid : null;
+    const snaps = Object.create(null);
+    if (fromCont && inv.containers[fromCont]) snaps[fromCont] = snapshotSlots(inv.containers[fromCont]);
+    if (destUid !== fromCont && inv.containers[destUid]) snaps[destUid] = snapshotSlots(inv.containers[destUid]);
+    detachItem(inv, uidFrom);
+    if (fromCont && fromCont !== destUid) compactContainer(inv, fromCont);
+    compactContainer(inv, destUid);
+    const placed = placeDetachedInContainer(inv, uidFrom, destUid, itemDb, uidFrom);
+    if (!placed.ok) {
+        const keys = Object.keys(snaps);
+        for (let i = 0; i < keys.length; i++) restoreSlots(inv, keys[i], snaps[keys[i]]);
+        if (inv.items[uidFrom] && !inv.items[uidFrom].location) reattachItem(inv, uidFrom, loc);
+        return { ok: false, error: placed.error || 'full' };
+    }
+    if (loc && loc.kind === 'equipment' && (canonicalEquipmentSlot(loc.slot) || loc.slot) === 'backpack') {
+        syncRootToEquippedBackpack(inv);
+    }
+    return { ok: true, merged: !!placed.merged, index: placed.index, uid: placed.uid || uidFrom };
+}
+
+function moveAmountIntoContainer(inv, uidFrom, destUid, amount, itemDb) {
+    const src = inv.items[uidFrom];
+    if (!src) return { ok: false, error: 'unknown_item' };
+    const n = Math.max(1, Math.floor(Number(amount)));
+    const prev = getStackCount(src);
+    if (n >= prev) return moveWholeIntoContainer(inv, uidFrom, destUid, itemDb);
+    if (!movedUnitsFit(inv, uidFrom, destUid, n, itemDb, false)) {
+        return { ok: false, error: 'full' };
+    }
+    const snap = snapshotSlots(inv.containers[destUid]);
+    setStackCount(src, prev - n);
+    let splitUid;
+    try {
+        splitUid = createItemInstance(inv, src.itemId, itemDb, { count: n });
+    } catch (e) {
+        setStackCount(src, prev);
+        return { ok: false, error: 'split_failed' };
+    }
+    if (!inv.items[splitUid]) {
+        setStackCount(src, prev);
+        recomputeTotalWeight(inv, itemDb);
+        return { ok: false, error: 'split_failed' };
+    }
+    inv.items[splitUid].location = null;
+    const placed = placeDetachedInContainer(inv, splitUid, destUid, itemDb, uidFrom);
+    if (!placed.ok) {
+        if (inv.items[splitUid]) destroyItem(inv, splitUid, itemDb);
+        restoreSlots(inv, destUid, snap);
+        if (inv.items[uidFrom]) setStackCount(inv.items[uidFrom], prev);
+        recomputeTotalWeight(inv, itemDb);
+        return { ok: false, error: placed.error || 'full' };
+    }
+    recomputeTotalWeight(inv, itemDb);
+    return {
+        ok: true,
+        splitUid: inv.items[splitUid] ? splitUid : undefined,
+        merged: !!placed.merged || !inv.items[splitUid]
+    };
+}
+
 function moveItem(inv, from, to, itemDb, amount) {
     if (!inv || !from || !to) return { ok: false, error: 'bad_args' };
     const uidFrom = resolveLocationUid(inv, from);
@@ -512,40 +778,17 @@ function moveItemAmount(inv, from, to, amount, itemDb) {
     if (!uidFrom) return { ok: false, error: 'empty_source' };
     const src = inv.items[uidFrom];
     if (!src) return { ok: false, error: 'unknown_item' };
+
+    const target = resolveContainerInsertTarget(inv, uidFrom, to, itemDb);
+    if (target) {
+        if (target.error) return { ok: false, error: target.error };
+        return moveAmountIntoContainer(inv, uidFrom, target.containerUid, amount, itemDb);
+    }
+    if (to.kind === 'container') return { ok: false, error: 'unknown_container' };
     if (locationsEqual(from, to)) return { ok: true };
 
     const n = Math.max(1, Math.floor(Number(amount)));
     const uidTo = resolveLocationUid(inv, to);
-
-    if (to.kind === 'container' && uidTo && inv.containers[uidTo]) {
-        if (uidFrom === uidTo) return { ok: false, error: 'cycle' };
-        if (inv.containers[uidFrom] && isInsideSubtree(inv, uidTo, uidFrom)) {
-            return { ok: false, error: 'cycle' };
-        }
-        const existing = findStackInContainer(inv, uidTo, src.itemId, uidFrom);
-        if (existing && canMergeStacks(inv, uidFrom, existing, itemDb)) {
-            const dest = inv.items[existing];
-            const destIndex = dest && dest.location && dest.location.kind === 'container'
-                ? dest.location.index
-                : 0;
-            return moveItemAmount(
-                inv,
-                from,
-                { kind: 'container', containerUid: uidTo, index: destIndex },
-                n,
-                itemDb
-            );
-        }
-        const free = firstFreeSlot(inv.containers[uidTo]);
-        if (free < 0) return { ok: false, error: 'full' };
-        return moveItemAmount(
-            inv,
-            from,
-            { kind: 'container', containerUid: uidTo, index: free },
-            n,
-            itemDb
-        );
-    }
 
     if (uidTo && canMergeStacks(inv, uidFrom, uidTo, itemDb)) {
         mergeStacks(inv, uidFrom, uidTo, itemDb, n);
@@ -557,16 +800,6 @@ function moveItemAmount(inv, from, to, amount, itemDb) {
         const item = findItem(itemDb, src.itemId);
         if (item && !canEquipInSlot(item, to.slot)) return { ok: false, error: 'wrong_slot' };
         if (uidTo) return { ok: false, error: 'occupied' };
-    }
-
-    if (to.kind === 'container') {
-        const cont = inv.containers[to.containerUid];
-        if (!cont) return { ok: false, error: 'unknown_container' };
-        if (to.index < 0 || to.index >= cont.capacity) return { ok: false, error: 'invalid_index' };
-        if (uidTo) return { ok: false, error: 'occupied' };
-        if (inv.containers[uidFrom] && isInsideSubtree(inv, to.containerUid, uidFrom)) {
-            return { ok: false, error: 'cycle' };
-        }
     }
 
     const prevCount = getStackCount(src);
@@ -608,20 +841,17 @@ function moveItemAmount(inv, from, to, amount, itemDb) {
 function moveItemWhole(inv, from, to, itemDb) {
     const uidFrom = resolveLocationUid(inv, from);
     if (!uidFrom) return { ok: false, error: 'empty_source' };
+    const target = resolveContainerInsertTarget(inv, uidFrom, to, itemDb);
+    if (target) {
+        if (target.error) return { ok: false, error: target.error };
+        return moveWholeIntoContainer(inv, uidFrom, target.containerUid, itemDb);
+    }
+    if (to.kind === 'container') return { ok: false, error: 'unknown_container' };
     if (locationsEqual(from, to)) return { ok: true };
     const uidTo = resolveLocationUid(inv, to);
     if (uidTo && canMergeStacks(inv, uidFrom, uidTo, itemDb)) {
         mergeStacks(inv, uidFrom, uidTo, itemDb);
         return { ok: true, merged: true };
-    }
-    if (to.kind === 'container' && uidTo && inv.containers[uidTo]) {
-        if (uidFrom === uidTo) return { ok: false, error: 'cycle' };
-        if (inv.containers[uidFrom] && isInsideSubtree(inv, uidTo, uidFrom)) {
-            return { ok: false, error: 'cycle' };
-        }
-        const free = firstFreeSlot(inv.containers[uidTo]);
-        if (free < 0) return { ok: false, error: 'full' };
-        return moveItem(inv, from, { kind: 'container', containerUid: uidTo, index: free }, itemDb);
     }
     if (to.kind === 'equipment') {
         const inst = inv.items[uidFrom];
@@ -640,14 +870,6 @@ function moveItemWhole(inv, from, to, itemDb) {
         const instTo = inv.items[uidTo];
         const itemTo = findItem(itemDb, instTo.itemId);
         if (itemTo && !canEquipInSlot(itemTo, from.slot)) return { ok: false, error: 'wrong_slot_swap' };
-    }
-    if (to.kind === 'container') {
-        const cont = inv.containers[to.containerUid];
-        if (!cont) return { ok: false, error: 'unknown_container' };
-        if (to.index < 0 || to.index >= cont.capacity) return { ok: false, error: 'invalid_index' };
-        if (inv.containers[uidFrom] && isInsideSubtree(inv, to.containerUid, uidFrom)) {
-            return { ok: false, error: 'cycle' };
-        }
     }
     const swapIntoNewBag = to.kind === 'equipment' &&
         from.kind === 'container' &&

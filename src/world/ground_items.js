@@ -33,6 +33,7 @@ const {
 
 const MAX_GROUND_RENDER = 10;
 const GROUND_RANGE = 1;
+const BROWSE_FIELD_MAX = 255;
 
 function tileKey(x, y, z) {
     return `${z | 0}:${x | 0}:${y | 0}`;
@@ -537,6 +538,28 @@ function slideGroundItem(opts) {
     return { ok: true, groundUid: merged.uid || uid, merged: !!merged.merged };
 }
 
+function browseFieldSlots(store, x, y, z, itemDb) {
+    const stack = getStack(store, x, y, z);
+    const start = stack.length > BROWSE_FIELD_MAX ? stack.length - BROWSE_FIELD_MAX : 0;
+    const out = [];
+    for (let i = stack.length - 1; i >= start; i--) {
+        const uid = stack[i];
+        const inst = store && store.inventory && store.inventory.items[uid];
+        if (!inst) continue;
+        out.push({
+            x: x | 0,
+            y: y | 0,
+            z: z | 0,
+            stackIndex: (stack.length - 1 - i) | 0,
+            uid,
+            id: inst.itemId,
+            count: getStackCount(inst),
+            flags: groundFlagsForUid(store, uid, itemDb)
+        });
+    }
+    return out;
+}
+
 function visibleGroundSlots(store, x, y, z) {
     const vis = getRenderableStack(store, x, y, z);
     const out = [];
@@ -785,6 +808,7 @@ function moveWithGround(opts) {
 
 module.exports = {
     MAX_GROUND_RENDER,
+    BROWSE_FIELD_MAX,
     GROUND_RANGE,
     tileKey,
     parseTileKey,
@@ -812,6 +836,7 @@ module.exports = {
     pickupFromGround,
     slideGroundItem,
     visibleGroundSlots,
+    browseFieldSlots,
     groundFlagsForUid,
     locIsPlayer,
     locIsGroundContainer,

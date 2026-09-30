@@ -9,7 +9,7 @@ const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
 const { C2S, S2C, REASON } = require('../src/protocol/opcodes');
 const { decodeFrame } = require('../src/protocol/frame');
-const { decodeExp, decodeSkills, decodeSay } = require('../src/protocol/messages');
+const { decodeExp, decodeSkills, decodeSay, decodeSkillProgress } = require('../src/protocol/messages');
 const { createStaticMap } = require('../src/world/static_map');
 const { TEMPLATES } = require('../src/world/templates');
 
@@ -212,6 +212,9 @@ async function main() {
     assert.strictEqual(hunter.level, 2);
     const skillsPkt = decodeSkills(lastOf(hunter.socket, S2C.SKILLS).payload);
     assert.strictEqual(skillsPkt.fist, 11);
+    const progPkt = decodeSkillProgress(lastOf(hunter.socket, S2C.SKILL_PROGRESS).payload);
+    assert.strictEqual(progPkt.fist, 0);
+    assert.strictEqual(progPkt.magic, 0);
     hunter.kick(REASON.LOGOUT);
     await w2.flushPersist();
     w2.stop();

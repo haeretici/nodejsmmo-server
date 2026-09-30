@@ -41,7 +41,7 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `ENTER` | 1 | token 32 B (only before enter) |
 | `PING` | 2 | `clientMs u32` |
 | `LOGOUT` | 3 | empty |
-| `MOVE_STEP` | 10 | `dir u8` N=0 E=1 S=2 W=3 — orthogonal; occupancy + `stepDelayTicks`. Clears a queued `MOVE_PATH`. Landing on `stairs`/`hole` hops. Keyboard. Extra before ready → `REJECT BUSY` |
+| `MOVE_STEP` | 10 | `dir u8` N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7. Occupancy + step delay. A diagonal step uses `moveDiagonalFactor` (default **2**) on the friction×speed delay, and is refused when both adjacent cardinal tiles are closed. Clears a queued `MOVE_PATH`. Landing on `stairs`/`hole` hops. Keyboard, including a two-key chord. Extra before ready → `REJECT BUSY` |
 | `SET_TARGET` | 11 | `id u32` (0 = clear). Auto-swing when in weapon range |
 | *(unused)* | 12 | Do not reuse. Chase is client `MOVE_PATH` |
 | `USE_STAIR` | 13 | empty. Standing on a registered pad (type-blind, including ladder). Same `stepDelayTicks`. Clears a queued `MOVE_PATH` |
@@ -49,7 +49,7 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `USE_ITEM_WITH` | 15 | `x i16 y i16 z i8` + `itemId str`. Rope/shovel Use-with. Chebyshev ≤ **1**, same `z`. Does not consume the tool |
 | `CAST` | 16 | `spellId str`, `targetId u32`, `x i16 y i16 z i8`. Server admits (P12). Bars: `../frontend/docs/03_action_bars.md` |
 | *(unused)* | 17 | Do not reuse. Bars are client IndexedDB; fire is `CAST` / `USE_ITEM` / `EQUIP` |
-| `MOVE_PATH` | 18 | `n u8` + `n × dir u8` (N=0 E=1 S=2 W=3). Click-to-walk / chase. Cap `movePathMaxSteps` **165**. `n=0` clears the queue. Replaces remaining dirs (no `BUSY` reject). This process consumes **one** dir per `moveReadyTick`, occupancy each step. Blocked → stop + `REJECT BLOCKED`. Client does **not** send a landing tile |
+| `MOVE_PATH` | 18 | `n u8` + `n × dir u8` (N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7). Click-to-walk / chase. Cap `movePathMaxSteps` **165**. `n=0` clears the queue. Replaces remaining dirs (no `BUSY` reject). This process consumes **one** dir per `moveReadyTick`, occupancy and the diagonal delay each step. Blocked → stop + `REJECT BLOCKED`. Client does **not** send a landing tile |
 | `OPEN_CORPSE` | 20 | `id u32` Chebyshev ≤ 1 |
 | `LOOT_TAKE` | 21 | `corpseId u32`, `slot u8` |
 | `LOOT_CLOSE` | 22 | `id u32` |
@@ -61,9 +61,11 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `EQUIP` | 40 | `containerId str`, `index u8`, `slot str` (empty = preferred). Designer or engine slot names |
 | `UNEQUIP` | 41 | `slot str` into backpack |
 | `MOVE_ITEM` | 42 | from loc + to loc + `count u16` (0 = all). Loc: `kind u8` 0=container (`id str` `index u8`) 1=equipment (`slot str`) 2=tile (`x i16 y i16 z i8` + `stackIndex u8`, **0 = top**). Pickup / drop / tile slide are this opcode. No `PICKUP`/`DROP` C2S |
-| `USE_ITEM` | 43 | `containerId str`, `index u8` — equip / open bag / consume (`heal` / `restoreMana` arrays, food regen, dispel, condition; empty-effect `usable` still consume) |
+| `USE_ITEM` | 43 | `containerId str`, `index u8` — equip / open bag / consume (`heal` / `restoreMana` arrays, food regen, dispel, condition; empty-effect `usable` still consume). Index **255** names a ground uid and uses that tile item in place (open a container, spend a consumable on the tile, equip onto the paperdoll, or cast a rune from the tile). Chebyshev ≤ **1**, same `z`. The server does not path |
 | `OPEN_BAG` | 44 | `containerId str`, `index u8`. Nested bag: parent uid + slot `0–254`. Equipped container: designer slot name (`shield`, `backpack`, …) + index 0. Ground bag from canvas: GROUND uid + index **255** (open that uid). Ground nested: parent ground uid + slot |
 | `CLOSE_BAG` | 45 | `containerId str` (instance uid). Empty string closes all open bags |
+| `BROWSE_FIELD` | 46 | `x i16 y i16 z i8`. In range (Chebyshev ≤ 1, same `z`) the server watches that tile and answers with S2C `BROWSE_FIELD`. Farther, or another floor: `REJECT` `OUT_OF_RANGE` and no snapshot. The server does not path |
+| `BROWSE_FIELD_CLOSE` | 47 | same tile. Drops that session’s watch. No snapshot |
 
 | S2C | id | Payload |
 | :--- | ---: | :--- |
@@ -73,17 +75,17 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `REJECT` | 103 | `refSeq u32`, `reason u8` |
 | `PONG` | 104 | `clientMs u32`, `serverMs u32`, `tickIndex u32` |
 | `VIEWPORT` | 110 | same tile window as `ENTER_WORLD` (sent to mover after a step) |
-| `APPEAR` | 111 | `id u32`, name, `x i16 y i16 z i8`, `hp u16 hpMax u16`, `flags u8`, `look str` (creature kind or vocation), extra `dir u8` (N=0 E=1 S=2 W=3). Extra bytes ignored |
+| `APPEAR` | 111 | `id u32`, name, `x i16 y i16 z i8`, `hp u32 hpMax u32`, `flags u8`, `look str` (creature kind or vocation), extra `dir u8` (N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7). Extra bytes ignored |
 | `DISAPPEAR` | 112 | `id u32` |
-| `MOVE` | 113 | `id u32`, `x i16 y i16 z i8`, `dir u8` |
-| `STATS` | 114 | `id u32`, hp/mp u16×4 |
+| `MOVE` | 113 | `id u32`, `x i16 y i16 z i8`, `dir u8` (N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7) |
+| `STATS` | 114 | `id u32`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`. Fixed 20 bytes |
 | `SWING` | 115 | `sourceId u32`, `targetId u32`, `amount u16`, `flags u8` (1=miss, 2=death, 4=crit, 8=fatal), extra `element u8` + `weaponId str` + `ammoId str`. Extra bytes ignored |
 | `DEATH` | 116 | `id u32`, `killerId u32` |
 | `CORPSE` | 117 | `id u32`, `x i16 y i16 z i8`, name |
 | `CORPSE_GONE` | 118 | `id u32` |
 | `CONTAINER` | 119 | `id u32`, `n u8`, then n× (`id str`, `count u16`) |
 | `ITEM_GAIN` | 120 | `id str`, `count u16` |
-| `EXP` | 121 | `experience u32`, `gained u32`, optional `level u16` (extra bytes ignored) |
+| `EXP` | 121 | `experience u64`, `gained u64`, `level u16`. Fixed 18 bytes |
 | `INVENTORY` | 122 | backpack: `containerId str`, `capacity u8`, `n u8`, n× (`index u8`, `id str`, `count u16`, `flags u8`). Flag 1 = nested container |
 | `SAY` | 123 | `text str` (fail / system), extra `speakerId u32` (0 = system) + `yell u8`. Extra bytes ignored |
 | `SKILLS` | 124 | 8× `u16`: fist, club, sword, axe, distance, shielding, magic, fishing. Sent on enter and skill level-up. Extra bytes ignored |
@@ -97,11 +99,12 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `SHOP` | 132 | `npcId u32`, `currency str`, `n u8`, n× (`id str`, `buy u16`, `sell u16`) |
 | `FIELD` | 133 | `x i16 y i16 z i8`, `kind str`, `flags u8`, extra `createdTick u32` (logic tick at plant). Extra bytes ignored |
 | `FIELD_GONE` | 134 | `x i16 y i16 z i8` |
-| *(unused)* | 135 | Do not reuse. Bars are client IndexedDB |
+| `SKILL_PROGRESS` | 135 | 8× `u64` in the `SKILLS` order. Magic is mana already counted toward the next magic level. The other slots are tries toward the next skill level. Fixed 64 bytes. Sent on enter and whenever a counter changes |
 | `GROUND` | 136 | one visible stack slot: `x i16 y i16 z i8`, `stackIndex u8` (0 = top), `uid str`, `id str`, `count u16`, `flags u8` (flag 1 = container). Viewport AOI. Cap **N ≤ 10** from the top; extras stay on the server. No nested guts |
 | `GROUND_GONE` | 137 | `uid str`, extra `x i16 y i16 z i8` ignored |
+| `BROWSE_FIELD` | 138 | `x i16 y i16 z i8`, `n u8`, then n× (`stackIndex u8`, `uid str`, `id str`, `count u16`, `flags u8`). Flag 1 = container. Full ground pile, top first, `stackIndex` **0 = top**, capped at **255**. No nested guts. `n = 0` means that tile’s pile is empty |
 
-`ENTER_WORLD`: `id u32`, name, vocation, `level u16`, `experience u32`, hp/mp u16×4, `x i16 y i16 z i8`, `townId u16`, then viewport: `originX i16 originY i16 z i8 w u8 h u8 tiles u16[w*h]`. Viewport `z` is the player floor. `tiles` are friction-derived debug ids (`0` void, `1` walk, `3` wall, `4` water, `5` town) — not visual stamps. Strings: `u8 len` + UTF-8.
+`ENTER_WORLD`: `id u32`, name, vocation, `level u16`, `experience u64`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`, `x i16 y i16 z i8`, `townId u16`, then viewport: `originX i16 originY i16 z i8 w u8 h u8 tiles u16[w*h]`. Viewport `z` is the player floor. `tiles` are friction-derived debug ids (`0` void, `1` walk, `3` wall, `4` water, `5` town) — not visual stamps. Strings: `u8 len` + UTF-8. Experience and the four pools are wide enough for level 5000. Swing damage, capacity, and item counts stay u16.
 
 ## Admit
 
@@ -123,7 +126,7 @@ Packet flood → kick `RATE_LIMITED`. Close code = `4000 + reason`. Clients MUST
 
 `BAD_FRAME=1` `BAD_TOKEN=2` `UNAUTHORIZED=5` `WORLD_FULL=6` `ALREADY_ONLINE=7` `RATE_LIMITED=8` `UNKNOWN_OPCODE=9` `NOT_IMPLEMENTED=10` `NOT_ENTERED=11` `TIMEOUT=12` `IP_MISMATCH=13` `BANNED=14` `REPLACED=15` `LOGOUT=16` `BAD_SEQ=17` `BLOCKED=18` `BUSY=19` `NO_TARGET=20` `OUT_OF_RANGE=21`
 
-`BLOCKED` = dest not walkable / occupancy deny / bad dir / `MOVE_PATH` over cap / PvP-off player target / talkable NPC target / stair dest deny. Mid-path occupancy fail stops the queue and `REJECT`s the path seq. `BUSY` = `MOVE_STEP` / `USE_STAIR` before `stepDelayTicks`, or non-`PING`/`LOGOUT` while downed. `MOVE_PATH` while not ready **replaces** the queue and waits. `NO_TARGET=20` unknown / empty slot / bad reply index / `USE_STAIR` with no pad. `OUT_OF_RANGE=21` corpse farther than Chebyshev 1, NPC farther than **3**, or `USE` / `USE_ITEM_WITH` / `MOVE_ITEM` tile loc / `OPEN_BAG` of a ground uid farther than Chebyshev **1** (same `z`). Do not renumber existing codes.
+`BLOCKED` = dest not walkable / occupancy deny / bad dir / `MOVE_PATH` over cap / PvP-off player target / talkable NPC target / stair dest deny. Mid-path occupancy fail stops the queue and `REJECT`s the path seq. `BUSY` = `MOVE_STEP` / `USE_STAIR` before `stepDelayTicks`, or non-`PING`/`LOGOUT` while downed. `MOVE_PATH` while not ready **replaces** the queue and waits. `NO_TARGET=20` unknown / empty slot / bad reply index / `USE_STAIR` with no pad. `OUT_OF_RANGE=21` corpse farther than Chebyshev 1, NPC farther than **3**, or `USE` / `USE_ITEM_WITH` / `MOVE_ITEM` tile loc / `OPEN_BAG` of a ground uid / `USE_ITEM` of a ground uid / `BROWSE_FIELD` farther than Chebyshev **1** (same `z`). Do not renumber existing codes.
 
 `APPEAR` ends with `flags u8` (`1` = NPC) then `look str` (catalog / vocation id for sprites) then extra `dir u8`. Extra bytes after older fields stay backward compatible. The game process still does **not** send visual stamps.
 
@@ -144,6 +147,10 @@ S6 frontend (`../frontend`) uses this pipe. Do not add WebTransport. Play token 
 
 P18 bars fire `CAST` **16** / `USE_ITEM` / `EQUIP` only. No hotkeys JSON on the socket. Contract: `../frontend/docs/03_action_bars.md`.
 
+## Container moves
+
+A container destination index is ignored. The server inserts the item at slot 0 and shifts later items up so occupied slots stay a prefix. A destination slot that holds a container enters that container. Equipment slots and map tiles keep their own locs. `count u16` stays **0 = all**, `n` = split n.
+
 ## Ground items (player-dropped stacks)
 
 Fifth surface next to bags (`MOVE_ITEM` / `OPEN_BAG` / `BAG`), authored pins (`WORLD_PIN` / `USE` / `CONTAINER`), corpses (`CORPSE` / `OPEN_CORPSE` / `LOOT_TAKE`), terrain (`VIEWPORT`), and fields (`FIELD`). Do **not** stuff drops into `VIEWPORT.tiles` or `WORLD_PIN`. Corpses and world-pin crates stay their own packets.
@@ -161,3 +168,5 @@ Fifth surface next to bags (`MOVE_ITEM` / `OPEN_BAG` / `BAG`), authored pins (`W
 **Walk-away close (Q7.6 A):** after each accepted `MOVE_STEP` / `MOVE_PATH` dir (and when the bag slides/is taken), if the **ground root** tile is Chebyshev > 1 or different `z`, forget that uid and send `BAG` capacity 0. Nested open bags of that root close with it. Backpack / equipped quiver stay. `#loot-panel` (`openCorpseId` / crate) uses the same range: clear the id and send empty `CONTAINER` so take cannot succeed from 2 sqm. Authority on the server — the client does not distance-poll and must not echo `CLOSE_BAG` for a uid the server already forgot.
 
 **Persist:** world ground blob (`saveWorldGround` / `loadWorldGround`), not the dropper’s character row. Restart must not delete floor items and must not duplicate them back into the backpack. Character snapshot after a drop must not still hold that uid.
+
+**Browse field:** `BROWSE_FIELD` **46** asks for one tile. The answer is S2C `BROWSE_FIELD` **138**, the whole `GroundStore` pile top-first (not the draw cap of 10). Corpses, world pins, and fields stay on their own packets and are not in this list. While the session is within Chebyshev 1 of that tile, a ground change there pushes a fresh snapshot (the whole list, not a delta). `BROWSE_FIELD_CLOSE` **47**, logout, `n = 0`, or the player leaving that range drops the watch. Stepping back into range does not push until the client sends `BROWSE_FIELD` again. Opcode **17** stays unused. Pickup, map-tile drop, and `OPEN_BAG` stay on their current opcodes. Use of a listed ground item is `USE_ITEM` with that uid and index **255** (same range, no path). A rope or shovel on an adjacent tile also satisfies `USE_ITEM_WITH` when the backpack does not hold that tool.

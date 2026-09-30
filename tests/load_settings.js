@@ -49,6 +49,7 @@ function main() {
     assert.strictEqual(committed.mysql.host, '127.0.0.1');
     assert.ok(!committed.mysql.password);
     assert.ok(committed.vocations.includes('adept'));
+    assert.ok(!committed.vocations.includes('adventurer'));
     assert.strictEqual(committed.stepDelayTicks, 4);
     assert.strictEqual(committed.playerBaseSpeed, 110);
     assert.strictEqual(committed.aiCreaturePathMaxDistance, 12);

@@ -5,6 +5,7 @@ const {
     getExpForLevel,
     expToNext,
     levelFromExp,
+    EXP_LEVEL_CACHE_MAX,
     getReqSkillTries,
     totalSkillTries,
     getReqMana,
@@ -24,6 +25,9 @@ const {
 } = require('../src/world/progression');
 
 function main() {
+    assert.strictEqual(EXP_LEVEL_CACHE_MAX, 5000);
+    assert.strictEqual(getExpForLevel(5000), 2080834749800);
+    assert.strictEqual(levelFromExp(2080834749800), 5000);
     assert.strictEqual(getExpForLevel(1), 0);
     assert.strictEqual(getExpForLevel(2), 100);
     assert.strictEqual(getExpForLevel(50), 1847300);

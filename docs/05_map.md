@@ -37,7 +37,7 @@ Hybrid like the lab TileMap: `occupancy` is **0** or **first** combatant id (`In
 | `playerBaseSpeed` | **110** fallback. Live player speed is class `baseSpeed` + (level−1) + gear.speed + class `speedBonus` (`applyPlayerLoadout`). Kit `speed` on creatures |
 | `stepDelayTicks` | **4** — tests only when `fixedStepDelay` |
 | `creatureStepDelayTicks` | **5** — tests only when `fixedStepDelay` |
-| Live delay | friction×speed tables (`movement.js`). Friction 100 + speed 110 → **0.4 s** = **8** ticks at 20 UPS. Diagonal `×2`. Extra `MOVE_STEP` / `USE_STAIR` before ready → `REJECT BUSY`. `MOVE_PATH` replaces the dir queue and waits. `/play` and `/debug` ignore OS key-repeat (200 ms auto-repeat) |
+| Live delay | friction×speed tables (`movement.js`). Friction 100 + speed 110 → **0.4 s** = **8** ticks at 20 UPS. Diagonal `× moveDiagonalFactor` (**2**, so **0.8 s** = **16** ticks) on `MOVE_STEP`, `MOVE_PATH`, and creature steps. Player dirs N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7. A diagonal is refused when both adjacent cardinal tiles are closed. Extra `MOVE_STEP` / `USE_STAIR` before ready → `REJECT BUSY`. `MOVE_PATH` replaces the dir queue and waits. `/play` and `/debug` ignore OS key-repeat (200 ms auto-repeat; the client waits twice as long after a diagonal step) |
 | `movePathMaxSteps` | **165** (`MOVE_PATH` n cap; viewport 15×11) |
 | `pathMaxDistance` | **100** (creature return-home) |
 | `pathMaxIterations` | **512** |

@@ -29,7 +29,9 @@ const C2S = Object.freeze({
     MOVE_ITEM: 42,
     USE_ITEM: 43,
     OPEN_BAG: 44,
-    CLOSE_BAG: 45
+    CLOSE_BAG: 45,
+    BROWSE_FIELD: 46,
+    BROWSE_FIELD_CLOSE: 47
 });
 
 const S2C = Object.freeze({
@@ -63,9 +65,10 @@ const S2C = Object.freeze({
     SHOP: 132,
     FIELD: 133,
     FIELD_GONE: 134,
-    // 135 unused (was HOTKEYS; bars are client IndexedDB)
+    SKILL_PROGRESS: 135,
     GROUND: 136,
-    GROUND_GONE: 137
+    GROUND_GONE: 137,
+    BROWSE_FIELD: 138
 });
 
 const REASON = Object.freeze({
@@ -167,14 +170,22 @@ const DIR = Object.freeze({
     N: 0,
     E: 1,
     S: 2,
-    W: 3
+    W: 3,
+    SW: 4,
+    SE: 5,
+    NW: 6,
+    NE: 7
 });
 
 const DIR_DELTA = Object.freeze([
     Object.freeze({ dx: 0, dy: -1 }),
     Object.freeze({ dx: 1, dy: 0 }),
     Object.freeze({ dx: 0, dy: 1 }),
-    Object.freeze({ dx: -1, dy: 0 })
+    Object.freeze({ dx: -1, dy: 0 }),
+    Object.freeze({ dx: -1, dy: 1 }),
+    Object.freeze({ dx: 1, dy: 1 }),
+    Object.freeze({ dx: -1, dy: -1 }),
+    Object.freeze({ dx: 1, dy: -1 })
 ]);
 
 const C2S_ENTERED = new Set([
@@ -200,7 +211,9 @@ const C2S_ENTERED = new Set([
     C2S.MOVE_ITEM,
     C2S.USE_ITEM,
     C2S.OPEN_BAG,
-    C2S.CLOSE_BAG
+    C2S.CLOSE_BAG,
+    C2S.BROWSE_FIELD,
+    C2S.BROWSE_FIELD_CLOSE
 ]);
 
 const C2S_DOWNED = new Set([C2S.PING, C2S.LOGOUT]);

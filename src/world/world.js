@@ -21,6 +21,7 @@ const {
     encodeEquipment,
     encodeSay,
     encodeSkills,
+    encodeSkillProgress,
     encodeDialog,
     encodeDialogClose,
     encodeShop,
@@ -50,7 +51,9 @@ const {
     decodeUnequip,
     decodeMoveItem,
     decodeContainerSlot,
-    decodeCloseBag
+    decodeCloseBag,
+    decodeBrowseFieldTile,
+    encodeBrowseField
 } = require('../protocol/messages');
 const { createStaticMap, viewport, viewportWindow, inViewport, clampSpawn } = require('./static_map');
 const { fromStaticMap } = require('./tilemap');
@@ -87,7 +90,7 @@ const {
 } = require('./combat');
 const { hasLineOfSight, getAffectedTiles, cardinalDirection } = require('./shapes');
 const { rollLoot } = require('./loot');
-const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, itemIsUsable, designerSlotToEngine } = require('./items');
+const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, itemIsUsable, designerSlotToEngine, preferredEquipSlot } = require('./items');
 const { resolveItemUseEffect, applyItemUseEffect } = require('./item_use');
 const {
     takeItem,
@@ -265,17 +268,41 @@ const {
     parseTileKey,
     listGroundTiles,
     visibleGroundSlots,
+    browseFieldSlots,
     groundRootLocation,
     inGroundRange,
     moveWithGround,
     locIsGroundContainer,
     isGroundStoreItem,
-    subtreeContainerUids
+    subtreeContainerUids,
+    getStack,
+    removeFromTileStack,
+    pickupFromGround
 } = require('./ground_items');
 
 const CREATURE_ID_BASE = 1000000000;
 const CORPSE_ID_BASE = 2000000000;
 const LOGOUT_PERSIST = 'logout';
+
+/**
+ * Relaxed corner rule from dungeon-engine pathfinding: a diagonal step is
+ * refused only when both adjacent cardinal tiles are inside the map and closed.
+ * One open side still allows the step. A side outside the map does not count.
+ */
+function diagonalSidesClosed(tileMap, x, y, z, dx, dy, entity) {
+    if (!tileMap || !dx || !dy) return false;
+    const layer = tileMap.getLayer(z);
+    if (!layer) return false;
+    const ax = (x | 0) + dx;
+    const ay = y | 0;
+    const bx = x | 0;
+    const by = (y | 0) + dy;
+    function inside(px, py) {
+        return px >= 0 && py >= 0 && px < layer.cols && py < layer.rows;
+    }
+    if (!inside(ax, ay) || !inside(bx, by)) return false;
+    return !tileMap.canEnter(ax, ay, z, entity) && !tileMap.canEnter(bx, by, z, entity);
+}
 
 function kitAttackIsMelee(atk) {
     if (!atk) return false;
@@ -1323,6 +1350,7 @@ class World {
     leave(session) {
         if (session.left) return;
         session.left = true;
+        this.clearBrowseTiles(session);
         const ch = session.character;
         if (!ch) return;
         if (!session.downed) {
@@ -1384,6 +1412,7 @@ class World {
         this.tickSpawnPins(this.tick.tickIndex, { appear: false });
         this.sendInventory(session);
         this.sendSkills(session);
+        this.sendSkillProgress(session);
         this.sendGroundInView(session);
     }
 
@@ -1568,6 +1597,10 @@ class World {
             if (this.tileMap && typeof this.tileMap.sweepIdleFloors === 'function' && (tickIndex % this.floorSweepIntervalTicks === 0)) {
                 this.tileMap.sweepIdleFloors(this.now(), this.floorIdleTimeoutSec);
             }
+            for (const session of this.players.values()) {
+                if (session.dead) continue;
+                this.dropBrowseWatchesOutOfRange(session);
+            }
         } finally {
             this.flushOutbound();
             this._batchingOutbound = false;
@@ -1648,6 +1681,12 @@ class World {
             case C2S.CLOSE_BAG:
                 this.applyCloseBag(session, intent);
                 return;
+            case C2S.BROWSE_FIELD:
+                this.applyBrowseField(session, intent);
+                return;
+            case C2S.BROWSE_FIELD_CLOSE:
+                this.applyBrowseFieldClose(session, intent);
+                return;
             case C2S.CAST:
                 this.applyCastIntent(session, intent, tickIndex);
                 return;
@@ -1727,6 +1766,9 @@ class World {
         const nx = session.x + delta.dx;
         const ny = session.y + delta.dy;
         const nz = session.z;
+        if (diagonalSidesClosed(
+            this.tileMap, session.x, session.y, nz, delta.dx, delta.dy, session
+        )) return false;
         if (!this.tileMap.canEnter(nx, ny, nz, session)) return false;
         const from = { x: session.x, y: session.y, z: session.z };
         if (!this.tileMap.moveEntityToTile(nx, ny, nz, session)) return false;
@@ -1734,7 +1776,7 @@ class World {
         session.moveReadyTick = tickIndex + this.stepDelay(
             session,
             this.tileMap.frictionAt(session.x, session.y, session.z),
-            false
+            delta.dx !== 0 && delta.dy !== 0
         );
         session.movedThisTick = true;
         this.broadcastMove(session, from, dir);
@@ -1824,9 +1866,12 @@ class World {
         }
         const inst = this.worldPinAt(cmd.x, cmd.y, cmd.z);
         const from = { x: session.x, y: session.y, z: session.z };
+        const toolReady = countItem(session.inventory, cmd.itemId) >= 1
+            || this.groundHoldsItemInRange(session, cmd.itemId);
         const result = useWorldToolWith(session, cmd, {
             tileMap: this.tileMap,
-            inst
+            inst,
+            toolReady
         });
         if (!result.ok) {
             if (result.reason === 'too_far') {
@@ -2305,7 +2350,7 @@ class World {
         if (tickIndex < cr.moveReadyTick) return false;
         const from = { x: cr.x | 0, y: cr.y | 0, z: cr.z | 0 };
         const opts = [];
-        for (let i = 0; i < DIR_DELTA.length; i++) {
+        for (let i = 0; i < 4; i++) {
             const d = DIR_DELTA[i];
             const nx = from.x + d.dx;
             const ny = from.y + d.dy;
@@ -3359,7 +3404,7 @@ class World {
             this.sendInventory(killer);
         }
         killer.send(S2C.EXP, encodeExp(
-            Math.min(0xffffffff, Number(killer.experience) || 0),
+            Number(killer.experience) || 0,
             awarded,
             killer.level | 0
         ));
@@ -3378,24 +3423,30 @@ class World {
             blockChargeSpent: !!hit.blockChargeSpent
         });
         let reload = false;
-        if (out.weaponAdvance && out.weaponAdvance.levelsGained > 0 && attacker && attacker.type === 'player') {
-            this.sendSkills(attacker);
-            this.say(
-                attacker,
-                'Your ' + skillLabel(out.weaponAdvance.skill) + ' skill increased to ' +
-                    out.weaponAdvance.newLevel + '.'
-            );
-            reload = true;
+        if (out.weaponAdvance && out.weaponAdvance.effectiveTries > 0 && attacker && attacker.type === 'player') {
+            this.sendSkillProgress(attacker);
+            if (out.weaponAdvance.levelsGained > 0) {
+                this.sendSkills(attacker);
+                this.say(
+                    attacker,
+                    'Your ' + skillLabel(out.weaponAdvance.skill) + ' skill increased to ' +
+                        out.weaponAdvance.newLevel + '.'
+                );
+                reload = true;
+            }
         }
-        if (out.shieldAdvance && out.shieldAdvance.levelsGained > 0 && defender && defender.type === 'player') {
-            this.sendSkills(defender);
-            this.say(
-                defender,
-                'Your ' + skillLabel('shielding') + ' skill increased to ' +
-                    out.shieldAdvance.newLevel + '.'
-            );
-            applyPlayerLoadout(defender, this.itemDb());
-            this.sendInventory(defender);
+        if (out.shieldAdvance && out.shieldAdvance.effectiveTries > 0 && defender && defender.type === 'player') {
+            this.sendSkillProgress(defender);
+            if (out.shieldAdvance.levelsGained > 0) {
+                this.sendSkills(defender);
+                this.say(
+                    defender,
+                    'Your ' + skillLabel('shielding') + ' skill increased to ' +
+                        out.shieldAdvance.newLevel + '.'
+                );
+                applyPlayerLoadout(defender, this.itemDb());
+                this.sendInventory(defender);
+            }
         }
         if (reload && attacker && attacker.type === 'player') {
             applyPlayerLoadout(attacker, this.itemDb());
@@ -4031,6 +4082,7 @@ class World {
             }
         });
         this._touchGroundTile(x, y, z);
+        this.refreshBrowseWatchers(x, y, z);
     }
 
     closeContainersOutOfRange(session) {
@@ -4087,8 +4139,83 @@ class World {
         return !inGroundRange(session.x, session.y, session.z, x, y, z);
     }
 
+    ensureBrowseTiles(session) {
+        if (!session.browseTiles) session.browseTiles = Object.create(null);
+        return session.browseTiles;
+    }
+
+    clearBrowseTiles(session) {
+        if (session) session.browseTiles = Object.create(null);
+    }
+
+    forgetBrowseTile(session, x, y, z) {
+        const watched = session && session.browseTiles;
+        if (!watched) return;
+        delete watched[tileKey(x, y, z)];
+    }
+
+    dropBrowseWatchesOutOfRange(session) {
+        const watched = session && session.browseTiles;
+        if (!watched) return;
+        const keys = Object.keys(watched);
+        for (let i = 0; i < keys.length; i++) {
+            const pos = parseTileKey(keys[i]);
+            if (!pos || !inGroundRange(session.x, session.y, session.z, pos.x, pos.y, pos.z)) {
+                delete watched[keys[i]];
+            }
+        }
+    }
+
+    sendBrowseSnapshot(session, x, y, z) {
+        const slots = browseFieldSlots(this.ground, x, y, z, this.itemDb());
+        session.send(S2C.BROWSE_FIELD, encodeBrowseField({ x, y, z, slots }));
+        if (slots.length === 0) this.forgetBrowseTile(session, x, y, z);
+        return slots;
+    }
+
+    refreshBrowseWatchers(x, y, z) {
+        const key = tileKey(x, y, z);
+        for (const p of this.players.values()) {
+            if (!p || p.dead || p.left) continue;
+            if (!p.browseTiles || !p.browseTiles[key]) continue;
+            if (!inGroundRange(p.x, p.y, p.z, x, y, z)) {
+                delete p.browseTiles[key];
+                continue;
+            }
+            this.sendBrowseSnapshot(p, x, y, z);
+        }
+    }
+
+    applyBrowseField(session, intent) {
+        const tile = decodeBrowseFieldTile(intent.payload);
+        if (!tile) {
+            session.malformed();
+            return;
+        }
+        if (this.groundRangeReject(session, tile.x, tile.y, tile.z)) {
+            session.reject(intent.seq, REASON.OUT_OF_RANGE);
+            return;
+        }
+        this.ensureBrowseTiles(session)[tileKey(tile.x, tile.y, tile.z)] = true;
+        this.sendBrowseSnapshot(session, tile.x, tile.y, tile.z);
+    }
+
+    applyBrowseFieldClose(session, intent) {
+        const tile = decodeBrowseFieldTile(intent.payload);
+        if (!tile) {
+            session.malformed();
+            return;
+        }
+        this.forgetBrowseTile(session, tile.x, tile.y, tile.z);
+    }
+
     sendSkills(session) {
         session.send(S2C.SKILLS, encodeSkills(session.skills));
+    }
+
+    sendSkillProgress(session) {
+        if (!session || typeof session.send !== 'function') return;
+        session.send(S2C.SKILL_PROGRESS, encodeSkillProgress(session));
     }
 
     say(session, text) {
@@ -4607,6 +4734,10 @@ class World {
         }
         const r = moveItem(session.inventory, from, to, this.itemDb(), body.count);
         if (!r.ok) {
+            if (r.error === 'only_ammo') {
+                this.say(session, 'This quiver only holds ammunition.');
+                return;
+            }
             this.say(session, r.error === 'full' || r.error === 'no_room' || r.error === 'cycle'
                 ? 'You cannot carry that.'
                 : 'You cannot do that.');
@@ -4670,6 +4801,10 @@ class World {
             itemDb: this.itemDb()
         });
         if (!r.ok) {
+            if (r.error === 'only_ammo') {
+                this.say(session, 'This quiver only holds ammunition.');
+                return;
+            }
             if (r.error === 'equipped_backpack') {
                 this.say(session, 'You cannot drop that.');
                 return;
@@ -5017,12 +5152,19 @@ class World {
                 if (!isRuneSpell(sp)) return true;
                 const id = sp.runeItemId;
                 if (!id) return true;
+                if (this.groundLoanLive(ent, id)) return true;
                 return countItem(ent.inventory, id) >= 1;
             },
             consumeRune: (ent, sp) => {
                 if (!isRuneSpell(sp) || !runeOn) return;
                 const id = sp.runeItemId;
-                if (!id || !ent.inventory) return;
+                if (!id) return;
+                const loan = ent && ent._groundRuneLoan;
+                if (loan && String(loan.itemId) === String(id) && this.groundLoanLive(ent, id)) {
+                    this.consumeGroundStackOne(loan.uid, loan.x, loan.y, loan.z);
+                    return;
+                }
+                if (!ent.inventory) return;
                 consumeItemIdFromInventory(ent.inventory, id, 1);
                 if (ent.type === 'player') this.sendInventory(ent);
             },
@@ -5062,6 +5204,7 @@ class World {
                 skillProgression: true,
                 vocationRates: attacker.skillRates
             });
+            if (ml.mana > 0) this.sendSkillProgress(attacker);
             if (ml.levelsGained > 0) {
                 this.sendSkills(attacker);
                 this.say(attacker, 'Your magic skill increased to ' + ml.newLevel + '.');
@@ -5119,11 +5262,155 @@ class World {
         return result;
     }
 
+    groundHoldsItemInRange(session, itemId) {
+        if (!session || itemId == null || String(itemId).trim() === '') return false;
+        const want = String(itemId).trim();
+        const x = session.x | 0;
+        const y = session.y | 0;
+        const z = session.z | 0;
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+                const stack = getStack(this.ground, x + dx, y + dy, z);
+                for (let i = 0; i < stack.length; i++) {
+                    const inst = this.ground.inventory.items[stack[i]];
+                    if (inst && String(inst.itemId) === want) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    groundLoanLive(ent, itemId) {
+        const loan = ent && ent._groundRuneLoan;
+        if (!loan || itemId == null) return false;
+        if (String(loan.itemId) !== String(itemId)) return false;
+        const inst = this.ground.inventory.items[loan.uid];
+        if (!inst || String(inst.itemId) !== String(itemId)) return false;
+        const loc = inst.location;
+        if (!loc || loc.kind !== 'ground') return false;
+        return (loc.x | 0) === (loan.x | 0)
+            && (loc.y | 0) === (loan.y | 0)
+            && (loc.z | 0) === (loan.z | 0);
+    }
+
+    consumeGroundStackOne(uid, x, y, z) {
+        const itemDb = this.itemDb();
+        if (!consumeInstanceCount(this.ground.inventory, uid, 1, itemDb)) return false;
+        const gone = !this.ground.inventory.items[uid];
+        if (gone) removeFromTileStack(this.ground, uid, x, y, z);
+        this.broadcastGroundTile(x, y, z, gone ? [uid] : []);
+        return true;
+    }
+
+    applyGroundUseItem(session, intent, rawUid) {
+        const uid = rawUid != null ? String(rawUid) : '';
+        const inst = uid ? this.ground.inventory.items[uid] : null;
+        const loc = inst && inst.location;
+        if (!inst || !loc || loc.kind !== 'ground') {
+            session.reject(intent.seq, REASON.NO_TARGET);
+            return;
+        }
+        if (this.groundRangeReject(session, loc.x, loc.y, loc.z)) {
+            session.reject(intent.seq, REASON.OUT_OF_RANGE);
+            return;
+        }
+        const itemDb = this.itemDb();
+        const item = findItem(itemDb, inst.itemId);
+        if (itemIsContainer(item)) {
+            if (!ensurePlayerContainer(this.ground.inventory, uid, itemDb)) {
+                session.reject(intent.seq, REASON.NO_TARGET);
+                return;
+            }
+            const dropped = rememberOpenBag(session, uid);
+            for (let i = 0; i < dropped.length; i++) sendBagClosed(session, dropped[i]);
+            this.sendInventory(session);
+            return;
+        }
+        const effect = resolveItemUseEffect(item);
+        if (effect.known || itemIsUsable(item)) {
+            if (!this.consumeGroundStackOne(uid, loc.x, loc.y, loc.z)) {
+                this.say(session, 'You cannot use that.');
+                return;
+            }
+            applyItemUseEffect(session, effect, { rng: this.rng });
+            session.send(S2C.STATS, encodeStats(session));
+            return;
+        }
+        if (itemIsRune(item)) {
+            const spell = findSpellByRuneItem(this.spellBook, inst.itemId);
+            if (!spell) {
+                this.say(session, 'You cannot use that.');
+                return;
+            }
+            const target = this.getEntity(session.targetId);
+            session._groundRuneLoan = {
+                itemId: inst.itemId,
+                uid,
+                x: loc.x | 0,
+                y: loc.y | 0,
+                z: loc.z | 0
+            };
+            try {
+                this.runCast(session, spell, {
+                    target,
+                    aim: target
+                        ? { x: target.x, y: target.y, z: target.z }
+                        : { x: session.x, y: session.y, z: session.z },
+                    tickIndex: this._tickIndex
+                });
+            } finally {
+                session._groundRuneLoan = null;
+            }
+            return;
+        }
+        if (itemIsEquipable(item)) {
+            const r = pickupFromGround({
+                ground: this.ground,
+                playerInv: session.inventory,
+                player: session,
+                x: loc.x | 0,
+                y: loc.y | 0,
+                z: loc.z | 0,
+                uid,
+                count: 1,
+                itemDb,
+                to: { kind: 'equipment', slot: preferredEquipSlot(item) }
+            });
+            if (!r.ok) {
+                const err = r.error;
+                if (err === 'not_enough_cap' || err === 'full' || err === 'no_room') {
+                    this.say(session, 'You cannot carry that.');
+                } else if (err === 'occupied' || err === 'wrong_slot' || err === 'not_equippable') {
+                    this.say(session, 'You cannot equip that.');
+                } else {
+                    this.say(session, 'You cannot do that.');
+                }
+                return;
+            }
+            this.broadcastGroundTile(loc.x, loc.y, loc.z, [uid]);
+            this.refreshLoadout(session);
+            return;
+        }
+        this.say(session, 'You cannot use that.');
+    }
+
     applyUseItem(session, intent) {
         const body = decodeContainerSlot(intent.payload);
         if (!body) {
             session.malformed();
             return;
+        }
+        // Index 255 names the uid itself. Ground and player inventories both mint iN,
+        // so a tile item can share a string with a backpack. A ground location wins.
+        // A real bag slot is 0–254 and stays on the inventory path below.
+        if ((body.index | 0) === OPEN_BAG_SELF_INDEX) {
+            const groundUid = body.containerId != null ? String(body.containerId) : '';
+            const groundInst = groundUid ? this.ground.inventory.items[groundUid] : null;
+            const groundLoc = groundInst && groundInst.location;
+            if (groundInst && groundLoc && groundLoc.kind === 'ground') {
+                this.applyGroundUseItem(session, intent, groundUid);
+                return;
+            }
         }
         if (!ownsContainer(session.inventory, body.containerId)) {
             session.reject(intent.seq, REASON.NO_TARGET);

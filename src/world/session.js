@@ -99,6 +99,7 @@ class GameSession {
         this.openCorpseId = 0;
         this.openBagUid = '';
         this.openBagUids = [];
+        this.browseTiles = Object.create(null);
         this.talkNpcId = 0;
         this.talkNodeId = '';
         this.shopOpen = false;
@@ -193,6 +194,7 @@ class GameSession {
         this.openCorpseId = 0;
         this.openBagUid = '';
         this.openBagUids = [];
+        this.browseTiles = Object.create(null);
         this.talkNpcId = 0;
         this.talkNodeId = '';
         this.shopOpen = false;

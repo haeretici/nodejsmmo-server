@@ -39,6 +39,8 @@ const {
     decodeSay,
     encodeSkills,
     decodeSkills,
+    encodeSkillProgress,
+    decodeSkillProgress,
     encodeExp,
     decodeExp
 } = require('../src/protocol/messages');
@@ -57,11 +59,12 @@ function main() {
     assert.strictEqual(empty.opcode, S2C.KICK);
     assert.strictEqual(empty.payload.length, 0);
 
-    const w = new Writer().u8(1).u16(512).i16(-3).str('Ash').toBuffer();
+    const w = new Writer().u8(1).u16(512).i16(-3).u64(2080834749800).str('Ash').toBuffer();
     const r = new Reader(w);
     assert.strictEqual(r.u8(), 1);
     assert.strictEqual(r.u16(), 512);
     assert.strictEqual(r.i16(), -3);
+    assert.strictEqual(r.u64(), 2080834749800);
     assert.strictEqual(r.str(), 'Ash');
 
     const hello = decodeHello(encodeHello({
@@ -85,10 +88,15 @@ function main() {
     assert.strictEqual(exp.experience, 100);
     assert.strictEqual(exp.gained, 5);
     assert.strictEqual(exp.level, 2);
-    const expOld = decodeExp(encodeExp(20, 5));
-    assert.strictEqual(expOld.experience, 20);
-    assert.strictEqual(expOld.gained, 5);
-    assert.ok(expOld.level == null);
+    assert.strictEqual(encodeExp(100, 5, 2).length, 18);
+    const expWide = decodeExp(encodeExp(2080834749800, 1249250200, 5000));
+    assert.strictEqual(expWide.experience, 2080834749800);
+    assert.strictEqual(expWide.gained, 1249250200);
+    assert.strictEqual(expWide.level, 5000);
+    const expLevel0 = decodeExp(encodeExp(20, 5));
+    assert.strictEqual(expLevel0.experience, 20);
+    assert.strictEqual(expLevel0.gained, 5);
+    assert.strictEqual(expLevel0.level, 0);
 
     const map = createStaticMap();
     const vp = viewport(map, 12, 12);
@@ -101,7 +109,25 @@ function main() {
         viewport: vp
     }));
     assert.strictEqual(ew.name, 'Ash');
+    assert.strictEqual(ew.experience, 0);
+    assert.strictEqual(ew.hp, 185);
     assert.strictEqual(ew.x, 12);
+    const wideEwPayload = encodeEnterWorld({
+        character: {
+            id: 3, name: 'Ash', vocation: 'guardian', level: 5000,
+            experience: 2080834749800,
+            hp: 75065, hpMax: 75065, mp: 25050, mpMax: 25050, townId: 1
+        },
+        x: 12, y: 12, z: 0,
+        viewport: vp
+    });
+    const wideEw = decodeEnterWorld(wideEwPayload);
+    assert.strictEqual(wideEw.level, 5000);
+    assert.strictEqual(wideEw.experience, 2080834749800);
+    assert.strictEqual(wideEw.hp, 75065);
+    assert.strictEqual(wideEw.mpMax, 25050);
+    assert.strictEqual(wideEw.viewport.width, vp.width);
+    assert.strictEqual(wideEw.viewport.height, vp.height);
     const lx = 12 - ew.viewport.originX;
     const ly = 12 - ew.viewport.originY;
     assert.strictEqual(ew.viewport.tiles[ly * ew.viewport.width + lx], TILE.SPAWN);
@@ -132,6 +158,12 @@ function main() {
     }));
     assert.strictEqual(st.hp, 10);
     assert.strictEqual(st.mp, 4);
+    assert.strictEqual(encodeStats({ id: 3, hp: 1, hpMax: 1, mp: 1, mpMax: 1 }).length, 20);
+    const stWide = decodeStats(encodeStats({
+        id: 3, hp: 75065, hpMax: 75065, mp: 149850, mpMax: 149850
+    }));
+    assert.strictEqual(stWide.hp, 75065);
+    assert.strictEqual(stWide.mp, 149850);
 
     const sw = decodeSwing(encodeSwing({
         sourceId: 3, targetId: 1000000000, amount: 4, flags: 2
@@ -167,6 +199,12 @@ function main() {
     }));
     assert.strictEqual(ap.flags, 0);
     assert.strictEqual(ap.dir, 3);
+    assert.strictEqual(ap.hp, 185);
+    const apWide = decodeAppear(encodeAppear({
+        id: 4, name: 'Tank', x: 1, y: 2, z: 0, hp: 75065, hpMax: 75065, dir: 1
+    }));
+    assert.strictEqual(apWide.hp, 75065);
+    assert.strictEqual(apWide.hpMax, 75065);
     const npc = decodeAppear(encodeAppear({
         id: 9, name: 'Guide', x: 6, y: 12, z: 0, hp: 100, hpMax: 100, type: 'npc', isNpc: true
     }));
@@ -194,6 +232,34 @@ function main() {
         })),
         encodeFrame(S2C.SAY, 4, encodeSay('Need directions?', { speakerId: 2, yell: true }))
     ]);
+    const progress = decodeSkillProgress(encodeSkillProgress({
+        _skillTryProgress: { fist: 12, sword: 4, fishing: 0 },
+        _manaTowardMagic: 800
+    }));
+    assert.strictEqual(progress.fist, 12);
+    assert.strictEqual(progress.sword, 4);
+    assert.strictEqual(progress.magic, 800);
+    assert.strictEqual(progress.fishing, 0);
+    assert.strictEqual(encodeSkillProgress({}).length, 64);
+
+    const split = decodeFrames(Buffer.concat([
+        encodeFrame(S2C.ENTER_WORLD, 1, wideEwPayload),
+        encodeFrame(S2C.STATS, 2, encodeStats({
+            id: 3, hp: 75065, hpMax: 75065, mp: 25050, mpMax: 25050
+        })),
+        encodeFrame(S2C.EXP, 3, encodeExp(2080834749800, 1249250200, 5000)),
+        encodeFrame(S2C.SKILL_PROGRESS, 4, encodeSkillProgress({
+            _skillTryProgress: { fist: 3 },
+            _manaTowardMagic: 9
+        }))
+    ]));
+    assert.strictEqual(split.length, 4);
+    assert.strictEqual(decodeEnterWorld(split[0].payload).experience, 2080834749800);
+    assert.strictEqual(decodeEnterWorld(split[0].payload).viewport.width, vp.width);
+    assert.strictEqual(decodeStats(split[1].payload).hp, 75065);
+    assert.strictEqual(decodeExp(split[2].payload).level, 5000);
+    assert.strictEqual(decodeSkillProgress(split[3].payload).magic, 9);
+
     const parsed = decodeFrames(batched);
     assert.strictEqual(parsed.length, 4);
     assert.strictEqual(decodeAppear(parsed[0].payload).dir, 1);

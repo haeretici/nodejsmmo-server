@@ -2,7 +2,7 @@
 
 /** Product port of HuntDL [27] exp / skill math and [09] L1–7 HP/MP pools. No kernel require. */
 
-const EXP_LEVEL_CACHE_MAX = 2000;
+const EXP_LEVEL_CACHE_MAX = 5000;
 const EXP_FOR_LEVEL_CACHE = new Array(EXP_LEVEL_CACHE_MAX + 1);
 
 function fillExpForLevelCache() {

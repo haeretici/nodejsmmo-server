@@ -494,7 +494,9 @@ function useWorldToolWith(player, cmd, opts) {
     if (!role) return { ok: false, reason: 'not_tool', text: CANNOT_TEXT };
     if (!player) return { ok: false, reason: 'no_player', text: CANNOT_TEXT };
     const heldId = String(cmd.itemId).trim();
-    if (countItem(player.inventory, heldId) < 1) {
+    const listed = Object.prototype.hasOwnProperty.call(o, 'toolReady');
+    const hasTool = listed ? !!o.toolReady : (countItem(player.inventory, heldId) >= 1);
+    if (!hasTool) {
         return { ok: false, reason: 'no_item', text: CANNOT_TEXT };
     }
     const x = Math.round(Number(cmd && cmd.x));
