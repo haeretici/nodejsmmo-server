@@ -294,6 +294,124 @@ function testWorldIntegration() {
     world.stop();
 }
 
+function framesOf(sock, opcode) {
+    const out = [];
+    for (let i = 0; i < sock.sent.length; i++) {
+        const frame = decodeFrame(sock.sent[i]);
+        if (frame && frame.opcode === opcode) out.push(frame);
+    }
+    return out;
+}
+
+function testStairFloorSendsFields() {
+    const settings = testSettings();
+    settings.pagedFloors = true;
+    const store = new MemoryStore();
+    const log = createLog(settings);
+    const n = 64 * 64;
+    const cols = 64;
+    const fields6 = new Uint8Array(n);
+    fields6[10 * cols + 11] = FIELD_MASKS.FIRE;
+    fields6[10 * cols + 12] = FIELD_MASKS.POISON;
+    const fields7 = new Uint8Array(n);
+    fields7[10 * cols + 9] = FIELD_MASKS.POISON;
+    const map = {
+        width: cols,
+        height: 64,
+        z: 6,
+        zMin: 6,
+        zMax: 7,
+        spawnX: 10,
+        spawnY: 10,
+        spawnZ: 6,
+        floors: {
+            6: { friction: new Uint8Array(n).fill(100), fields: fields6 },
+            7: { friction: new Uint8Array(n).fill(100), fields: fields7 }
+        },
+        stairs: [],
+        spawns: [],
+        npcs: []
+    };
+    const world = new World({
+        settings,
+        store,
+        log,
+        map,
+        schedule: () => 0,
+        clear: () => {}
+    });
+    world.start();
+    world.tileMap.addStair(
+        { x: 10, y: 10, z: 7 },
+        { x: 10, y: 10, z: 6 },
+        { type: 'ladder', deltaZ: -1 }
+    );
+
+    const sent = [];
+    const session = new GameSession({
+        socket: {
+            readyState: 1,
+            sent,
+            send(buf) { sent.push(Buffer.from(buf)); },
+            close() {}
+        },
+        ip: '127.0.0.1',
+        world,
+        settings,
+        limiter: { allow: () => true },
+        log
+    });
+    session.bindCharacter({
+        id: 2,
+        accountId: 2,
+        name: 'Climber',
+        vocation: 'knight',
+        level: 1,
+        hp: 100,
+        hpMax: 100,
+        mp: 50,
+        mpMax: 50
+    }, { x: 10, y: 10, z: 7 });
+    assert.ok(world.add(session));
+    assert.strictEqual(session.z, 7);
+
+    sent.length = 0;
+    world.sendFieldsInView(session);
+    const loginFields = framesOf(session.socket, S2C.FIELD).map((f) => decodeField(f.payload));
+    assert.strictEqual(loginFields.length, 1);
+    assert.strictEqual(loginFields[0].z, 7);
+    assert.strictEqual(loginFields[0].kind, 'poison');
+    assert.strictEqual(loginFields[0].x, 9);
+
+    sent.length = 0;
+    const from = { x: session.x, y: session.y, z: session.z };
+    assert.ok(world.tileMap.tryUseStair(session));
+    assert.strictEqual(session.z, 6);
+    world.broadcastMove(session, from, 0);
+
+    const arrived = framesOf(session.socket, S2C.FIELD).map((f) => decodeField(f.payload));
+    const kinds = arrived.map((f) => f.z + ':' + f.kind + '@' + f.x + ',' + f.y).sort();
+    assert.deepStrictEqual(kinds, ['6:fire@11,10', '6:poison@12,10']);
+    assert.strictEqual(framesOf(session.socket, S2C.FIELD_GONE).length, 0);
+
+    // Field just outside the arrival window. One step east must send only that one.
+    deployFieldToTile(world.fieldStore, 18, 10, 6, { kind: FIELD_KINDS.FIRE, durationSec: 100 });
+    sent.length = 0;
+    const stepFrom = { x: session.x, y: session.y, z: session.z };
+    assert.ok(world.tileMap.moveEntityToTile(11, 10, 6, session));
+    world.broadcastMove(session, stepFrom, 1);
+    const stepped = framesOf(session.socket, S2C.FIELD).map((f) => decodeField(f.payload));
+    assert.strictEqual(stepped.length, 1);
+    assert.strictEqual(stepped[0].x, 18);
+    assert.strictEqual(stepped[0].y, 10);
+    assert.strictEqual(stepped[0].z, 6);
+    assert.strictEqual(stepped[0].kind, 'fire');
+    assert.strictEqual(framesOf(session.socket, S2C.FIELD_GONE).length, 0);
+
+    session.kick();
+    world.stop();
+}
+
 function runAll() {
     testDirectTypedArray2DWindow();
     testBoundaryClampingAndOutOfBounds();
@@ -302,6 +420,7 @@ function runAll() {
     testFallbackWithoutTileMap();
     testContinentalScaleBenchmark();
     testWorldIntegration();
+    testStairFloorSendsFields();
     console.log('ok phase6_2_tilemap_fields_window');
 }
 

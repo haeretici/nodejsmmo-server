@@ -463,6 +463,21 @@ function measureFramePayload(opcode, buf, off = 0) {
             }
             return o - off;
         }
+        case S2C.TRADE_CLOSE:
+            return 0;
+        case S2C.TRADE: {
+            if (!need(1)) return -1;
+            o += 1;
+            if (readStr() == null) return -1;
+            if (!need(1)) return -1;
+            const count = buf[o++];
+            for (let i = 0; i < count; i++) {
+                if (readStr() == null) return -1;
+                if (!need(3)) return -1;
+                o += 3;
+            }
+            return o - off;
+        }
         case S2C.EXP: return rem >= 18 ? 18 : -1;
         case S2C.ENTER_WORLD: {
             if (!need(4)) return -1; o += 4;

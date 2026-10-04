@@ -277,8 +277,10 @@ const {
     subtreeContainerUids,
     getStack,
     removeFromTileStack,
+    resolveStackUid,
     pickupFromGround
 } = require('./ground_items');
+const { TradeBook } = require('./trade');
 
 const CREATURE_ID_BASE = 1000000000;
 const CORPSE_ID_BASE = 2000000000;
@@ -443,6 +445,7 @@ class World {
             (opts.settings && opts.settings.persistConcurrency) || 8
         );
         this.ground = createGroundStore();
+        this.trades = new TradeBook(this);
         this.groundSpatial = new SpatialIndex({ chunkSize: 32 });
         this._groundDirty = false;
         this._groundPersistTail = Promise.resolve();
@@ -607,6 +610,7 @@ class World {
         const id = entity.id != null ? entity.id : (entity.character && entity.character.id);
         if (entity.type === 'player' || (id != null && this.players.has(id))) {
             this.playerSpatial.update(entity);
+            if (entity.type === 'player' && this.trades) this.trades.onPlayerMoved(entity);
         } else if (entity.type === 'creature' || entity.type === 'npc' || (id != null && this.creatures.has(id))) {
             this.creatureSpatial.update(entity);
         }
@@ -1356,6 +1360,7 @@ class World {
 
     leave(session) {
         if (session.left) return;
+        if (this.trades) this.trades.cancelPlayer(session);
         session.left = true;
         this.clearBrowseTiles(session);
         const ch = session.character;
@@ -1629,6 +1634,8 @@ class World {
                 return;
             }
             case C2S.LOGOUT:
+                if (this.trades) this.trades.cancelPlayer(session);
+                if (typeof session.flushOutbound === 'function') session.flushOutbound();
                 session.kick(REASON.LOGOUT);
                 return;
             case C2S.MOVE_STEP:
@@ -1696,6 +1703,15 @@ class World {
                 return;
             case C2S.BROWSE_FIELD_CLOSE:
                 this.applyBrowseFieldClose(session, intent);
+                return;
+            case C2S.TRADE_OFFER:
+                this.trades.offer(session, intent);
+                return;
+            case C2S.TRADE_ACCEPT:
+                this.trades.accept(session);
+                return;
+            case C2S.TRADE_CANCEL:
+                this.trades.cancel(session);
                 return;
             case C2S.CAST:
                 this.applyCastIntent(session, intent, tickIndex);
@@ -3580,6 +3596,7 @@ class World {
     }
 
     killPlayer(session, killer, tickIndex) {
+        if (this.trades) this.trades.cancelPlayer(session);
         const delay = Math.max(1, (this.settings.deathDelayTicks | 0) || 40);
         this.tileMap.leaveTile(session.x, session.y, session.z, session);
         this.broadcastToViewers(session.x, session.y, session.z, (p) => {
@@ -3979,6 +3996,58 @@ class World {
                 }
             }
         }
+
+        this.syncPlayerFields(entity, from);
+    }
+
+    // Login snapshots the current floor only. Stairs and viewport scrolls must too.
+    // VIEWPORT arrives first and the client drops every other floor, so a floor
+    // change sends the new window only.
+    syncPlayerFields(entity, from) {
+        if (!entity || entity.type !== 'player' || entity.downed || entity.dead) return;
+        if (!this.fieldStore || !from) return;
+        const oldZ = from.z | 0;
+        const newZ = entity.z | 0;
+        const newWin = viewportWindow(this.map, entity.x, entity.y, null, null, newZ);
+        const sameFloor = oldZ === newZ;
+        if (!sameFloor) {
+            const next = listFieldsInRect(
+                this.fieldStore, newWin.originX, newWin.originY, newZ, newWin.width, newWin.height
+            );
+            for (let i = 0; i < next.length; i++) {
+                entity.send(S2C.FIELD, encodeField(next[i]));
+            }
+            return;
+        }
+        const oldWin = viewportWindow(this.map, from.x, from.y, null, null, oldZ);
+        if (
+            oldWin.originX === newWin.originX
+            && oldWin.originY === newWin.originY
+            && oldWin.width === newWin.width
+            && oldWin.height === newWin.height
+        ) {
+            return;
+        }
+        const next = listFieldsInRect(
+            this.fieldStore, newWin.originX, newWin.originY, newZ, newWin.width, newWin.height
+        );
+        const prev = listFieldsInRect(
+            this.fieldStore, oldWin.originX, oldWin.originY, oldZ, oldWin.width, oldWin.height
+        );
+        const stay = new Set();
+        for (let i = 0; i < next.length; i++) {
+            const f = next[i];
+            const insideOld = f.x >= oldWin.originX && f.y >= oldWin.originY
+                && f.x < oldWin.originX + oldWin.width
+                && f.y < oldWin.originY + oldWin.height;
+            if (insideOld) stay.add((f.x | 0) + ',' + (f.y | 0));
+            else entity.send(S2C.FIELD, encodeField(f));
+        }
+        for (let i = 0; i < prev.length; i++) {
+            const f = prev[i];
+            if (stay.has((f.x | 0) + ',' + (f.y | 0))) continue;
+            entity.send(S2C.FIELD_GONE, encodeFieldGone(f.x, f.y, f.z));
+        }
     }
 
     talkRange() {
@@ -4024,6 +4093,7 @@ class World {
             const storeInv = ownsContainer(inv, uid) ? inv : this.ground.inventory;
             session.send(S2C.BAG, encodeInventory(bagView(storeInv, uid, itemDb)));
         }
+        if (this.trades) this.trades.audit(session.inventory);
     }
 
     async loadGroundStore() {
@@ -4147,6 +4217,7 @@ class World {
         });
         this._touchGroundTile(x, y, z);
         this.refreshBrowseWatchers(x, y, z);
+        if (this.trades) this.trades.audit(this.ground.inventory);
     }
 
     closeContainersOutOfRange(session) {
@@ -4830,6 +4901,12 @@ class World {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
+        const touchedBefore = from.kind === 'equipment'
+            ? resolveLocationUid(session.inventory, {
+                kind: 'equipment',
+                slot: designerSlotToEngine(from.slot) || from.slot
+            })
+            : resolveLocationUid(session.inventory, from);
         const r = moveItem(
             session.inventory,
             from,
@@ -4853,6 +4930,7 @@ class World {
                 : 'You cannot do that.');
             return;
         }
+        if (this.trades && touchedBefore) this.trades.onTouched(session.inventory, touchedBefore);
         this.refreshLoadout(session);
     }
 
@@ -4895,6 +4973,19 @@ class World {
                 return;
             }
         }
+        const touchedGround = from.kind === 'tile'
+            ? resolveStackUid(this.ground, from.x, from.y, from.z, from.stackIndex | 0)
+            : (locIsGroundContainer(this.ground, from)
+                ? resolveLocationUid(this.ground.inventory, from)
+                : null);
+        const touchedPlayer = from.kind === 'equipment'
+            ? resolveLocationUid(session.inventory, {
+                kind: 'equipment',
+                slot: designerSlotToEngine(from.slot) || from.slot
+            })
+            : (from.kind === 'container' && ownsContainer(session.inventory, from.containerUid)
+                ? resolveLocationUid(session.inventory, from)
+                : null);
         const beforeFrom = from.kind === 'tile'
             ? visibleGroundSlots(this.ground, from.x, from.y, from.z).map((s) => s.uid)
             : [];
@@ -4930,6 +5021,10 @@ class World {
             const dress = to.kind === 'equipment' ? equipDenyMessage(r.error) : null;
             this.say(session, dress || 'You cannot do that.');
             return;
+        }
+        if (this.trades) {
+            if (touchedGround) this.trades.onTouched(this.ground.inventory, touchedGround);
+            if (touchedPlayer) this.trades.onTouched(session.inventory, touchedPlayer);
         }
         const tiles = [];
         if (r.fromTile) tiles.push(r.fromTile);

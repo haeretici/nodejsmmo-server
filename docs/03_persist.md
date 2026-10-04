@@ -49,7 +49,7 @@ Passwords: **argon2id** PHC (`crypto.argon2`, Node 24+). OWASP pin: m=19456, t=2
 | Loot, shop, quest, walk, HP, exp, level, skills, death | RAM only until logout / interval / wall-clock |
 | Client timer | **Never** |
 
-Do **not** debounce-save on loot/shop. Those fire at hunt rate; at 1000 online that is SQL-bound, not player-bound. Interval + logout is the 1000-player path. Trade/bank/mail (when they exist) save the two characters involved, not a 500 ms timer.
+Do **not** debounce-save on loot/shop. Those fire at hunt rate; at 1000 online that is SQL-bound, not player-bound. Interval + logout is the 1000-player path. A finished player trade saves the two characters then (persist reason `trade`, `last_logout` unchanged). Cancelling a trade does not save by itself. Bank and mail, when they exist, save the two characters involved the same way, not on a 500 ms timer.
 
 | Knob | Default |
 | :--- | :--- |

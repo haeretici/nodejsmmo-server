@@ -1006,6 +1006,54 @@ function decodeMoveItem(payload) {
     }, payload);
 }
 
+function encodeTradeOffer(from, partnerId) {
+    const w = new FastWriter();
+    writeItemLoc(w, from);
+    w.u32(partnerId >>> 0);
+    return w.toBuffer();
+}
+
+function decodeTradeOffer(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const from = readItemLoc(r);
+        if (r.rest().length < 4) throw new Error('bad trade offer');
+        return { from, partnerId: r.u32() };
+    }, payload);
+}
+
+function encodeTrade(msg) {
+    const items = msg && Array.isArray(msg.items) ? msg.items : [];
+    const n = Math.min(255, items.length);
+    const w = new FastWriter()
+        .u8(msg && msg.side)
+        .str((msg && msg.name) || '')
+        .u8(n);
+    for (let i = 0; i < n; i++) {
+        const it = items[i] || {};
+        w.str(it.id || '')
+            .u16(clampU16(it.count || 0))
+            .u8((it.flags | 0) & 0xff);
+    }
+    return w.toBuffer();
+}
+
+function decodeTrade(payload) {
+    return wrap((p) => {
+        const r = new Reader(p);
+        const out = { side: r.u8(), name: r.str(), items: [] };
+        const n = r.u8();
+        for (let i = 0; i < n; i++) {
+            out.items.push({ id: r.str(), count: r.u16(), flags: r.u8() });
+        }
+        return out;
+    }, payload);
+}
+
+function encodeTradeClose() {
+    return Buffer.alloc(0);
+}
+
 function encodeSay(text, extra) {
     const speakerId = extra && extra.speakerId != null ? extra.speakerId >>> 0 : 0;
     const yell = extra && (extra.yell === true || extra.yell === 1) ? 1 : 0;
@@ -1358,6 +1406,11 @@ module.exports = {
     decodeCloseBag,
     encodeMoveItem,
     decodeMoveItem,
+    encodeTradeOffer,
+    decodeTradeOffer,
+    encodeTrade,
+    decodeTrade,
+    encodeTradeClose,
     encodeGround,
     decodeGround,
     encodeGroundGone,

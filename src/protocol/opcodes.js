@@ -31,7 +31,10 @@ const C2S = Object.freeze({
     OPEN_BAG: 44,
     CLOSE_BAG: 45,
     BROWSE_FIELD: 46,
-    BROWSE_FIELD_CLOSE: 47
+    BROWSE_FIELD_CLOSE: 47,
+    TRADE_OFFER: 48,
+    TRADE_ACCEPT: 49,
+    TRADE_CANCEL: 50
 });
 
 const S2C = Object.freeze({
@@ -68,7 +71,9 @@ const S2C = Object.freeze({
     SKILL_PROGRESS: 135,
     GROUND: 136,
     GROUND_GONE: 137,
-    BROWSE_FIELD: 138
+    BROWSE_FIELD: 138,
+    TRADE: 139,
+    TRADE_CLOSE: 140
 });
 
 const REASON = Object.freeze({
@@ -236,7 +241,10 @@ const C2S_ENTERED = new Set([
     C2S.OPEN_BAG,
     C2S.CLOSE_BAG,
     C2S.BROWSE_FIELD,
-    C2S.BROWSE_FIELD_CLOSE
+    C2S.BROWSE_FIELD_CLOSE,
+    C2S.TRADE_OFFER,
+    C2S.TRADE_ACCEPT,
+    C2S.TRADE_CANCEL
 ]);
 
 const C2S_DOWNED = new Set([C2S.PING, C2S.LOGOUT]);
