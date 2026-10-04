@@ -16,7 +16,6 @@ const {
     itemIsAmmo,
     itemIsQuiver,
     itemIsShield,
-    itemIsTwoHanded,
     itemIsBowOrCrossbowWeapon,
     itemIsThrowingWeapon,
     itemIsMagicWeapon,
@@ -27,6 +26,9 @@ const {
     weaponRequiredAmmoKind,
     canEquipInSlot,
     preferredEquipSlot,
+    planEquipmentAdd,
+    itemTakesLevelPenalty,
+    penalizedWeaponStats,
     containerCapacity,
     canonicalEquipmentSlot,
     engineSlotToDesigner,
@@ -462,33 +464,72 @@ function unequipItem(inv, engineSlot, itemDb, dest) {
     );
 }
 
-function prepareLeftHandForTwoHandedEquip(inv, weaponItem, itemDb) {
-    if (!inv || !itemIsTwoHanded(weaponItem)) return { ok: true };
-    const leftUid = inv.equipment && inv.equipment.leftHand;
-    if (!leftUid) return { ok: true };
-    const leftInst = inv.items[leftUid];
-    const leftItem = leftInst ? findItem(itemDb, leftInst.itemId) : null;
-    if (itemIsBowOrCrossbowWeapon(weaponItem) && itemIsQuiver(leftItem)) return { ok: true };
-    const root = inv.containers[inv.rootUid];
-    if (!root || firstFreeSlot(root) < 0) return { ok: false, error: 'no_room' };
-    const un = unequipItem(inv, 'leftHand', itemDb, { containerUid: inv.rootUid });
+function equippedCatalogItem(inv, slot, itemDb) {
+    const engine = canonicalEquipmentSlot(slot) || slot;
+    const uid = inv && inv.equipment ? inv.equipment[engine] : null;
+    if (!uid) return null;
+    const inst = inv.items[uid];
+    return inst ? findItem(itemDb, inst.itemId) : null;
+}
+
+function equipmentAddPlan(inv, item, slot, itemDb, actor, from) {
+    let right = equippedCatalogItem(inv, 'rightHand', itemDb);
+    let left = equippedCatalogItem(inv, 'leftHand', itemDb);
+    if (from && from.kind === 'equipment') {
+        const src = canonicalEquipmentSlot(from.slot) || from.slot;
+        if (src === 'rightHand') right = null;
+        if (src === 'leftHand') left = null;
+    }
+    return planEquipmentAdd(item, slot, { right: right, left: left }, actor);
+}
+
+function rootFreeSlots(inv) {
+    const root = inv && inv.containers ? inv.containers[inv.rootUid] : null;
+    if (!root || !Array.isArray(root.slots)) return 0;
+    const cap = root.capacity | 0;
+    let free = 0;
+    for (let i = 0; i < root.slots.length && i < cap; i++) {
+        if (!root.slots[i]) free++;
+    }
+    return free;
+}
+
+function releaseEquipSlot(inv, slot, itemDb) {
+    const engine = canonicalEquipmentSlot(slot) || slot;
+    if (!inv || !inv.equipment || !inv.equipment[engine]) return { ok: true };
+    const un = unequipItem(inv, engine, itemDb, { containerUid: inv.rootUid });
     if (!un.ok) return { ok: false, error: un.error === 'full' ? 'no_room' : un.error || 'no_room' };
     return { ok: true };
 }
 
-function prepareRightHandForLeftHandEquip(inv, leftItem, itemDb) {
-    if (!inv) return { ok: true };
-    const rightUid = inv.equipment && inv.equipment.rightHand;
-    if (!rightUid) return { ok: true };
-    const rightInst = inv.items[rightUid];
-    const rightItem = rightInst ? findItem(itemDb, rightInst.itemId) : null;
-    if (!itemIsTwoHanded(rightItem)) return { ok: true };
-    if (itemIsBowOrCrossbowWeapon(rightItem) && itemIsQuiver(leftItem)) return { ok: true };
-    const root = inv.containers[inv.rootUid];
-    if (!root || firstFreeSlot(root) < 0) return { ok: false, error: 'no_room' };
-    const un = unequipItem(inv, 'rightHand', itemDb, { containerUid: inv.rootUid });
-    if (!un.ok) return { ok: false, error: un.error === 'full' ? 'no_room' : un.error || 'no_room' };
-    return { ok: true };
+function gateEquipmentPickup(inv, item, slot, itemDb, actor) {
+    const plan = equipmentAddPlan(inv, item, slot, itemDb, actor, null);
+    if (!plan.ok) return plan;
+    const mode = plan.mode === 'equip' ? 'equip' : 'move';
+    if (mode !== 'equip' && inv.equipment[plan.slot]) {
+        return { ok: false, error: 'occupied', slot: plan.slot };
+    }
+    let need = 0;
+    if (plan.clearSlot) need += 1;
+    if (mode === 'equip' && inv.equipment[plan.slot] && plan.clearSlot !== plan.slot) need += 1;
+    if (need > rootFreeSlots(inv)) return { ok: false, error: 'no_room', slot: plan.slot };
+    return plan;
+}
+
+function applyEquipmentPickup(inv, uid, itemDb, plan) {
+    if (!plan || !plan.ok) return { ok: false, error: (plan && plan.error) || 'not_equippable' };
+    if (plan.clearSlot) {
+        const cleared = releaseEquipSlot(inv, plan.clearSlot, itemDb);
+        if (!cleared.ok) return cleared;
+    }
+    if (plan.mode === 'equip' && inv.equipment[plan.slot]) {
+        const replaced = releaseEquipSlot(inv, plan.slot, itemDb);
+        if (!replaced.ok) return replaced;
+    }
+    if (inv.equipment[plan.slot]) return { ok: false, error: 'occupied' };
+    const placed = placeInEquipment(inv, uid, plan.slot, itemDb);
+    if (!placed.ok) return placed;
+    return { ok: true, uid: uid, equipped: true };
 }
 
 function copyLocation(loc) {
@@ -757,7 +798,7 @@ function moveAmountIntoContainer(inv, uidFrom, destUid, amount, itemDb) {
     };
 }
 
-function moveItem(inv, from, to, itemDb, amount) {
+function moveItem(inv, from, to, itemDb, amount, actor) {
     if (!inv || !from || !to) return { ok: false, error: 'bad_args' };
     const uidFrom = resolveLocationUid(inv, from);
     if (!uidFrom) return { ok: false, error: 'empty_source' };
@@ -768,12 +809,12 @@ function moveItem(inv, from, to, itemDb, amount) {
     const partial = Number.isFinite(n) && n >= 1 && n < total;
     if (partial) {
         const item = findItem(itemDb, src.itemId);
-        if (itemIsStackable(item)) return moveItemAmount(inv, from, to, n, itemDb);
+        if (itemIsStackable(item)) return moveItemAmount(inv, from, to, n, itemDb, actor);
     }
-    return moveItemWhole(inv, from, to, itemDb);
+    return moveItemWhole(inv, from, to, itemDb, actor);
 }
 
-function moveItemAmount(inv, from, to, amount, itemDb) {
+function moveItemAmount(inv, from, to, amount, itemDb, actor) {
     const uidFrom = resolveLocationUid(inv, from);
     if (!uidFrom) return { ok: false, error: 'empty_source' };
     const src = inv.items[uidFrom];
@@ -798,7 +839,10 @@ function moveItemAmount(inv, from, to, amount, itemDb) {
 
     if (to.kind === 'equipment') {
         const item = findItem(itemDb, src.itemId);
-        if (item && !canEquipInSlot(item, to.slot)) return { ok: false, error: 'wrong_slot' };
+        if (item) {
+            const plan = equipmentAddPlan(inv, item, to.slot, itemDb, actor || null, from);
+            if (!plan.ok) return { ok: false, error: plan.error };
+        }
         if (uidTo) return { ok: false, error: 'occupied' };
     }
 
@@ -838,7 +882,7 @@ function moveItemAmount(inv, from, to, amount, itemDb) {
     };
 }
 
-function moveItemWhole(inv, from, to, itemDb) {
+function moveItemWhole(inv, from, to, itemDb, actor) {
     const uidFrom = resolveLocationUid(inv, from);
     if (!uidFrom) return { ok: false, error: 'empty_source' };
     const target = resolveContainerInsertTarget(inv, uidFrom, to, itemDb);
@@ -856,14 +900,9 @@ function moveItemWhole(inv, from, to, itemDb) {
     if (to.kind === 'equipment') {
         const inst = inv.items[uidFrom];
         const item = findItem(itemDb, inst.itemId);
-        if (item && !canEquipInSlot(item, to.slot)) return { ok: false, error: 'wrong_slot' };
-        if (to.slot === 'rightHand') {
-            const prep = prepareLeftHandForTwoHandedEquip(inv, item, itemDb);
-            if (!prep.ok) return prep;
-        }
-        if (to.slot === 'leftHand') {
-            const prep = prepareRightHandForLeftHandEquip(inv, item, itemDb);
-            if (!prep.ok) return prep;
+        if (item) {
+            const plan = equipmentAddPlan(inv, item, to.slot, itemDb, actor || null, from);
+            if (!plan.ok) return { ok: false, error: plan.error };
         }
     }
     if (from.kind === 'equipment' && uidTo) {
@@ -925,11 +964,11 @@ function moveItemWhole(inv, from, to, itemDb) {
     return { ok: true };
 }
 
-function equipItem(inv, uid, itemDb, engineSlot) {
+function equipItem(inv, uid, itemDb, engineSlot, actor) {
     const inst = inv.items[uid];
     if (!inst) return { ok: false, error: 'unknown_item' };
     const item = findItem(itemDb, inst.itemId);
-    const slot = engineSlot != null
+    const slot = engineSlot != null && engineSlot !== ''
         ? canonicalEquipmentSlot(engineSlot) || engineSlot
         : preferredEquipSlot(item);
     if (!slot || (item && !canEquipInSlot(item, slot))) {
@@ -941,8 +980,28 @@ function equipItem(inv, uid, itemDb, engineSlot) {
         }
         return { ok: false, error: 'not_in_container' };
     }
-    const from = Object.assign({}, inst.location);
-    const r = moveItem(inv, from, { kind: 'equipment', slot }, itemDb);
+    const equipActor = Object.assign({ mode: 'equip' }, actor || { skipWield: true });
+    equipActor.mode = 'equip';
+    if (!actor) equipActor.skipWield = true;
+    const plan = equipmentAddPlan(inv, item, slot, itemDb, equipActor, null);
+    if (!plan.ok) return { ok: false, error: plan.error };
+    if (plan.clearSlot) {
+        const cleared = releaseEquipSlot(inv, plan.clearSlot, itemDb);
+        if (!cleared.ok) return cleared;
+    }
+    const live = inv.items[uid];
+    if (!live || !live.location || live.location.kind !== 'container') {
+        return { ok: false, error: 'not_in_container' };
+    }
+    const from = {
+        kind: 'container',
+        containerUid: live.location.containerUid,
+        index: live.location.index
+    };
+    const moveActor = actor
+        ? Object.assign({}, actor, { mode: 'move' })
+        : null;
+    const r = moveItem(inv, from, { kind: 'equipment', slot }, itemDb, undefined, moveActor);
     if (!r.ok) return r;
     return { ok: true, swappedUid: resolveLocationUid(inv, from) };
 }
@@ -1500,12 +1559,20 @@ function applyPlayerLoadout(session, itemDb) {
     session.weaponSkill = weaponSkill;
     session.weaponTier = unarmed ? 0 : Math.max(0, Math.floor(Number(right && right.tier) || 0));
 
-    const extraAtk = (!unarmed && right && right.extraAtk != null)
+    let extraAtk = (!unarmed && right && right.extraAtk != null)
         ? Math.max(0, Number(right.extraAtk) || 0)
         : 0;
-    const extraAtkElement = (!unarmed && right && extraAtk > 0 && right.extraAtkElement)
+    let extraAtkElement = (!unarmed && right && extraAtk > 0 && right.extraAtkElement)
         ? String(right.extraAtkElement).toLowerCase()
         : null;
+    const levelPenalty = (!unarmed && itemTakesLevelPenalty(right))
+        ? penalizedWeaponStats(right, session.level)
+        : null;
+    if (levelPenalty) {
+        atk = levelPenalty.atk;
+        extraAtk = levelPenalty.extraAtk;
+        if (extraAtk <= 0) extraAtkElement = null;
+    }
     session.extraAtk = extraAtk;
     session.extraAtkElement = extraAtkElement;
 
@@ -1675,7 +1742,8 @@ function applyPlayerLoadout(session, itemDb) {
         session.canBlock = false;
         return;
     }
-    const weaponDef = right && right.defense != null ? Number(right.defense) || 0 : UNARMED_WEAPON_DEFENSE;
+    let weaponDef = right && right.defense != null ? Number(right.defense) || 0 : UNARMED_WEAPON_DEFENSE;
+    if (levelPenalty && levelPenalty.defense != null) weaponDef = levelPenalty.defense;
     const blockSkill = skillValue(skills, session.weaponSkill);
     session.mitigation = computeMitigationPercent(shielding, weaponDef);
     session.maxBlock = computeMaxBlock(blockSkill, weaponDef);
@@ -2106,6 +2174,8 @@ module.exports = {
     moveItem,
     equipItem,
     unequipItem,
+    gateEquipmentPickup,
+    applyEquipmentPickup,
     resolveLocationUid,
     ensureEquippedBackpack,
     syncRootToEquippedBackpack,

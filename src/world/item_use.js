@@ -11,26 +11,52 @@ const {
 } = require('./items');
 const { applyCondition, removeConditions } = require('./conditions');
 
-const FOOD_REGEN_HEALTH_GAIN = 1;
-const FOOD_REGEN_INTERVAL_SEC = 3;
-const FOOD_REGEN_DURATION_SEC = 60;
+/** Legacy foods.lua: each nutrition point is 12 seconds. Cap is 1200 seconds. */
+const FOOD_SEC_PER_NUTRITION = 12;
+const FOOD_MAX_SECONDS = 1200;
 
-function defaultFoodCondition(item) {
-    if (!itemIsFood(item)) return null;
-    const durationSec = item.durationSec != null && Number(item.durationSec) > 0
-        ? Number(item.durationSec)
-        : FOOD_REGEN_DURATION_SEC;
-    const healthGain = item.healthGain != null && Number(item.healthGain) > 0
-        ? Number(item.healthGain)
-        : FOOD_REGEN_HEALTH_GAIN;
-    const intervalSec = item.intervalSec != null && Number(item.intervalSec) > 0
-        ? Number(item.intervalSec)
-        : FOOD_REGEN_INTERVAL_SEC;
+function foodNutrition(item) {
+    const n = Math.floor(Number(item && item.nutrition));
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return n;
+}
+
+/**
+ * Seconds one bite adds. `nutrition` × 12 wins. A food row with no nutrition
+ * uses `durationSec` as the satiation seconds.
+ */
+function foodAddSeconds(item) {
+    if (!itemIsFood(item)) return 0;
+    const nutrition = foodNutrition(item);
+    if (nutrition > 0) return nutrition * FOOD_SEC_PER_NUTRITION;
+    const sec = Math.floor(Number(item && item.durationSec));
+    if (Number.isFinite(sec) && sec > 0) return sec;
+    return 0;
+}
+
+function foodEatText(item) {
+    const raw = item && (item.eatText != null ? item.eatText : item.say);
+    const text = raw == null ? '' : String(raw).trim();
+    return text || 'Munch.';
+}
+
+/**
+ * Extend satiation. Already fed and `current + add >= 1200` refuses the bite
+ * (legacy "You are full."). A bite from hungry is accepted even past 1200.
+ */
+function tryFeed(entity, item) {
+    const add = foodAddSeconds(item);
+    if (!(add > 0) || !entity) return { ok: false, reason: 'not_food', add: 0 };
+    const cur = Math.max(0, Math.floor(Number(entity.foodSeconds) || 0));
+    if (cur > 0 && cur + add >= FOOD_MAX_SECONDS) {
+        return { ok: false, reason: 'full', foodSeconds: cur, add };
+    }
+    entity.foodSeconds = cur + add;
     return {
-        type: 'regen',
-        healthGain,
-        intervalSec,
-        durationSec
+        ok: true,
+        foodSeconds: entity.foodSeconds,
+        add,
+        text: foodEatText(item)
     };
 }
 
@@ -44,10 +70,7 @@ function resolveItemUseEffect(item) {
     } else if (use && Array.isArray(use.dispel)) {
         dispel = asDispel(use.dispel);
     }
-    let condition = asCondition(item && item.condition) || asCondition(use && use.condition) || null;
-    if (!condition && !heal && !mana && !dispel.length) {
-        condition = defaultFoodCondition(item);
-    }
+    const condition = asCondition(item && item.condition) || asCondition(use && use.condition) || null;
     const known = !!(heal || mana || dispel.length || condition);
     return { heal, mana, dispel, condition, known };
 }
@@ -94,11 +117,13 @@ function applyItemUseEffect(target, effect, opts) {
 }
 
 module.exports = {
-    FOOD_REGEN_HEALTH_GAIN,
-    FOOD_REGEN_INTERVAL_SEC,
-    FOOD_REGEN_DURATION_SEC,
+    FOOD_SEC_PER_NUTRITION,
+    FOOD_MAX_SECONDS,
+    foodNutrition,
+    foodAddSeconds,
+    foodEatText,
+    tryFeed,
     resolveItemUseEffect,
     applyItemUseEffect,
-    rollRange,
-    defaultFoodCondition
+    rollRange
 };

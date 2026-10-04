@@ -23,6 +23,8 @@ const {
     placeInContainer,
     placeInEquipment,
     moveItem,
+    gateEquipmentPickup,
+    applyEquipmentPickup,
     itemSubtreeWeight,
     canCarryAdditional,
     totalCarriedWeight,
@@ -387,6 +389,17 @@ function dropToGround(opts) {
     };
 }
 
+function actorForPickup(o) {
+    const mode = o && o.equipMode === 'equip' ? 'equip' : 'move';
+    const player = o && o.player;
+    if (!player) return { mode: mode, skipWield: true };
+    return {
+        mode: mode,
+        level: player.level != null ? player.level : 1,
+        vocation: player.vocation || (player.character && player.character.vocation) || ''
+    };
+}
+
 function pickupFromGround(opts) {
     const o = opts || {};
     const ground = o.ground;
@@ -425,6 +438,13 @@ function pickupFromGround(opts) {
         }
     }
 
+    let equipPlan = null;
+    if (o.to && o.to.kind === 'equipment') {
+        const wearItem = findItem(itemDb, gInst.itemId);
+        equipPlan = gateEquipmentPickup(playerInv, wearItem, o.to.slot, itemDb, actorForPickup(o));
+        if (!equipPlan.ok) return { ok: false, error: equipPlan.error };
+    }
+
     const closedUids = n >= total ? subtreeContainerUids(ground.inventory, uid) : [];
     let moveUid = uid;
     const onTile = !!(gInst.location && gInst.location.kind === 'ground');
@@ -452,7 +472,9 @@ function pickupFromGround(opts) {
         return { ok: false, error: 'transfer_failed' };
     }
 
-    const placed = placePickedItem(playerInv, playerUid, o.to, itemDb);
+    const placed = equipPlan
+        ? applyEquipmentPickup(playerInv, playerUid, itemDb, equipPlan)
+        : placePickedItem(playerInv, playerUid, o.to, itemDb);
     if (!placed.ok) {
         const back = transferItemTree(playerInv, ground.inventory, playerUid, itemDb);
         if (back && onTile) pushToTileStack(ground, back, root.x, root.y, root.z);

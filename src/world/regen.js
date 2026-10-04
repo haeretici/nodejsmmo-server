@@ -1,14 +1,17 @@
 'use strict';
 
-/** Vocation food/tick regen + equipped duration decay. Integer ticks. No Date.now. */
+/** Vocation regen paced by food, plus equipped duration decay. Integer ticks. No Date.now. */
 
 const { findItem } = require('./items');
-const { isCombatantAlive } = require('./conditions');
 
+const DEFAULT_FULL_HP_MS = 3000;
+const DEFAULT_FULL_MP_MS = 5000;
+const DEFAULT_BASE_HP_MS = 4000;
+const DEFAULT_BASE_MP_MS = 6000;
 const DEFAULT_REGEN_HP_TICKS = 60;
 const DEFAULT_REGEN_MP_TICKS = 100;
-const DEFAULT_ENGAGE_REGEN_HP_TICKS = 80;
-const DEFAULT_ENGAGE_REGEN_MP_TICKS = 120;
+const DEFAULT_HUNGRY_REGEN_HP_TICKS = 80;
+const DEFAULT_HUNGRY_REGEN_MP_TICKS = 120;
 
 function asNonNegInt(v, fallback) {
     if (v == null || v === '') return fallback;
@@ -32,18 +35,78 @@ function nativeRegenRates(cls, promoted) {
     };
 }
 
-function regenIntervalTicks(settings, inEngage) {
+function pickSetting(settings, keys) {
     const s = settings || {};
-    if (inEngage) {
-        return {
-            hpTicks: Math.max(1, asNonNegInt(s.engageRegenHpTicks, DEFAULT_ENGAGE_REGEN_HP_TICKS) || DEFAULT_ENGAGE_REGEN_HP_TICKS),
-            mpTicks: Math.max(1, asNonNegInt(s.engageRegenMpTicks, DEFAULT_ENGAGE_REGEN_MP_TICKS) || DEFAULT_ENGAGE_REGEN_MP_TICKS)
-        };
+    for (let i = 0; i < keys.length; i++) {
+        const v = s[keys[i]];
+        if (v != null && v !== '') return v;
     }
-    return {
-        hpTicks: Math.max(1, asNonNegInt(s.regenHpTicks, DEFAULT_REGEN_HP_TICKS) || DEFAULT_REGEN_HP_TICKS),
-        mpTicks: Math.max(1, asNonNegInt(s.regenMpTicks, DEFAULT_REGEN_MP_TICKS) || DEFAULT_REGEN_MP_TICKS)
-    };
+    return undefined;
+}
+
+function ticksFromMs(ms, ups, fallbackMs) {
+    const chosen = asNonNegInt(ms, fallbackMs);
+    return Math.max(1, intervalMsToTicks(chosen, ups));
+}
+
+/**
+ * Full stomach (`hungry` false) uses fullRegen*IntervalMs: 3000 HP / 5000 MP.
+ * Hungry uses baseRegen*IntervalMs: 4000 HP / 6000 MP.
+ * A living target does not change the pace. Milliseconds become logic ticks.
+ * Older tick keys apply only when the matching millisecond key is absent.
+ */
+function regenIntervalTicks(settings, hungry, ups) {
+    const u = (ups | 0) || (settings && (settings.logicUps | 0)) || 20;
+    if (hungry) {
+        const hpMs = pickSetting(settings, ['baseRegenHpIntervalMs', 'baseRegenHPIntervalMS']);
+        const mpMs = pickSetting(settings, ['baseRegenMpIntervalMs', 'baseRegenMPIntervalMS']);
+        const hpTicks = hpMs != null
+            ? ticksFromMs(hpMs, u, DEFAULT_BASE_HP_MS)
+            : Math.max(1, asNonNegInt(
+                pickSetting(settings, ['hungryRegenHpTicks', 'engageRegenHpTicks']),
+                DEFAULT_HUNGRY_REGEN_HP_TICKS
+            ));
+        const mpTicks = mpMs != null
+            ? ticksFromMs(mpMs, u, DEFAULT_BASE_MP_MS)
+            : Math.max(1, asNonNegInt(
+                pickSetting(settings, ['hungryRegenMpTicks', 'engageRegenMpTicks']),
+                DEFAULT_HUNGRY_REGEN_MP_TICKS
+            ));
+        return { hpTicks, mpTicks };
+    }
+    const hpMs = pickSetting(settings, ['fullRegenHpIntervalMs', 'fullRegenHPIntervalMS']);
+    const mpMs = pickSetting(settings, ['fullRegenMpIntervalMs', 'fullRegenMPIntervalMS']);
+    const hpTicks = hpMs != null
+        ? ticksFromMs(hpMs, u, DEFAULT_FULL_HP_MS)
+        : Math.max(1, asNonNegInt(pickSetting(settings, ['regenHpTicks']), DEFAULT_REGEN_HP_TICKS));
+    const mpTicks = mpMs != null
+        ? ticksFromMs(mpMs, u, DEFAULT_FULL_MP_MS)
+        : Math.max(1, asNonNegInt(pickSetting(settings, ['regenMpTicks']), DEFAULT_REGEN_MP_TICKS));
+    return { hpTicks, mpTicks };
+}
+
+/**
+ * Count one logic tick of satiation. One second is `ups` ticks.
+ * Returns whether the player is hungry after the tick, and whether this tick
+ * is the one that reached zero.
+ */
+function tickFoodSatiation(entity, ups) {
+    if (!entity) return { hungry: true, expired: false };
+    const upsN = Math.max(1, (ups | 0) || 20);
+    const cur = Math.max(0, Math.floor(Number(entity.foodSeconds) || 0));
+    entity.foodSeconds = cur;
+    if (cur <= 0) {
+        entity._foodSubTicks = 0;
+        return { hungry: true, expired: false };
+    }
+    entity._foodSubTicks = (entity._foodSubTicks | 0) + 1;
+    if (entity._foodSubTicks < upsN) return { hungry: false, expired: false };
+    const steps = Math.floor(entity._foodSubTicks / upsN);
+    entity._foodSubTicks -= steps * upsN;
+    entity.foodSeconds = Math.max(0, cur - steps);
+    if (entity.foodSeconds === 0) entity._foodSubTicks = 0;
+    const expired = entity.foodSeconds === 0;
+    return { hungry: expired, expired };
 }
 
 function intervalMsToTicks(ms, ups) {
@@ -199,24 +262,16 @@ function tickEquippedItemRegen(inv, itemDb, ups) {
     return { hpDelta, mpDelta };
 }
 
-function playerInEngage(session, world) {
-    if (!session) return false;
-    const tid = session.targetId | 0;
-    if (!tid || !world || typeof world.getEntity !== 'function') return false;
-    const t = world.getEntity(tid);
-    return !!(t && isCombatantAlive(t));
-}
-
 module.exports = {
     DEFAULT_REGEN_HP_TICKS,
     DEFAULT_REGEN_MP_TICKS,
-    DEFAULT_ENGAGE_REGEN_HP_TICKS,
-    DEFAULT_ENGAGE_REGEN_MP_TICKS,
+    DEFAULT_HUNGRY_REGEN_HP_TICKS,
+    DEFAULT_HUNGRY_REGEN_MP_TICKS,
     nativeRegenRates,
     regenIntervalTicks,
+    tickFoodSatiation,
     intervalMsToTicks,
     tickNativeRegen,
     tickEquippedDurations,
-    tickEquippedItemRegen,
-    playerInEngage
+    tickEquippedItemRegen
 };

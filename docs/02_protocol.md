@@ -61,7 +61,7 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `EQUIP` | 40 | `containerId str`, `index u8`, `slot str` (empty = preferred). Designer or engine slot names |
 | `UNEQUIP` | 41 | `slot str` into backpack |
 | `MOVE_ITEM` | 42 | from loc + to loc + `count u16` (0 = all). Loc: `kind u8` 0=container (`id str` `index u8`) 1=equipment (`slot str`) 2=tile (`x i16 y i16 z i8` + `stackIndex u8`, **0 = top**). Pickup / drop / tile slide are this opcode. No `PICKUP`/`DROP` C2S |
-| `USE_ITEM` | 43 | `containerId str`, `index u8` — equip / open bag / consume (`heal` / `restoreMana` arrays, food regen, dispel, condition; empty-effect `usable` still consume). Index **255** names a ground uid and uses that tile item in place (open a container, spend a consumable on the tile, equip onto the paperdoll, or cast a rune from the tile). Chebyshev ≤ **1**, same `z`. The server does not path |
+| `USE_ITEM` | 43 | `containerId str`, `index u8` — equip / open bag / consume (`heal` / `restoreMana` arrays, food satiation, dispel, condition; empty-effect `usable` still consume). Food adds `nutrition` × 12 seconds (cap 1200 while already fed; `You are full.` does not consume). Index **255** names a ground uid and uses that tile item in place (open a container, spend a consumable on the tile, equip onto the paperdoll, or cast a rune from the tile). Chebyshev ≤ **1**, same `z`. The server does not path |
 | `OPEN_BAG` | 44 | `containerId str`, `index u8`. Nested bag: parent uid + slot `0–254`. Equipped container: designer slot name (`shield`, `backpack`, …) + index 0. Ground bag from canvas: GROUND uid + index **255** (open that uid). Ground nested: parent ground uid + slot |
 | `CLOSE_BAG` | 45 | `containerId str` (instance uid). Empty string closes all open bags |
 | `BROWSE_FIELD` | 46 | `x i16 y i16 z i8`. In range (Chebyshev ≤ 1, same `z`) the server watches that tile and answers with S2C `BROWSE_FIELD`. Farther, or another floor: `REJECT` `OUT_OF_RANGE` and no snapshot. The server does not path |
@@ -78,7 +78,7 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `APPEAR` | 111 | `id u32`, name, `x i16 y i16 z i8`, `hp u32 hpMax u32`, `flags u8`, `look str` (creature kind or vocation), extra `dir u8` (N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7). Extra bytes ignored |
 | `DISAPPEAR` | 112 | `id u32` |
 | `MOVE` | 113 | `id u32`, `x i16 y i16 z i8`, `dir u8` (N=0 E=1 S=2 W=3 SW=4 SE=5 NW=6 NE=7) |
-| `STATS` | 114 | `id u32`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`. Fixed 20 bytes |
+| `STATS` | 114 | `id u32`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`, `foodSec u16`. Fixed 22 bytes. `foodSec` is remaining food seconds on a player (0 = hungry). Creatures send 0 |
 | `SWING` | 115 | `sourceId u32`, `targetId u32`, `amount u16`, `flags u8` (1=miss, 2=death, 4=crit, 8=fatal), extra `element u8` + `weaponId str` + `ammoId str`. Extra bytes ignored |
 | `DEATH` | 116 | `id u32`, `killerId u32` |
 | `CORPSE` | 117 | `id u32`, `x i16 y i16 z i8`, name |
@@ -104,7 +104,7 @@ Enter deadline: `wsEnterTimeoutMs` **10000**. One online character per account (
 | `GROUND_GONE` | 137 | `uid str`, extra `x i16 y i16 z i8` ignored |
 | `BROWSE_FIELD` | 138 | `x i16 y i16 z i8`, `n u8`, then n× (`stackIndex u8`, `uid str`, `id str`, `count u16`, `flags u8`). Flag 1 = container. Full ground pile, top first, `stackIndex` **0 = top**, capped at **255**. No nested guts. `n = 0` means that tile’s pile is empty |
 
-`ENTER_WORLD`: `id u32`, name, vocation, `level u16`, `experience u64`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`, `x i16 y i16 z i8`, `townId u16`, then viewport: `originX i16 originY i16 z i8 w u8 h u8 tiles u16[w*h]`. Viewport `z` is the player floor. `tiles` are friction-derived debug ids (`0` void, `1` walk, `3` wall, `4` water, `5` town) — not visual stamps. Strings: `u8 len` + UTF-8. Experience and the four pools are wide enough for level 5000. Swing damage, capacity, and item counts stay u16.
+`ENTER_WORLD`: `id u32`, name, vocation, `level u16`, `experience u64`, `hp u32`, `hpMax u32`, `mp u32`, `mpMax u32`, `x i16 y i16 z i8`, `townId u16`, then viewport: `originX i16 originY i16 z i8 w u8 h u8 tiles u16[w*h]`, then `foodSec u16`. Viewport `z` is the player floor. `tiles` are friction-derived debug ids (`0` void, `1` walk, `3` wall, `4` water, `5` town) — not visual stamps. Strings: `u8 len` + UTF-8. Experience and the four pools are wide enough for level 5000. Swing damage, capacity, and item counts stay u16. `foodSec` is the same remaining food seconds as `STATS`.
 
 ## Admit
 

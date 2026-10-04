@@ -90,8 +90,8 @@ const {
 } = require('./combat');
 const { hasLineOfSight, getAffectedTiles, cardinalDirection } = require('./shapes');
 const { rollLoot } = require('./loot');
-const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsRune, itemIsUsable, designerSlotToEngine, preferredEquipSlot } = require('./items');
-const { resolveItemUseEffect, applyItemUseEffect } = require('./item_use');
+const { itemDbFromPack, findItem, itemIsContainer, itemIsEquipable, itemIsFood, itemIsRune, itemIsUsable, designerSlotToEngine, preferredEquipSlot, equipDenyMessage } = require('./items');
+const { resolveItemUseEffect, applyItemUseEffect, foodAddSeconds, tryFeed } = require('./item_use');
 const {
     takeItem,
     addItemToInventory,
@@ -230,10 +230,10 @@ const {
 const {
     nativeRegenRates,
     regenIntervalTicks,
+    tickFoodSatiation,
     tickNativeRegen,
     tickEquippedDurations,
-    tickEquippedItemRegen,
-    playerInEngage
+    tickEquippedItemRegen
 } = require('./regen');
 const {
     createFieldStore,
@@ -350,6 +350,13 @@ function forgetOpenBag(session, uid) {
     if (at >= 0) list.splice(at, 1);
     syncOpenBagUid(session);
     return at >= 0 ? [uid] : [];
+}
+
+function wearerOf(session) {
+    return {
+        level: session && session.level != null ? session.level : 1,
+        vocation: (session && (session.vocation || (session.character && session.character.vocation))) || ''
+    };
 }
 
 function sendBagClosed(session, uid) {
@@ -1407,13 +1414,16 @@ class World {
             x: session.x,
             y: session.y,
             z: session.z,
-            viewport: vp
+            viewport: vp,
+            foodSeconds: session.foodSeconds
         }));
         this.tickSpawnPins(this.tick.tickIndex, { appear: false });
         this.sendInventory(session);
         this.sendSkills(session);
         this.sendSkillProgress(session);
         this.sendGroundInView(session);
+        this.stampProtectionZone(session);
+        session.send(S2C.STATS, encodeStats(session));
     }
 
     syncAppears(session) {
@@ -1780,6 +1790,7 @@ class World {
         );
         session.movedThisTick = true;
         this.broadcastMove(session, from, dir);
+        this.noteProtectionZone(session);
         this.applyWorldPinStep(session, from, tickIndex);
         this.closeContainersOutOfRange(session);
         return true;
@@ -1812,6 +1823,7 @@ class World {
         );
         session.movedThisTick = true;
         this.broadcastMove(session, from, session.dir);
+        this.noteProtectionZone(session);
         this.applyWorldPinStep(session, from, tickIndex);
         this.closeContainersOutOfRange(session);
     }
@@ -1888,6 +1900,7 @@ class World {
         );
         session.movedThisTick = true;
         this.broadcastMove(session, from, session.dir);
+        this.noteProtectionZone(session);
         this.applyWorldPinStep(session, from, tickIndex);
         if (inst) this.broadcastWorldPin(inst);
     }
@@ -1922,6 +1935,7 @@ class World {
             );
             session.movedThisTick = true;
             this.broadcastMove(session, from, session.dir);
+            this.noteProtectionZone(session);
             this.applyWorldPinStep(session, from, tickIndex);
         }
         if (result.changed || result.transformed || result.state != null) {
@@ -1967,7 +1981,7 @@ class World {
                 }
             }
             if (row.result.damage > 0) {
-                this.applyDamage(entity, row.result.damage, 'physical', tickIndex, null);
+                this.applyDamage(entity, row.result.damage, 'physical', tickIndex, null, true);
             }
             this.broadcastWorldPin(row.inst);
             this.scheduleWorldPinDeadline(row.inst, now);
@@ -1976,7 +1990,14 @@ class World {
         for (let i = 0; i < fieldEvents.length; i++) {
             const ev = fieldEvents[i];
             if (ev && ev.result && ev.result.damage > 0) {
-                this.applyDamage(entity, ev.result.damage, ev.result.element || 'physical', tickIndex, null);
+                this.applyDamage(
+                    entity,
+                    ev.result.damage,
+                    ev.result.element || 'physical',
+                    tickIndex,
+                    null,
+                    true
+                );
             }
         }
     }
@@ -3339,7 +3360,7 @@ class World {
         if (entity.character) entity.character.mp = next;
     }
 
-    applyDamage(entity, amount, element, tickIndex, killer) {
+    applyDamage(entity, amount, element, tickIndex, killer, announce) {
         if (!entity) return 0;
         let incoming = Math.max(0, Math.floor(Number(amount) || 0));
         if (incoming > 0 && element !== 'healing' && element !== 'undefined' && element !== 'manadrain') {
@@ -3352,6 +3373,8 @@ class World {
             this.wakeCreature(entity, tickIndex);
         }
         this.broadcastStats(entity);
+        // Announce before kill so viewers still have the target when the number arrives.
+        if (announce && incoming > 0) this.broadcastAmbientSwing(entity, incoming, element);
         if ((entity.hp | 0) <= 0) this.kill(entity, killer || null, tickIndex);
         return incoming;
     }
@@ -3492,6 +3515,46 @@ class World {
         };
     }
 
+    /**
+     * Floating number for damage with no attacker swing (condition tick, field, zone).
+     * sourceId 0 tells the client to skip the melee arc.
+     */
+    broadcastAmbientSwing(defender, amount, element) {
+        if (!defender || !(amount > 0)) return;
+        const swing = encodeSwing({
+            sourceId: 0,
+            targetId: defender.id,
+            amount,
+            flags: 0,
+            element: element || 'physical',
+            weaponId: '',
+            ammoId: ''
+        });
+        const candidates = this.viewerCandidates(defender.x, defender.y, defender.z, 16);
+        for (const p of candidates) {
+            if (!p || (p.downed && p !== defender) || p.dead) continue;
+            if (p === defender || this.sees(p, defender.x, defender.y, defender.z)) {
+                p.send(S2C.SWING, swing);
+            }
+        }
+    }
+
+    stampProtectionZone(entity) {
+        if (!entity) return false;
+        const on = !!(this.tileMap
+            && typeof this.tileMap.isProtectionZonePackage === 'function'
+            && this.tileMap.isProtectionZonePackage(entity.x, entity.y, entity.z));
+        const changed = !!entity.inProtectionZone !== on;
+        entity.inProtectionZone = on;
+        return changed;
+    }
+
+    noteProtectionZone(entity) {
+        if (!entity || entity.type !== 'player' || entity.dead) return;
+        if (!this.stampProtectionZone(entity)) return;
+        if (entity.send && !entity.downed) entity.send(S2C.STATS, encodeStats(entity));
+    }
+
     broadcastSwing(attacker, defender, amount, flags, hit) {
         const swing = encodeSwing(this.swingWire(attacker, defender, amount, flags, hit));
         const stats = encodeStats(defender);
@@ -3625,6 +3688,7 @@ class World {
         this.clearPlayerWalk(session);
         session.moveReadyTick = tickIndex;
         session.attackReadyTick = tickIndex;
+        this.stampProtectionZone(session);
         session.send(S2C.STATS, encodeStats(session));
         session.send(S2C.MOVE, encodeMove({
             id: session.id, x: session.x, y: session.y, z: session.z, dir: session.dir
@@ -4222,6 +4286,39 @@ class World {
         session.send(S2C.SAY, encodeSay(text));
     }
 
+    sayNear(session, text) {
+        if (!session || !text) return;
+        const payload = encodeSay(text, { speakerId: session.id });
+        this.broadcastToViewers(session.x, session.y, session.z, (p) => {
+            p.send(S2C.SAY, payload);
+        }, session);
+    }
+
+    /**
+     * Eat one food. Full stomach refuses the bite and leaves the item.
+     * A catalog heal, mana, dispel, or condition on the same row still applies.
+     */
+    applyFoodUse(session, item, consume) {
+        const before = Math.max(0, Math.floor(Number(session.foodSeconds) || 0));
+        const fed = tryFeed(session, item);
+        if (!fed.ok) {
+            this.say(session, fed.reason === 'full' ? 'You are full.' : 'You cannot use that.');
+            return false;
+        }
+        if (typeof consume !== 'function' || !consume()) {
+            session.foodSeconds = before;
+            this.say(session, 'You cannot use that.');
+            return false;
+        }
+        const effect = resolveItemUseEffect(item);
+        if (effect && (effect.heal || effect.mana || (effect.dispel && effect.dispel.length) || effect.condition)) {
+            applyItemUseEffect(session, effect, { rng: this.rng });
+        }
+        this.sayNear(session, fed.text);
+        session.send(S2C.STATS, encodeStats(session));
+        return true;
+    }
+
     _clearGlobalSaveTimers() {
         if (this._globalSaveTimer != null) {
             clearTimeout(this._globalSaveTimer);
@@ -4680,10 +4777,11 @@ class World {
             return;
         }
         const slot = body.slot ? designerSlotToEngine(body.slot) : null;
-        const r = equipItem(session.inventory, uid, this.itemDb(), slot);
+        const r = equipItem(session.inventory, uid, this.itemDb(), slot, Object.assign({ mode: 'equip' }, wearerOf(session)));
         if (!r.ok) {
-            this.say(session, r.error === 'not_equippable' || r.error === 'wrong_slot'
-                ? 'You cannot equip that.'
+            const dress = equipDenyMessage(r.error);
+            this.say(session, dress
+                ? dress
                 : r.error === 'no_room' || r.error === 'full'
                     ? 'You cannot carry that.'
                     : 'You cannot do that.');
@@ -4732,10 +4830,22 @@ class World {
             session.reject(intent.seq, REASON.NO_TARGET);
             return;
         }
-        const r = moveItem(session.inventory, from, to, this.itemDb(), body.count);
+        const r = moveItem(
+            session.inventory,
+            from,
+            to,
+            this.itemDb(),
+            body.count,
+            Object.assign({ mode: 'move' }, wearerOf(session))
+        );
         if (!r.ok) {
             if (r.error === 'only_ammo') {
                 this.say(session, 'This quiver only holds ammunition.');
+                return;
+            }
+            const dress = to.kind === 'equipment' ? equipDenyMessage(r.error) : null;
+            if (dress) {
+                this.say(session, dress);
                 return;
             }
             this.say(session, r.error === 'full' || r.error === 'no_room' || r.error === 'cycle'
@@ -4817,7 +4927,8 @@ class World {
                 session.reject(intent.seq, REASON.NO_TARGET);
                 return;
             }
-            this.say(session, 'You cannot do that.');
+            const dress = to.kind === 'equipment' ? equipDenyMessage(r.error) : null;
+            this.say(session, dress || 'You cannot do that.');
             return;
         }
         const tiles = [];
@@ -4954,7 +5065,7 @@ class World {
     applyFieldHit(entity, result, tickIndex) {
         if (!entity || !result) return;
         if (result.damage > 0) {
-            this.applyDamage(entity, result.damage, result.element || 'physical', tickIndex, null);
+            this.applyDamage(entity, result.damage, result.element || 'physical', tickIndex, null, true);
         }
     }
 
@@ -4971,17 +5082,22 @@ class World {
 
     _applyConditionHpDelta(ent, amount, element) {
         if (element === 'healing') {
-            this.applyHp(ent, (ent.hp | 0) + Math.abs(amount | 0));
+            const healed = Math.abs(amount | 0);
+            if (!(healed > 0)) return;
+            this.applyHp(ent, (ent.hp | 0) + healed);
             this.broadcastStats(ent);
+            this.broadcastAmbientSwing(ent, healed, 'healing');
             return;
         }
-        this.applyDamage(ent, amount, element, this._tickIndex, null);
+        this.applyDamage(ent, amount, element, this._tickIndex, null, true);
     }
 
     tickCombatantConditions(ent, dt) {
         if (ent.conditions && ent.conditions.length > 0) {
             const cond = tickConditions(ent, dt, this._conditionHooks);
-            if (cond.ticks && cond.ticks.length) this.broadcastStats(ent);
+            const ticked = cond.ticks && cond.ticks.length;
+            const expired = cond.expired && cond.expired.length;
+            if (ticked || expired) this.broadcastStats(ent);
         }
     }
 
@@ -5002,14 +5118,16 @@ class World {
     tickPlayerRegen(session) {
         if (!session || session.simSleeping) return;
         if (session.dead || session.downed || (session.hp | 0) <= 0) return;
+        const ups = (this.settings.logicUps | 0) || 20;
+        const food = tickFoodSatiation(session, ups);
         const cls = classRow(this.pack, session.vocation || (session.character && session.character.vocation));
         const rates = nativeRegenRates(cls, !!(session.promoted || (session.character && session.character.promoted)));
-        const intervals = regenIntervalTicks(this.settings, playerInEngage(session, this));
+        const intervals = regenIntervalTicks(this.settings, food.hungry, ups);
         const native = tickNativeRegen(session, rates, intervals);
         const itemDb = this.itemDb();
-        const ups = (this.settings.logicUps | 0) || 20;
         const gear = tickEquippedItemRegen(session.inventory, itemDb, ups);
-        this.applyRegenDeltas(session, native.hpDelta + gear.hpDelta, native.mpDelta + gear.mpDelta);
+        const healed = this.applyRegenDeltas(session, native.hpDelta + gear.hpDelta, native.mpDelta + gear.mpDelta);
+        if (food.expired && !healed) this.broadcastStats(session);
     }
 
     tickPlayerDurationItems(session) {
@@ -5240,9 +5358,16 @@ class World {
                 this.applyHp(def, (def.hp | 0) + (hit.final | 0));
                 amount = hit.final | 0;
             } else if (hit.field) {
-                amount = this.applyDamage(def, hit.final, hit.element, tickIndex, attacker);
+                amount = this.applyDamage(def, hit.final, hit.element, tickIndex, attacker, true);
             } else {
-                amount = this.applyDamage(def, hit.final, hit.element, tickIndex, attacker);
+                amount = this.applyDamage(
+                    def,
+                    hit.final,
+                    hit.element,
+                    tickIndex,
+                    attacker,
+                    def === attacker
+                );
                 if (amount > 0 && attacker.type === 'player' && spellCanCritOrLeech(spell)) {
                     this.applyAttackLeech(attacker, amount);
                 }
@@ -5326,6 +5451,10 @@ class World {
             this.sendInventory(session);
             return;
         }
+        if (itemIsFood(item) && foodAddSeconds(item) > 0) {
+            this.applyFoodUse(session, item, () => this.consumeGroundStackOne(uid, loc.x, loc.y, loc.z));
+            return;
+        }
         const effect = resolveItemUseEffect(item);
         if (effect.known || itemIsUsable(item)) {
             if (!this.consumeGroundStackOne(uid, loc.x, loc.y, loc.z)) {
@@ -5374,14 +5503,16 @@ class World {
                 uid,
                 count: 1,
                 itemDb,
+                equipMode: 'equip',
                 to: { kind: 'equipment', slot: preferredEquipSlot(item) }
             });
             if (!r.ok) {
                 const err = r.error;
+                const dress = equipDenyMessage(err);
                 if (err === 'not_enough_cap' || err === 'full' || err === 'no_room') {
                     this.say(session, 'You cannot carry that.');
-                } else if (err === 'occupied' || err === 'wrong_slot' || err === 'not_equippable') {
-                    this.say(session, 'You cannot equip that.');
+                } else if (dress) {
+                    this.say(session, dress);
                 } else {
                     this.say(session, 'You cannot do that.');
                 }
@@ -5442,6 +5573,16 @@ class World {
             this.sendInventory(session);
             return;
         }
+        if (itemIsFood(item) && foodAddSeconds(item) > 0) {
+            if (this.applyFoodUse(
+                session,
+                item,
+                () => consumeInstanceCount(session.inventory, uid, 1, itemDb)
+            )) {
+                this.sendInventory(session);
+            }
+            return;
+        }
         const effect = resolveItemUseEffect(item);
         if (effect.known || itemIsUsable(item)) {
             if (!consumeInstanceCount(session.inventory, uid, 1, itemDb)) {
@@ -5468,10 +5609,11 @@ class World {
             return;
         }
         if (itemIsEquipable(item)) {
-            const r = equipItem(session.inventory, uid, itemDb, null);
+            const r = equipItem(session.inventory, uid, itemDb, null, Object.assign({ mode: 'equip' }, wearerOf(session)));
             if (!r.ok) {
-                this.say(session, r.error === 'not_equippable'
-                    ? 'You cannot equip that.'
+                const dress = equipDenyMessage(r.error);
+                this.say(session, dress
+                    ? dress
                     : r.error === 'no_room' || r.error === 'full'
                         ? 'You cannot carry that.'
                         : 'You cannot do that.');

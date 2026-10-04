@@ -318,7 +318,14 @@ function measureFramePayload(opcode, buf, off = 0) {
             if (readStr() == null) return o - off;
             return o - off;
         }
-        case S2C.STATS: return rem >= 20 ? 20 : -1;
+        case S2C.STATS: {
+            // 20 pools + food u16 + zone u8 + count u8 + count kind bytes.
+            if (rem < 24) return -1;
+            const n = buf[off + 23];
+            if (n > 16) return -1;
+            if (rem < 24 + n) return -1;
+            return 24 + n;
+        }
         case S2C.SKILLS: return rem >= 16 ? 16 : -1;
         case S2C.SKILL_PROGRESS: return rem >= 64 ? 64 : -1;
         case S2C.FIELD_GONE: return rem >= 5 ? 5 : -1;
@@ -466,8 +473,8 @@ function measureFramePayload(opcode, buf, off = 0) {
             const w = buf[o + 38];
             const h = buf[o + 39];
             o += 40;
-            if (!need(w * h * 2)) return -1;
-            o += w * h * 2;
+            if (!need(w * h * 2 + 2)) return -1;
+            o += w * h * 2 + 2;
             return o - off;
         }
         default:

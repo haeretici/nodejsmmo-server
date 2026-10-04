@@ -7,9 +7,18 @@ const { GameSession } = require('../src/world/session');
 const { MemoryStore } = require('../src/persist/memory_store');
 const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
-const { C2S, S2C, REASON, DIR } = require('../src/protocol/opcodes');
+const { C2S, S2C, REASON, DIR, SWING_ELEMENT } = require('../src/protocol/opcodes');
 const { decodeFrame } = require('../src/protocol/frame');
-const { decodeReject, decodeEnterWorld, decodeMove, decodeDisappear } = require('../src/protocol/messages');
+const { TILE_FLAG_PZ_PACKAGE } = require('../src/world/tilemap');
+const { applyCondition, FIELD_BURNING } = require('../src/world/conditions');
+const {
+    decodeReject,
+    decodeEnterWorld,
+    decodeMove,
+    decodeDisappear,
+    decodeStats,
+    decodeSwing
+} = require('../src/protocol/messages');
 
 function fakeSocket() {
     return {
@@ -223,6 +232,42 @@ function main() {
     assert.strictEqual(noPad.reason, REASON.NO_TARGET);
     climb.kick(REASON.LOGOUT);
     w4.stop();
+
+    const w5 = makeWorld({ stepDelayTicks: 4 }).world;
+    const pyre = makeSession(w5, {
+        id: 40, accountId: 40, name: 'Pyre', vocation: 'scout',
+        level: 1, experience: 0, hp: 185, hpMax: 185, mp: 90, mpMax: 90, townId: 1
+    });
+    const enteredStats = decodeStats(lastOf(pyre.socket, S2C.STATS).payload);
+    assert.strictEqual(enteredStats.inProtectionZone, false);
+    assert.deepStrictEqual(enteredStats.conditions, []);
+    w5.tileMap.setTileFlags(pyre.x, pyre.y - 1, pyre.z, TILE_FLAG_PZ_PACKAGE);
+    pyre.socket.sent.length = 0;
+    assert.ok(w5.enqueueIntent(pyre, {
+        opcode: C2S.MOVE_STEP, seq: 1, payload: Buffer.from([DIR.N])
+    }));
+    w5.step(1);
+    assert.strictEqual(pyre.inProtectionZone, true);
+    const onPz = decodeStats(lastOf(pyre.socket, S2C.STATS).payload);
+    assert.strictEqual(onPz.inProtectionZone, true);
+    // A 1-point chunk floors to 0 under unarmed mitigation. Burning deals 10.
+    const burn = applyCondition(pyre, FIELD_BURNING);
+    assert.ok(burn && burn.kind === 'fire');
+    burn.tickTimer = burn.tickIntervalSec;
+    const beforeHp = pyre.hp | 0;
+    pyre.socket.sent.length = 0;
+    w5.step(2);
+    assert.ok((pyre.hp | 0) < beforeHp, 'fire tick reduces hp');
+    const swing = decodeSwing(lastOf(pyre.socket, S2C.SWING).payload);
+    assert.strictEqual(swing.sourceId, 0);
+    assert.strictEqual(swing.targetId, pyre.id);
+    assert.ok(swing.amount > 0);
+    assert.strictEqual(swing.element, SWING_ELEMENT.FIRE);
+    const burning = decodeStats(lastOf(pyre.socket, S2C.STATS).payload);
+    assert.ok(burning.conditions.some((c) => c.kind === 'fire'));
+    assert.strictEqual(burning.inProtectionZone, true);
+    pyre.kick(REASON.LOGOUT);
+    w5.stop();
 
     console.log('ok world');
 }

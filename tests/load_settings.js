@@ -38,10 +38,10 @@ function main() {
     const noLocal = path.join(os.tmpdir(), 'engine-no-local-settings.json');
     const committed = loadSettings({ root: SERVER_ROOT, env: {}, localPath: noLocal });
     assert.strictEqual(committed.logicUps, 20);
-    assert.strictEqual(committed.regenHpTicks, 60);
-    assert.strictEqual(committed.regenMpTicks, 100);
-    assert.strictEqual(committed.engageRegenHpTicks, 80);
-    assert.strictEqual(committed.engageRegenMpTicks, 120);
+    assert.strictEqual(committed.fullRegenHpIntervalMs, 3000);
+    assert.strictEqual(committed.fullRegenMpIntervalMs, 5000);
+    assert.strictEqual(committed.baseRegenHpIntervalMs, 4000);
+    assert.strictEqual(committed.baseRegenMpIntervalMs, 6000);
     assert.strictEqual(committed.newCharacter.hp, 150);
     assert.strictEqual(committed.newCharacter.hpMax, 150);
     assert.strictEqual(committed.newCharacter.mp, 55);

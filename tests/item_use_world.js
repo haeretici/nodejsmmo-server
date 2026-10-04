@@ -15,8 +15,7 @@ const { addItemToInventory, countItem } = require('../src/world/inventory');
 const { applyCondition } = require('../src/world/conditions');
 const { createStaticMap } = require('../src/world/static_map');
 const {
-    FOOD_REGEN_HEALTH_GAIN,
-    FOOD_REGEN_INTERVAL_SEC
+    FOOD_SEC_PER_NUTRITION
 } = require('../src/world/item_use');
 
 const itemDb = Object.assign(Object.create(null), FALLBACK_ITEMS, {
@@ -74,7 +73,9 @@ const itemDb = Object.assign(Object.create(null), FALLBACK_ITEMS, {
         stackable: true,
         consumable: true,
         usable: true,
-        weight: 1300
+        weight: 1300,
+        nutrition: 15,
+        eatText: 'Munch.'
     },
     rock: {
         id: 'rock',
@@ -215,17 +216,26 @@ function main() {
     assert.strictEqual(shield.poolRemaining, 406);
 
     session.hp = 50;
-    addItemToInventory(session.inventory, 'meat', 1, itemDb);
+    addItemToInventory(session.inventory, 'meat', 2, itemDb);
     enqueueUse(world, session, 'meat');
     world.step(6);
-    assert.strictEqual(countItem(session.inventory, 'meat'), 0);
-    const regen = session.conditions.find((c) => c.kind === 'regen');
-    assert.ok(regen);
-    assert.strictEqual(regen.healthGain, FOOD_REGEN_HEALTH_GAIN);
-    const intervalTicks = Math.round(FOOD_REGEN_INTERVAL_SEC * ((world.settings.logicUps | 0) || 20));
-    const hpBeforeTick = session.hp | 0;
-    for (let i = 0; i < intervalTicks; i++) world.step(7 + i);
-    assert.strictEqual(session.hp, hpBeforeTick + FOOD_REGEN_HEALTH_GAIN);
+    assert.strictEqual(countItem(session.inventory, 'meat'), 1);
+    assert.strictEqual(session.foodSeconds, 15 * FOOD_SEC_PER_NUTRITION);
+    assert.ok(!(session.conditions || []).some((c) => c.kind === 'regen'));
+    const munched = decodeSay(lastOf(session.socket, S2C.SAY).payload);
+    assert.strictEqual(munched.text, 'Munch.');
+    assert.strictEqual(munched.speakerId, session.id);
+    const beforeFood = session.foodSeconds;
+    for (let i = 0; i < 20; i++) world.step(7 + i);
+    assert.strictEqual(session.foodSeconds, beforeFood - 1);
+    session.foodSeconds = 1100;
+    enqueueUse(world, session, 'meat');
+    world.step(40);
+    assert.strictEqual(countItem(session.inventory, 'meat'), 1);
+    assert.strictEqual(session.foodSeconds, 1100);
+    const full = decodeSay(lastOf(session.socket, S2C.SAY).payload);
+    assert.strictEqual(full.text, 'You are full.');
+    assert.strictEqual(full.speakerId, 0);
 
     addItemToInventory(session.inventory, 'rock', 1, itemDb);
     session.socket.sent = [];

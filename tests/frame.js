@@ -158,7 +158,35 @@ function main() {
     }));
     assert.strictEqual(st.hp, 10);
     assert.strictEqual(st.mp, 4);
-    assert.strictEqual(encodeStats({ id: 3, hp: 1, hpMax: 1, mp: 1, mpMax: 1 }).length, 20);
+    assert.strictEqual(encodeStats({ id: 3, hp: 1, hpMax: 1, mp: 1, mpMax: 1 }).length, 24);
+    assert.strictEqual(st.foodSeconds, 0);
+    assert.strictEqual(st.inProtectionZone, false);
+    assert.deepStrictEqual(st.conditions, []);
+    const marked = decodeStats(encodeStats({
+        id: 3,
+        hp: 1,
+        hpMax: 1,
+        mp: 1,
+        mpMax: 1,
+        foodSeconds: 9,
+        inProtectionZone: true,
+        conditions: [{ kind: 'burning' }, { kind: 'poison' }, { type: 'food', seconds: 1 }],
+        invisible: true,
+        combatStats: { flags: { manaShield: true } }
+    }));
+    assert.strictEqual(marked.foodSeconds, 9);
+    assert.strictEqual(marked.inProtectionZone, true);
+    assert.deepStrictEqual(
+        marked.conditions.map((c) => c.kind),
+        ['fire', 'poison', 'invisible', 'mana_shield']
+    );
+    assert.strictEqual(encodeStats({
+        id: 3, hp: 1, hpMax: 1, mp: 1, mpMax: 1, conditions: [{ kind: 'fire' }]
+    }).length, 25);
+    const fedStats = decodeStats(encodeStats({
+        id: 3, hp: 1, hpMax: 1, mp: 1, mpMax: 1, foodSeconds: 180
+    }));
+    assert.strictEqual(fedStats.foodSeconds, 180);
     const stWide = decodeStats(encodeStats({
         id: 3, hp: 75065, hpMax: 75065, mp: 149850, mpMax: 149850
     }));

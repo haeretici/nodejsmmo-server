@@ -1,6 +1,72 @@
 'use strict';
 
-const { PROTOCOL_VERSION, APPEAR_FLAG, SKILL_ORDER, LOC_KIND, INV_FLAG, swingElementId } = require('./opcodes');
+const {
+    PROTOCOL_VERSION,
+    APPEAR_FLAG,
+    SKILL_ORDER,
+    LOC_KIND,
+    INV_FLAG,
+    ZONE_FLAG_PZ,
+    STATUS_KIND_NAMES,
+    swingElementId
+} = require('./opcodes');
+
+const STATUS_KIND_ALIAS = Object.freeze({
+    burning: 'fire',
+    poisoned: 'poison',
+    freezing: 'ice',
+    electrified: 'energy',
+    electrification: 'energy',
+    electrify: 'energy',
+    bleeding: 'bleed',
+    cursed: 'curse',
+    dazzled: 'holy',
+    dazzle: 'holy',
+    paralyzed: 'slow',
+    paralysed: 'slow',
+    paralyze: 'slow',
+    invisibility: 'invisible',
+    manashield: 'mana_shield',
+    'mana-shield': 'mana_shield',
+    magic_shield: 'mana_shield',
+    regeneration: 'regen',
+    hot: 'regen',
+    recovery: 'regen',
+    attribute: 'attributes',
+    stance: 'attributes',
+    strengthened: 'attributes'
+});
+
+function canonicalStatusKind(raw) {
+    let kind = String(raw || '')
+        .toLowerCase()
+        .replace(/^condition_/, '')
+        .trim();
+    if (STATUS_KIND_ALIAS[kind]) kind = STATUS_KIND_ALIAS[kind];
+    if (!kind || kind === 'food') return '';
+    return STATUS_KIND_NAMES.indexOf(kind) >= 0 ? kind : '';
+}
+
+function collectStatusKinds(entity) {
+    const out = [];
+    const seen = new Set();
+    const push = (raw) => {
+        const kind = canonicalStatusKind(raw);
+        if (!kind || seen.has(kind)) return;
+        seen.add(kind);
+        out.push(kind);
+    };
+    const list = entity && Array.isArray(entity.conditions) ? entity.conditions : [];
+    for (let i = 0; i < list.length; i++) {
+        const row = list[i];
+        if (!row) continue;
+        push(row.kind || row.type || row.id);
+    }
+    const flags = entity && entity.combatStats && entity.combatStats.flags;
+    if (entity && (entity.invisible || (flags && flags.invisible))) push('invisible');
+    if (flags && flags.manaShield) push('mana_shield');
+    return out;
+}
 const { FastWriter, Writer, Reader, clampU16, clampU32 } = require('./frame');
 
 function wrap(fn, payload) {
@@ -226,7 +292,13 @@ function readViewport(r) {
     return { originX, originY, z, width, height, tiles };
 }
 
-function encodeEnterWorld({ character, x, y, z, viewport }) {
+function foodSecondsOf(value) {
+    const n = Math.floor(Number(value) || 0);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return n;
+}
+
+function encodeEnterWorld({ character, x, y, z, viewport, foodSeconds }) {
     const w = new FastWriter();
     w.u32(character.id);
     w.str(character.name);
@@ -242,6 +314,7 @@ function encodeEnterWorld({ character, x, y, z, viewport }) {
     w.i8(z);
     w.u16(character.townId);
     writeViewport(w, viewport);
+    w.u16(clampU16(foodSecondsOf(foodSeconds)));
     return w.toBuffer();
 }
 
@@ -262,7 +335,8 @@ function decodeEnterWorld(payload) {
             y: r.i16(),
             z: r.i8(),
             townId: r.u16(),
-            viewport: readViewport(r)
+            viewport: readViewport(r),
+            foodSeconds: r.rest().length >= 2 ? r.u16() : 0
         };
     }, payload);
 }
@@ -413,25 +487,49 @@ function encodeStats(entity) {
     const mp = entity && entity.mp != null ? entity.mp : (ch && ch.mp) || 0;
     const mpMax = entity && entity.mpMax != null ? entity.mpMax : (ch && ch.mpMax) || 0;
     const v = appearView(entity);
-    return new FastWriter()
+    const kinds = collectStatusKinds(entity);
+    let zone = 0;
+    if (entity && entity.inProtectionZone) zone |= ZONE_FLAG_PZ;
+    const w = new FastWriter()
         .u32(v.id)
         .u32(clampU32(v.hp))
         .u32(clampU32(v.hpMax))
         .u32(clampU32(mp))
         .u32(clampU32(mpMax))
-        .toBuffer();
+        .u16(clampU16(foodSecondsOf(entity && entity.foodSeconds)))
+        .u8(zone & 0xff)
+        .u8(kinds.length & 0xff);
+    for (let i = 0; i < kinds.length; i++) {
+        w.u8(STATUS_KIND_NAMES.indexOf(kinds[i]) & 0xff);
+    }
+    return w.toBuffer();
 }
 
 function decodeStats(payload) {
     return wrap((p) => {
         const r = new Reader(p);
-        return {
+        const out = {
             id: r.u32(),
             hp: r.u32(),
             hpMax: r.u32(),
             mp: r.u32(),
-            mpMax: r.u32()
+            mpMax: r.u32(),
+            foodSeconds: r.rest().length >= 2 ? r.u16() : 0,
+            inProtectionZone: false,
+            conditions: []
         };
+        if (r.rest().length >= 2) {
+            const zone = r.u8();
+            const n = r.u8();
+            out.inProtectionZone = (zone & ZONE_FLAG_PZ) !== 0;
+            const cap = Math.min(n, 16);
+            for (let i = 0; i < cap; i++) {
+                if (!r.rest().length) break;
+                const kind = STATUS_KIND_NAMES[r.u8()] || '';
+                if (kind) out.conditions.push({ kind });
+            }
+        }
+        return out;
     }, payload);
 }
 

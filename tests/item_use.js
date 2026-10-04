@@ -12,9 +12,10 @@ const {
     resolveItemUseEffect,
     applyItemUseEffect,
     rollRange,
-    FOOD_REGEN_HEALTH_GAIN,
-    FOOD_REGEN_INTERVAL_SEC,
-    FOOD_REGEN_DURATION_SEC
+    FOOD_SEC_PER_NUTRITION,
+    FOOD_MAX_SECONDS,
+    foodAddSeconds,
+    tryFeed
 } = require('../src/world/item_use');
 
 function main() {
@@ -70,24 +71,33 @@ function main() {
     assert.strictEqual(eBerserk.heal, null);
     assert.strictEqual(eBerserk.condition, null);
 
-    const meat = { id: 'meat', category: 'food', usable: true, consumable: true };
+    const meat = { id: 'meat', category: 'food', usable: true, consumable: true, nutrition: 15, eatText: 'Munch.' };
     const eMeat = resolveItemUseEffect(meat);
-    assert.ok(eMeat.known);
-    assert.strictEqual(eMeat.condition.type, 'regen');
-    assert.strictEqual(eMeat.condition.healthGain, FOOD_REGEN_HEALTH_GAIN);
-    assert.strictEqual(eMeat.condition.intervalSec, FOOD_REGEN_INTERVAL_SEC);
-    assert.strictEqual(eMeat.condition.durationSec, FOOD_REGEN_DURATION_SEC);
+    assert.strictEqual(eMeat.condition, null);
+    assert.strictEqual(eMeat.known, false);
+    assert.strictEqual(foodAddSeconds(meat), 15 * FOOD_SEC_PER_NUTRITION);
+    assert.strictEqual(FOOD_MAX_SECONDS, 1200);
 
     const ham = {
         id: 'ham',
         category: 'food',
         usable: true,
-        durationSec: 180,
-        healthGain: 2
+        durationSec: 180
     };
-    const eHam = resolveItemUseEffect(ham);
-    assert.strictEqual(eHam.condition.durationSec, 180);
-    assert.strictEqual(eHam.condition.healthGain, 2);
+    assert.strictEqual(foodAddSeconds(ham), 180);
+    const eater = { foodSeconds: 0 };
+    assert.strictEqual(tryFeed(eater, meat).ok, true);
+    assert.strictEqual(eater.foodSeconds, 180);
+    assert.strictEqual(tryFeed(eater, meat).foodSeconds, 360);
+    eater.foodSeconds = 1100;
+    const full = tryFeed(eater, meat);
+    assert.strictEqual(full.reason, 'full');
+    assert.strictEqual(eater.foodSeconds, 1100);
+    eater.foodSeconds = 0;
+    const dragon = { id: 'dragon_ham', category: 'food', nutrition: 60, eatText: 'Chomp.' };
+    assert.strictEqual(tryFeed(eater, dragon).foodSeconds, 720);
+    assert.strictEqual(tryFeed(eater, dragon).reason, 'full');
+    assert.strictEqual(eater.foodSeconds, 720);
 
     const authoredFood = {
         id: 'special_stew',
@@ -139,11 +149,10 @@ function main() {
     assert.strictEqual(r3.conditionApplied.poolRemaining, 406);
     assert.strictEqual(drinker.conditions.length, 1);
 
-    const eater = { hp: 50, hpMax: 185, mp: 90, mpMax: 90 };
-    const r4 = applyItemUseEffect(eater, eMeat, { rng: () => 0 });
-    assert.ok(r4.conditionApplied);
-    assert.strictEqual(r4.conditionApplied.kind, 'regen');
-    assert.strictEqual(r4.conditionApplied.healthGain, FOOD_REGEN_HEALTH_GAIN);
+    const plainEater = { hp: 50, hpMax: 185, mp: 90, mpMax: 90, foodSeconds: 0 };
+    const r4 = applyItemUseEffect(plainEater, eMeat, { rng: () => 0 });
+    assert.strictEqual(r4.conditionApplied, null);
+    assert.strictEqual(plainEater.hp, 50);
 
     const packEq = require(path.join(__dirname, '../../content/equipment.json'));
     const liveDb = itemDbFromPack({ equipment: packEq });
@@ -156,7 +165,31 @@ function main() {
     const liveShield = resolveItemUseEffect(liveDb.magic_shield_potion);
     assert.strictEqual(liveShield.condition.type, 'mana_shield');
     const liveMeat = resolveItemUseEffect(liveDb.meat);
-    assert.strictEqual(liveMeat.condition.type, 'regen');
+    assert.strictEqual(liveMeat.condition, null);
+    const liveFood = {
+        meat: [15, 'Munch.'],
+        ham: [30, 'Chomp.'],
+        dragon_ham: [60, 'Chomp.'],
+        fish: [12, 'Munch.'],
+        shrimp: [4, 'Gulp.'],
+        cheese: [9, 'Smack.'],
+        cookie: [2, 'Crunch.'],
+        bread: [10, 'Crunch.'],
+        brown_bread: [8, 'Crunch.'],
+        brown_mushroom: [22, 'Munch.'],
+        green_mushroom: [5, 'Munch.'],
+        white_mushroom: [9, 'Munch.'],
+        dark_mushroom: [6, 'Munch.'],
+        grapes: [9, 'Yum.'],
+        carrot: [5, 'Crunch.']
+    };
+    for (const [id, pair] of Object.entries(liveFood)) {
+        const row = liveDb[id];
+        assert.ok(row, id);
+        assert.strictEqual(row.nutrition, pair[0], id + ' nutrition');
+        assert.strictEqual(row.eatText, pair[1], id + ' eatText');
+        assert.strictEqual(foodAddSeconds(row), pair[0] * FOOD_SEC_PER_NUTRITION, id + ' seconds');
+    }
     const liveBerserk = resolveItemUseEffect(liveDb.berserk_potion);
     assert.strictEqual(liveBerserk.known, false);
 

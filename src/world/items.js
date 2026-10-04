@@ -309,6 +309,132 @@ function itemIsBowOrCrossbowWeapon(item) {
     return weaponRequiredAmmoKind(item) != null;
 }
 
+function itemIsDistanceWeapon(item) {
+    if (!item || typeof item !== 'object') return false;
+    if (item.weaponType === 'distance') return true;
+    if (itemIsBowOrCrossbowWeapon(item)) return true;
+    const cat = item.category != null ? String(item.category).toLowerCase() : '';
+    if (cat === 'spear' || cat === 'throwing') return true;
+    const types = Array.isArray(item.type)
+        ? item.type
+        : item.type != null && item.type !== '' ? [item.type] : [];
+    for (let i = 0; i < types.length; i++) {
+        const t = String(types[i]).toLowerCase();
+        if (t === 'spear' || t === 'throwing' || t === 'bow' || t === 'crossbow' || t === 'distance') {
+            return true;
+        }
+    }
+    return false;
+}
+
+const DRESS_DENIED = 'You cannot dress this object there.';
+const BOTH_HANDS_DENIED = 'Both hands need to be free.';
+
+function equipDenyMessage(error) {
+    if (error === 'both_hands') return BOTH_HANDS_DENIED;
+    if (
+        error === 'level' ||
+        error === 'vocation' ||
+        error === 'wrong_slot' ||
+        error === 'wrong_slot_swap' ||
+        error === 'not_equippable' ||
+        error === 'cannot_dress'
+    ) {
+        return DRESS_DENIED;
+    }
+    return null;
+}
+
+function wieldBlock(item, actor) {
+    if (!item || !actor || actor.skipWield) return null;
+    // Sword, axe, club, fist, and thrown weapons equip below level.
+    // Attack and defense drop by one per missing level in applyPlayerLoadout.
+    if (!itemTakesLevelPenalty(item) && item.level != null && item.level !== '') {
+        const need = Math.floor(Number(item.level));
+        if (Number.isFinite(need) && need > 0) {
+            const have = Math.floor(Number(actor.level));
+            const level = Number.isFinite(have) ? have : 1;
+            if (level < need) return 'level';
+        }
+    }
+    const vocs = Array.isArray(item.vocation) ? item.vocation : [];
+    if (!vocs.length) return null;
+    const mine = actor.vocation != null ? String(actor.vocation).trim().toLowerCase() : '';
+    for (let i = 0; i < vocs.length; i++) {
+        if (String(vocs[i]).trim().toLowerCase() === mine) return null;
+    }
+    return 'vocation';
+}
+
+/**
+ * Legacy Player::queryAdd for the two hand slots, after the other hand
+ * has already been updated by an equip-action clear.
+ * rightHand is the weapon hand. leftHand is the shield, spellbook, or quiver.
+ * A two-handed distance weapon may share the shield hand with a quiver.
+ */
+function handConflict(item, slot, other) {
+    const engine = canonicalEquipmentSlot(slot) || slot;
+    if (engine === 'rightHand') {
+        if (!itemIsTwoHanded(item)) return null;
+        if (!other) return null;
+        if (itemIsDistanceWeapon(item) && itemIsQuiver(other)) return null;
+        return 'both_hands';
+    }
+    if (engine === 'leftHand') {
+        if (other && (itemIsTwoHanded(other) || itemIsTwoHanded(item))) {
+            if (itemIsQuiver(item) && itemIsDistanceWeapon(other)) return null;
+            return 'both_hands';
+        }
+        return null;
+    }
+    return null;
+}
+
+/**
+ * mode 'move' matches a drag onto the slot: conflicts are rejected.
+ * mode 'equip' matches Game::playerEquipItem: a non-distance two-hander
+ * clears a shield, and a shield or quiver clears a two-hander, except a
+ * quiver replaced by another quiver leaves the weapon in place.
+ * Vocation matches MoveEvent::EquipItem. Armor, shields, bows, crossbows,
+ * and wands also keep that level block. Melee and thrown weapons do not:
+ * they equip, and penalizedWeaponStats cuts attack and defense.
+ * Magic level and premium are not catalog fields.
+ */
+function planEquipmentAdd(item, slot, hands, actor) {
+    const engine = canonicalEquipmentSlot(slot) || null;
+    if (!item || !engine || !canEquipInSlot(item, engine)) {
+        return { ok: false, error: 'wrong_slot', slot: engine };
+    }
+    const mode = actor && actor.mode === 'equip' ? 'equip' : 'move';
+    const bag = hands || {};
+    let right = bag.right || null;
+    let left = bag.left || null;
+    let clearSlot = null;
+    if (mode === 'equip') {
+        if (engine === 'rightHand' && itemIsTwoHanded(item) && left) {
+            const currentDistance = !!(right && itemIsDistanceWeapon(right));
+            if (!itemIsDistanceWeapon(item) && !itemIsQuiver(left) && !currentDistance) {
+                clearSlot = 'leftHand';
+                left = null;
+            }
+        } else if (engine === 'leftHand') {
+            if (left && itemIsQuiver(left) && itemIsQuiver(item)) {
+                clearSlot = 'leftHand';
+                left = null;
+            } else if (right && itemIsTwoHanded(right)) {
+                clearSlot = 'rightHand';
+                right = null;
+            }
+        }
+    }
+    const other = engine === 'rightHand' ? left : right;
+    const block = handConflict(item, engine, other);
+    if (block) return { ok: false, error: block, slot: engine };
+    const wield = wieldBlock(item, actor);
+    if (wield) return { ok: false, error: wield, slot: engine };
+    return { ok: true, slot: engine, clearSlot: clearSlot, mode: mode };
+}
+
 function itemIsThrowingWeapon(item) {
     if (!item || typeof item !== 'object') return false;
     const cat = item.category != null ? String(item.category).toLowerCase() : '';
@@ -351,6 +477,52 @@ function mapTokenToWeaponSkill(token) {
     if (k === 'magic') return 'magic';
     if (k === 'melee') return 'melee';
     return null;
+}
+
+function levelsBelowRequirement(item, level) {
+    if (!item || item.level == null || item.level === '') return 0;
+    const need = Math.floor(Number(item.level));
+    if (!Number.isFinite(need) || need <= 0) return 0;
+    const have = Math.floor(Number(level));
+    const lv = Number.isFinite(have) ? have : 1;
+    return Math.max(0, need - lv);
+}
+
+/**
+ * Improper wield: sword, axe, club, fist, and thrown weapons
+ * stay equipped below item.level. Bows, crossbows, ammo, and wands do not.
+ */
+function itemTakesLevelPenalty(item) {
+    if (!item || typeof item !== 'object') return false;
+    if (itemIsAmmo(item) || itemIsBowOrCrossbowWeapon(item) || itemIsMagicWeapon(item)) return false;
+    if (itemIsShield(item) || itemIsQuiver(item)) return false;
+    if (itemIsThrowingWeapon(item)) return true;
+    const skill = resolveWeaponSkillFromItem(item);
+    return skill === 'sword' || skill === 'axe' || skill === 'club' || skill === 'fist';
+}
+
+/**
+ * Lose 1 attack and 1 defense for each missing level. Physical and elemental
+ * attack are one pool. Values stop at 0. Returns null when nothing is cut.
+ */
+function penalizedWeaponStats(item, level) {
+    const gap = levelsBelowRequirement(item, level);
+    if (!gap || !itemTakesLevelPenalty(item)) return null;
+    const phys = Math.max(0, Math.floor(Number(item.atk) || 0));
+    const extra = Math.max(0, Math.floor(Number(item.extraAtk) || 0));
+    const combined = phys + extra;
+    const reduced = Math.max(0, combined - gap);
+    let atk = 0;
+    let extraAtk = 0;
+    if (combined > 0) {
+        atk = Math.floor((reduced * phys) / combined);
+        extraAtk = reduced - atk;
+    }
+    const hasDefense = item.defense != null && item.defense !== '';
+    const defense = hasDefense
+        ? Math.max(0, Math.floor(Number(item.defense) || 0) - gap)
+        : null;
+    return { atk: atk, extraAtk: extraAtk, defense: defense, gap: gap };
 }
 
 function resolveWeaponSkillFromItem(item) {
@@ -617,6 +789,15 @@ module.exports = {
     itemAmmoKind,
     weaponRequiredAmmoKind,
     itemIsBowOrCrossbowWeapon,
+    itemIsDistanceWeapon,
+    DRESS_DENIED,
+    BOTH_HANDS_DENIED,
+    equipDenyMessage,
+    wieldBlock,
+    handConflict,
+    planEquipmentAdd,
+    itemTakesLevelPenalty,
+    penalizedWeaponStats,
     itemIsThrowingWeapon,
     itemBreakChance,
     normalizeAutoShape,

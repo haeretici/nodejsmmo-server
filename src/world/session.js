@@ -4,7 +4,7 @@ const { S2C, REASON, wsCloseCode } = require('../protocol/opcodes');
 const { encodeFrame } = require('../protocol/frame');
 const { encodeKick, encodeReject } = require('../protocol/messages');
 const { PacketGate } = require('../security/rate_limit');
-const { cloneStorage, cloneSkills, extractSkillTries } = require('./snapshot');
+const { cloneStorage, cloneSkills, extractSkillTries, foodSecondsFromConditions } = require('./snapshot');
 const { ensureSkillCounterBags, seedPlayerExperience } = require('./progression');
 const { normalizeInventory, applyPlayerLoadout } = require('./inventory');
 const { UNARMED_ATK, DEFAULT_RESISTS } = require('./items');
@@ -96,6 +96,8 @@ class GameSession {
         this.respawnTick = 0;
         this.inventory = normalizeInventory(null, null);
         this.storage = Object.create(null);
+        this.foodSeconds = 0;
+        this._foodSubTicks = 0;
         this.openCorpseId = 0;
         this.openBagUid = '';
         this.openBagUids = [];
@@ -122,6 +124,7 @@ class GameSession {
 
     bindCharacter(ch, pos, extras) {
         this.character = ch;
+        this.promoted = !!(ch && (ch.promoted || (ch.profile && ch.profile.promoted)));
         this.id = ch.id;
         this.type = 'player';
         this.x = pos.x;
@@ -191,6 +194,8 @@ class GameSession {
         this.inventory = normalizeInventory(state && state.inventory, itemDb);
         applyPlayerLoadout(this, itemDb);
         this.storage = cloneStorage(state && state.storage);
+        this.foodSeconds = foodSecondsFromConditions(state && state.conditions);
+        this._foodSubTicks = 0;
         this.openCorpseId = 0;
         this.openBagUid = '';
         this.openBagUids = [];

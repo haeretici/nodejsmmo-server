@@ -112,9 +112,28 @@ function attachSkillTries(skills, progress, manaToward) {
     return out;
 }
 
+function foodSecondsFromConditions(conditions) {
+    if (!Array.isArray(conditions)) return 0;
+    let best = 0;
+    for (let i = 0; i < conditions.length; i++) {
+        const row = conditions[i];
+        if (!row || row.type !== 'food') continue;
+        const n = Math.floor(Number(row.seconds));
+        if (Number.isFinite(n) && n > best) best = n;
+    }
+    return best;
+}
+
+function conditionsForFood(seconds) {
+    const n = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (!n) return [];
+    return [{ type: 'food', seconds: n }];
+}
+
 /**
  * Clone a persistable snapshot. Tick must not await SQL; callers clone first.
  * Downed sessions persist town spawn + full HP so reconnect is not dead.
+ * `conditions` stores the food timer only (`{ type: 'food', seconds }`).
  */
 function snapshotSession(session, extra) {
     const downed = !!(session && session.downed);
@@ -137,7 +156,7 @@ function snapshotSession(session, extra) {
             ? serializeInventory(session.inventory)
             : { items: cloneItems(session.inventory) },
         storage: cloneStorage(session.storage),
-        conditions: [],
+        conditions: conditionsForFood(session && session.foodSeconds),
         hotkeys: {},
         appearance: {},
         skills: attachSkillTries(
@@ -159,5 +178,7 @@ module.exports = {
     cloneSkills,
     extractSkillTries,
     attachSkillTries,
+    foodSecondsFromConditions,
+    conditionsForFood,
     snapshotSession
 };

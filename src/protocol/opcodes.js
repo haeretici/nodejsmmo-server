@@ -151,6 +151,29 @@ const SWING_ELEMENT_NAMES = Object.freeze([
     'manadrain'
 ]);
 
+/** STATS zone byte. Bit 0 is the full protection-zone package (NO_CAST | NO_CREATURE). */
+const ZONE_FLAG_PZ = 1;
+
+/**
+ * STATS condition tail. Order is the wire id.
+ * Hungry and protection zone are not kinds: hungry is the food clock, PZ is ZONE_FLAG_PZ.
+ */
+const STATUS_KIND_NAMES = Object.freeze([
+    'poison',
+    'fire',
+    'ice',
+    'energy',
+    'bleed',
+    'curse',
+    'holy',
+    'slow',
+    'haste',
+    'invisible',
+    'regen',
+    'attributes',
+    'mana_shield'
+]);
+
 function swingElementId(name) {
     if (typeof name === 'number' && Number.isFinite(name)) {
         const n = name | 0;
@@ -237,6 +260,8 @@ module.exports = {
     SWING_FLAG,
     SWING_ELEMENT,
     SWING_ELEMENT_NAMES,
+    ZONE_FLAG_PZ,
+    STATUS_KIND_NAMES,
     swingElementId,
     swingElementName,
     DIR,

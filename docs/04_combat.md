@@ -33,8 +33,8 @@
 | `features.expProgression` | **true** (product). Kill credits `experience` + `levelFromExp`. Cubic: `(50/3)×(L³−6L²+17L−12)`. L2 = **100** |
 | `features.skillProgression` | **true** (product). Weapon tries on auto; shield try when block zeros damage. Rates from pack `classes.json` `skillRates` |
 | L1–7 pools | HP **150+(L−1)×5** (L1 **150**), MP **50+L×5** (L1 **55**). L8 = class `baseHp`/`baseMp` (**185**/**90**). After 8: `base + (L−8)×perLevel`. `newCharacter` and `applyLevelPools` use absolute `poolMaxForLevel` |
-| `regenHpTicks` / `regenMpTicks` | **60** / **100** (3 s / 5 s at 20 UPS). Living players. Class `baseRegenHp`/`baseRegenMp` (promoted variants if `promoted`) |
-| `engageRegenHpTicks` / `engageRegenMpTicks` | **80** / **120** (4 s / 6 s). While `targetId` is a living entity |
+| `fullRegenHpIntervalMs` / `fullRegenMpIntervalMs` | **3000** / **5000**. Full stomach (`foodSeconds` > 0). 60 / 100 ticks at 20 UPS. Class `baseRegenHp`/`baseRegenMp`, or the promoted pair when the profile `promoted` flag is true |
+| `baseRegenHpIntervalMs` / `baseRegenMpIntervalMs` | **4000** / **6000**. Hungry (`foodSeconds` is 0). 80 / 120 ticks at 20 UPS. A living target does not change the pace |
 | Creature ids | `creatureIdBase` **1000000000** |
 | Corpse ids | `corpseIdBase` **2000000000** |
 
@@ -110,9 +110,11 @@ Logout always. Interval (1 hour) and wall-clock save all online. Loot/shop/quest
 
 ## Regen / duration
 
-Living players restore class `baseRegenHp`/`baseRegenMp` (promoted rows if `promoted`) on integer tick accumulators. Out-of-combat intervals `regenHpTicks` **60** / `regenMpTicks` **100**; engage (living `targetId`) **80** / **120**. Skip `simSleeping` creatures. MUST NOT `Date.now`. Equipped `durationSec` items decay while worn; leftover `remainingDurationSec` / `remainingCharges` persist on inventory instances. Stowed leftover duration freezes. MUST NOT weapon-charge attack-use.
+Living players restore class regen on integer tick accumulators. A full stomach (`foodSeconds` > 0) uses `fullRegenHpIntervalMs` **3000** / `fullRegenMpIntervalMs` **5000**. Hungry uses `baseRegenHpIntervalMs` **4000** / `baseRegenMpIntervalMs` **6000**. A living target does not change the pace. `profile.promoted` or `character.promoted` switches the amount to `promotedRegenHp`/`promotedRegenMp` — guardian 6/3, scout 5/4, mystic 5/4, adept 3/6, warden 3/6, adventurer 2/2 (adventurer has no promoted difference). The interval stays the same. Live characters have no profile and no `promoted` column, so they use the base amounts until that flag is set. Skip `simSleeping`, downed, and dead. Food seconds freeze in those states too. MUST NOT `Date.now`. Equipped `durationSec` items decay while worn; leftover `remainingDurationSec` / `remainingCharges` persist on inventory instances. Stowed leftover duration freezes. MUST NOT weapon-charge attack-use.
 
-`USE_ITEM` consumables: catalog `heal` / `restoreMana` (array or scalar) / `dispel` / `condition`. No built-in potion id table. Empty-effect `usable`/`consumable` (berserk / savant / marksman) still consume. Food (`category: food`) with no other effect applies regen `{healthGain:1,intervalSec:3,durationSec:60}` (catalog `condition` / `durationSec` / `healthGain` override). Regen overwrite. Stacks max **100**.
+Food satiation is the legacy timer, not a separate heal-over-time. Catalog `nutrition` × **12** seconds (a food with no `nutrition` uses `durationSec` as the seconds). One bite from hungry is accepted even past the cap. Already fed and `current + add >= 1200` answers `You are full.` and does not consume. The character says `eatText` (default `Munch.`). The timer is whole seconds on the logic tick and persists in `character_state.conditions` as `{ type: 'food', seconds }`. `ENTER_WORLD` and `STATS` carry `foodSec u16`.
+
+`USE_ITEM` consumables: catalog `heal` / `restoreMana` (array or scalar) / `dispel` / `condition`. No built-in potion id table. Empty-effect `usable`/`consumable` (berserk / savant / marksman) still consume. A food with its own `condition` applies that condition after a successful bite. Stacks max **100**.
 
 ## Key files
 
@@ -134,7 +136,7 @@ Living players restore class `baseRegenHp`/`baseRegenMp` (promoted rows if `prom
 | `src/world/npc.js` | dialog / `when` / shop / wander fields |
 | `src/world/snapshot.js` | persist clone |
 | `src/world/world.js` | tick: intents → chase/swing → on_demand pins → AI (strategy pick / retarget) → decay |
-| `src/world/regen.js` | vocation HP/MP integer-tick regen; equipped `durationSec` decay |
+| `src/world/regen.js` | food-paced vocation HP/MP regen; equipped `durationSec` decay |
 | `src/world/spawn_pins.js` | pin catalog / AOI / respawn seconds |
 | `src/world/world_pins.js` | hybrid `world[]` normalize / seed (RAM, not SQL) |
 | `src/world/world_pin_actions.js` | USE / Use-with / trap step / decay |
