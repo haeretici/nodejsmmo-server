@@ -24,10 +24,10 @@ Authoritative settings contract, environment overrides, multi-core compute worke
 
 | Knob | Default | Recommended (Prod) | Description |
 | :--- | :--- | :--- | :--- |
-| `computeWorkers` | `0` | `"auto"` | Worker thread count. `0` = inline. `1–4` = thread pool. `"auto"` uses reference formula: `0` if cores $\le 2$, else $\text{clamp}(\lfloor(\text{cores}-2)/2\rfloor, 1, 4)$. |
+| `computeWorkers` | `"auto"` | `"auto"` | Worker thread count. `0` = inline. `1–4` = thread pool. `"auto"` uses reference formula: `0` if cores $\le 2$, else $\text{clamp}(\lfloor(\text{cores}-2)/2\rfloor, 1, 4)`. |
 | `computeQueueCapacity` | `2048` | `2048` | Maximum in-flight/queued path searches across priority queues. Caps worker snapshot memory to < 6 MB. |
 | `computeApplyDelayTicks` | `0` | `0` | Completion pipeline delay. `0` = same-tick / immediate drain. `1` = staged next-tick drain (used for 100% deterministic parity testing). |
-| `aiPathBudgetPerFrame` | `0` | `0` (stress `48`) | Limit for optional moving-goal repaths per tick; `0` = unlimited. Critical repaths (empty path / recovery) bypass budget. |
+| `aiPathBudgetPerFrame` | `0` | `0` | Shared cap on optional moving-goal repaths per tick. `0` = unlimited. Critical repaths (empty path / recovery) bypass the cap. |
 | `aiCreaturePathMaxDistance` | `12` | `12` | Maximum chase distance from creature to target before giving up. |
 | `pathMaxDistance` | `100` | `100` | Creature return-home / long routes. Not player chase. |
 | `movePathMaxSteps` | `165` | `165` | Max dirs in one `MOVE_PATH`. Player BFS is client-side. |
@@ -44,7 +44,7 @@ Authoritative settings contract, environment overrides, multi-core compute worke
 | `spawnDespawnIdleTicks` | `40` | `40` | Ticks (2.0s at 20 UPS) an unengaged mob remains alive without players in range before despawning back to its pin. Idle/budget unload **parks** remaining HP. |
 | `spawnDespawnHomeDist` | `20` | `20` | Chebyshev tiles from pin home. Greater → destroy + respawn cooldown (not park). `0` disables. Same-floor only; other floor is home-floor unload. |
 | `aiCreatureSleep` | `true` | `true` | Enables sleep state. Dormant mobs skip AI, targeting, cooldown updates, and return pathing. Sleep apply is previous-awake deltas, not `creatures.values()`. |
-| `aiTickRadius` | `12` | `12` | Observer-centric wake radius. Sweep radiates outward from active players ($O(N_{\text{players}})$). One AOI frame per tick is shared by sleep, spawn, aggro, and broadcast. |
+| `aiTickRadius` | `12` | `12` | Observer-centric wake radius. Sweep radiates outward from active players ($O(N_{\text{players}})$). One AOI frame per tick is shared by sleep and spawn. Aggro and tile viewers query the player spatial index. |
 
 ## Network & Batching Limits
 

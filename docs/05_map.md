@@ -44,7 +44,7 @@ Hybrid like the lab TileMap: `occupancy` is **0** or **first** combatant id (`In
 | `aiCreaturePathMaxDistance` | **12** (creature chase) |
 | `aiRepathIntervalSec` | **2.0** optional moving-goal A* |
 | `aiRepathFailBackoffSec` | **0.25** after failed critical |
-| `aiPathBudgetPerFrame` | **0** unlimited (stress **48**) — optional repaths only |
+| `aiPathBudgetPerFrame` | **0** unlimited optional moving-goal repaths per tick. A positive value is a shared cap. Critical repaths (empty path / recovery) bypass it |
 | `aiCreatureThinkIntervalSec` | **1.0** (≤0 = every tick) |
 | `aiCreatureThreatDecayHalflifeSec` | **10** (`damageTakenBy` half-life; 0 = no decay; per-kit `flags.threatDecayHalflifeSec`) |
 | `aiCreatureRetargetIntervalSec` | **0** (sticky until lose; per-kit `changeTarget.interval` ms + `chance` % override) |

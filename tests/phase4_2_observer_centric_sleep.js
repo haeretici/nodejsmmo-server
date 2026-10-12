@@ -7,7 +7,9 @@ const { GameSession } = require('../src/world/session');
 const { MemoryStore } = require('../src/persist/memory_store');
 const { RateLimiter } = require('../src/security/rate_limit');
 const { createLog } = require('../src/log');
-const { REASON } = require('../src/protocol/opcodes');
+const { S2C, REASON } = require('../src/protocol/opcodes');
+const { decodeFrame } = require('../src/protocol/frame');
+const { decodeDisappear } = require('../src/protocol/messages');
 
 function fakeSocket() {
     return {
@@ -282,11 +284,20 @@ function testFloorIsolationObserverCentric() {
     world.stop();
 }
 
+function lastOf(sock, opcode) {
+    for (let i = sock.sent.length - 1; i >= 0; i--) {
+        const frame = decodeFrame(sock.sent[i]);
+        if (frame.opcode === opcode) return frame;
+    }
+    return null;
+}
+
 function testSharedAoiFramePerTick() {
     const world = makeWorld(null, multiFloorMap(80, 80));
     world.spawnCreature('rat', 11, 10, 0);
     world.spawnCreature('rat', 12, 10, 0);
     const session = makeSession(world, ash(1), { x: 10, y: 10, z: 0 });
+    const far = makeSession(world, ash(2), { x: 70, y: 70, z: 0 });
 
     let creatureQueries = 0;
     let playerQueries = 0;
@@ -307,14 +318,33 @@ function testSharedAoiFramePerTick() {
     world.tickSpawnPins(1);
     world.updateCreatureSleepStates(1);
     const near = world.nearestPlayer({ x: 11, y: 10, z: 0 }, 7);
-    assert.ok(near, 'aggro uses AOI observers');
+    assert.strictEqual(near, session, 'aggro queries players around the tile');
     world.broadcastToViewers(11, 10, 0, () => {});
 
-    assert.strictEqual(world._aoiFrame, frame, 'spawn/sleep/aggro/broadcast reuse one AOI frame');
-    assert.strictEqual(creatureQueries, 1, 'creatureSpatial queried once for the single observer');
-    assert.strictEqual(playerQueries, 0, 'playerSpatial not queried once the AOI frame exists');
+    assert.strictEqual(world._aoiFrame, frame, 'spawn and sleep reuse one AOI frame');
+    assert.strictEqual(creatureQueries, 2, 'creatureSpatial queried once per living observer');
+    assert.strictEqual(playerQueries, 2, 'aggro and broadcast each query the player index once');
+    assert.ok(frame.observers.indexOf(far) >= 0, 'AOI observers still list every living player');
 
     session.kick(REASON.LOGOUT);
+    far.kick(REASON.LOGOUT);
+    world.stop();
+}
+
+function testFloorChangeNotifiesDepartureViewers() {
+    const world = makeWorld(null, multiFloorMap(40, 40));
+    const walker = makeSession(world, ash(1), { x: 10, y: 10, z: 0 });
+    const watcher = makeSession(world, ash(2), { x: 12, y: 10, z: 0 });
+    world.ensureAoiFrame(1);
+    watcher.socket.sent.length = 0;
+    const from = { x: walker.x | 0, y: walker.y | 0, z: walker.z | 0 };
+    assert.ok(world.tileMap.moveEntityToTile(10, 10, 1, walker));
+    world.broadcastMove(walker, from, 0);
+    const gone = lastOf(watcher.socket, S2C.DISAPPEAR);
+    assert.ok(gone, 'watcher on the old floor is told the walker left');
+    assert.strictEqual(decodeDisappear(gone.payload), walker.id);
+    walker.kick(REASON.LOGOUT);
+    watcher.kick(REASON.LOGOUT);
     world.stop();
 }
 
@@ -379,6 +409,7 @@ function main() {
     testCombatExemptionsObserverCentric();
     testFloorIsolationObserverCentric();
     testSharedAoiFramePerTick();
+    testFloorChangeNotifiesDepartureViewers();
     testSleepApplyDoesNotWalkCreatureMap();
     testDisabledSleepAndZeroRadius();
     console.log('ok phase4_2_observer_centric_sleep');

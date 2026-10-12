@@ -2588,12 +2588,10 @@ class World {
         const r = Math.max(0, Number(range) || 0);
         const attackable = !!(opts && opts.attackable);
         const out = [];
-        const frame = this._aoiFrame;
-        const candidates = (frame && frame.observers)
-            ? frame.observers
-            : (this.playerSpatial
-                ? this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, r)
-                : this.players.values());
+        // Local index only. The AOI frame is wake and spawn, not a target scan.
+        const candidates = this.playerSpatial
+            ? this.playerSpatial.queryChunkCandidates(from.x, from.y, from.z, r)
+            : this.players.values();
         for (const p of candidates) {
             if (!p || p.downed || p.dead) continue;
             if ((p.z | 0) !== (from.z | 0)) continue;
@@ -3787,8 +3785,7 @@ class World {
     }
 
     viewerCandidates(x, y, z, radius) {
-        const frame = this._aoiFrame;
-        if (frame && frame.observers) return frame.observers;
+        // Who can see a tile stays a local query, including while an AOI frame is armed.
         if (this.playerSpatial) {
             return this.playerSpatial.queryChunkCandidates(x, y, z, radius != null ? radius : 16);
         }
@@ -3830,7 +3827,7 @@ class World {
             }
         };
         addPlayers(this.viewerCandidates(entity.x, entity.y, entity.z, 16));
-        if ((from.z | 0) !== (entity.z | 0) && !(this._aoiFrame && this._aoiFrame.observers)) {
+        if ((from.z | 0) !== (entity.z | 0)) {
             addPlayers(this.viewerCandidates(from.x, from.y, from.z, 16));
         }
 

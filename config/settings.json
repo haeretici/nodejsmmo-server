@@ -17,7 +17,7 @@
     "aiRepathIntervalSec": 2,
     "aiRepathFailBackoffSec": 0.25,
     "aiPathBudgetPerFrame": 0,
-    "computeWorkers": 0,
+    "computeWorkers": "auto",
     "computeQueueCapacity": 2048,
     "computeApplyDelayTicks": 0,
     "aiCreatureThinkIntervalSec": 1,
@@ -50,7 +50,7 @@
     "globalSaveShutdown": true,
     "talkRange": 3,
     "playerTileMaxStack": 10,
-    "maxPlayers": 50,
+    "maxPlayers": 1000,
     "maxPlayersOnlinePerAccount": 1,
     "logLevel": "info",
     "mysql": {

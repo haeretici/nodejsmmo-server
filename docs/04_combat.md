@@ -38,7 +38,7 @@
 | Creature ids | `creatureIdBase` **1000000000** |
 | Corpse ids | `corpseIdBase` **2000000000** |
 
-Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins load at boot; `spawnMode` **on_demand** (viewport + margin **8**). Tests set `spawns: []` `npcs: []` (eager overlay when those keys are present) or delete the keys to use pack pins. One AOI frame per tick (observers + nearby creatures + spawn-pin candidates) is reused by sleep, spawn, aggro, and broadcast.
+Live map: pack `maps/firstlight_isle/` hybrid (town **80,132,6**). Pack pins load at boot; `spawnMode` **on_demand** (viewport + margin **8**). Tests set `spawns: []` `npcs: []` (eager overlay when those keys are present) or delete the keys to use pack pins. One AOI frame per tick (observers + nearby creatures + spawn-pin candidates) is reused by sleep and spawn. Aggro and broadcast query the player spatial index around the tile.
 
 ## Intents
 

@@ -29,6 +29,9 @@ function testSettings() {
     s.fixedStepDelay = true;
     s.aiCreatureThinkIntervalSec = 0;
     s.aiRepathIntervalSec = 0;
+    // Live workers follow the host. The suite stays inline so a step does not wait on a thread.
+    s.aiPathBudgetPerFrame = 0;
+    s.computeWorkers = 0;
     s.persistIntervalMs = 0;
     s.persistConcurrency = 8;
     s.globalSaveTime = '';
